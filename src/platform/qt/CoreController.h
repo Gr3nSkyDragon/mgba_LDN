@@ -27,6 +27,8 @@
 #endif
 #ifdef M_CORE_GBA
 #include <mgba/internal/gba/sio/dolphin.h>
+#include <mgba/internal/gba/sio/rfu.h>
+#include <mgba/internal/gba/sio/rfu-udp.h>
 #endif
 
 #ifdef M_CORE_GBA
@@ -203,6 +205,8 @@ public slots:
 #ifdef M_CORE_GBA
 	void attachBattleChipGate();
 	void detachBattleChipGate();
+	void setRFUEnabled(bool);
+	bool rfuEnabled() const;
 	void setBattleChipId(uint16_t id);
 	void setBattleChipFlavor(int flavor);
 
@@ -252,6 +256,13 @@ private:
 	void updateFastForward();
 
 	void updateROMInfo();
+
+#ifdef M_CORE_GBA
+	void attachRFU();
+	void detachRFU();
+	bool startRFU();
+	void stopRFU();
+#endif
 
 	mCoreThread m_threadContext{};
 	struct CoreLogger : public mLogger {
@@ -347,6 +358,10 @@ private:
 
 #ifdef M_CORE_GBA
 	GBASIOBattlechipGate m_battlechip;
+	GBASIORFU m_rfu;
+	GBASIORFUBackend* m_rfuBackend = nullptr;
+	bool m_rfuAttached = false;
+	MultiplayerController* m_rfuSavedMultiplayer = nullptr;
 	QByteArray m_eReaderData;
 #endif
 };

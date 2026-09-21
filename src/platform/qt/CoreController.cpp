@@ -69,6 +69,7 @@ CoreController::CoreController(mCore* core, QObject* parent)
 #ifdef M_CORE_GBA
 		case mPLATFORM_GBA:
 			context->core->setPeripheral(context->core, mPERIPH_GBA_LUMINANCE, controller->m_inputController->luminance());
+			controller->attachRFU();
 			break;
 #endif
 		default:
@@ -135,6 +136,7 @@ CoreController::CoreController(mCore* core, QObject* parent)
 		controller->clearMultiplayerController();
 #ifdef M_CORE_GBA
 		controller->detachDolphin();
+		controller->detachRFU();
 #endif
 		QMetaObject::invokeMethod(controller, "stopping");
 	};
@@ -373,6 +375,13 @@ void CoreController::setMultiplayerController(MultiplayerController* controller)
 		return;
 	}
 	clearMultiplayerController();
+#ifdef M_CORE_GBA
+	if (m_rfuAttached) {
+		// The wireless adapter owns the link port; remember the request and restore it when the adapter is switched off.
+		m_rfuSavedMultiplayer = controller;
+		return;
+	}
+#endif
 	m_multiplayer = controller;
 	if (!mCoreThreadHasStarted(&m_threadContext)) {
 		return;
@@ -1108,6 +1117,131 @@ void CoreController::endPrint() {
 #endif
 
 #ifdef M_CORE_GBA
+// The wireless adapter is switched on with the Emulation > "Wireless adapter" menu entry (saved as rfu.enabled in the
+// config). For development the MGBA_RFU_BACKEND environment variable (or rfu.backend config value) set to anything
+// but "off" or "0" also forces it on, and MGBA_RFU_TRACE=<file> (or rfu.trace) writes the adapter's protocol trace.
+// Behind the adapter is a local UDP "air" (rfu-udp.c): other mGBA processes on this machine with the adapter on are
+// in range. MGBA_RFU_BACKEND=none (or rfu.backend) leaves the adapter with nobody in range instead.
+//
+// The adapter and mGBA's own multiplayer (lockstep) feature both need the game's single link-port driver, so a game
+// uses one or the other: enabling the adapter takes the game out of multiplayer, disabling it puts it back.
+static const char* rfuSetting(mCore* core, const char* env, const char* key) {
+	const char* value = getenv(env);
+	if (!value || !value[0]) {
+		value = mCoreConfigGetValue(&core->config, key);
+	}
+	return value;
+}
+
+// True only while our driver really is the one on the link port (another driver may have replaced it).
+bool CoreController::rfuEnabled() const {
+	if (!m_rfuAttached || m_threadContext.core->platform(m_threadContext.core) != mPLATFORM_GBA) {
+		return false;
+	}
+	GBA* gba = static_cast<GBA*>(m_threadContext.core->board);
+	return gba->sio.driver == &m_rfu.d;
+}
+
+bool CoreController::startRFU() {
+	if (rfuEnabled()) {
+		return true;
+	}
+	mCore* core = m_threadContext.core;
+	if (m_rfuAttached) {
+		// The driver was replaced behind our back; it is already deinitialised, just release what we hold.
+		GBASIORFUDestroy(&m_rfu);
+		GBASIORFUUDPDestroy(m_rfuBackend);
+		m_rfuBackend = nullptr;
+		m_rfuAttached = false;
+	}
+
+	const char* backendName = rfuSetting(core, "MGBA_RFU_BACKEND", "rfu.backend");
+	if (!backendName || strcmp(backendName, "none") != 0) {
+		m_rfuBackend = GBASIORFUUDPCreate();
+	}
+	GBASIORFUCreate(&m_rfu, m_rfuBackend);
+
+	const char* trace = rfuSetting(core, "MGBA_RFU_TRACE", "rfu.trace");
+	if (trace && trace[0]) {
+		// Several games (multiplayer windows) can have the adapter; give each its own trace file.
+		static int instances = 0;
+		QByteArray path(trace);
+		if (instances++ > 0) {
+			path += "." + QByteArray::number(instances);
+		}
+		GBASIORFUSetTraceFile(&m_rfu, path.constData());
+	}
+
+	core->setPeripheral(core, mPERIPH_GBA_LINK_PORT, &m_rfu.d);
+	m_rfuAttached = true;
+	return true;
+}
+
+void CoreController::stopRFU() {
+	if (!m_rfuAttached) {
+		return;
+	}
+	if (rfuEnabled()) {
+		m_threadContext.core->setPeripheral(m_threadContext.core, mPERIPH_GBA_LINK_PORT, nullptr);
+	}
+	GBASIORFUDestroy(&m_rfu);
+	GBASIORFUUDPDestroy(m_rfuBackend);
+	m_rfuBackend = nullptr;
+	m_rfuAttached = false;
+}
+
+// Called on the emulation thread when a game starts: attach the adapter if the setting (or the dev variable) asks.
+void CoreController::attachRFU() {
+	mCore* core = m_threadContext.core;
+	const char* force = rfuSetting(core, "MGBA_RFU_BACKEND", "rfu.backend");
+	bool forced = force && force[0] && strcmp(force, "off") != 0 && strcmp(force, "0") != 0;
+	int enabled = 0;
+	mCoreConfigGetIntValue(&core->config, "rfu.enabled", &enabled);
+	if (enabled || forced) {
+		startRFU();
+		if (m_rfuAttached && m_multiplayer) {
+			// Not part of multiplayer while the adapter has the link port; nothing has been attached yet at this point.
+			m_rfuSavedMultiplayer = m_multiplayer;
+			m_multiplayer = nullptr;
+		}
+	}
+}
+
+void CoreController::detachRFU() {
+	stopRFU();
+}
+
+// Called from the GUI thread by the menu toggle while a game may be running.
+void CoreController::setRFUEnabled(bool enabled) {
+	if (platform() != mPLATFORM_GBA) {
+		return;
+	}
+	if (enabled) {
+		if (rfuEnabled()) {
+			return;
+		}
+		Interrupter interrupter(this);
+		if (m_multiplayer) {
+			m_rfuSavedMultiplayer = m_multiplayer;
+			clearMultiplayerController();
+		}
+		startRFU();
+	} else {
+		if (!m_rfuAttached) {
+			return;
+		}
+		{
+			Interrupter interrupter(this);
+			stopRFU();
+		}
+		if (m_rfuSavedMultiplayer) {
+			MultiplayerController* multiplayer = m_rfuSavedMultiplayer;
+			m_rfuSavedMultiplayer = nullptr;
+			setMultiplayerController(multiplayer);
+		}
+	}
+}
+
 void CoreController::attachBattleChipGate() {
 	if (platform() != mPLATFORM_GBA) {
 		return;

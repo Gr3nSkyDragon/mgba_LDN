@@ -37,7 +37,9 @@ set(SOURCE_FILES
 
 set(SIO_FILES
 	sio/dolphin.c
-	sio/lockstep.c)
+	sio/lockstep.c
+	sio/rfu.c
+	sio/rfu-udp.c)
 
 set(EXTRA_FILES
 	extra/battlechip.c

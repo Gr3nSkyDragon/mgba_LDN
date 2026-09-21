@@ -924,6 +924,10 @@ void Window::gameStarted() {
 	m_config->updateOption("lockAspectRatio");
 	m_config->updateOption("interframeBlending");
 	m_config->updateOption("resampleVideo");
+#ifdef M_CORE_GBA
+	// Re-applies the saved setting to the newly started game (attaches the wireless adapter if it is ticked).
+	m_config->updateOption("rfu.enabled");
+#endif
 	attachWidget(m_display.get());
 	setFocus();
 
@@ -1603,6 +1607,16 @@ void Window::setupMenu(QMenuBar* menubar) {
 #ifdef M_CORE_GBA
 	auto bcGate = addGameAction(tr("BattleChip Gate..."), "bcGate", openControllerTView<BattleChipView>(this), "emu");
 	m_platformActions.insert(mPLATFORM_GBA, bcGate);
+
+	// Wireless adapter (RFU). No network is behind it yet: the game sees an adapter with nobody else in range.
+	ConfigOption* rfuEnabled = m_config->addOption("rfu.enabled");
+	rfuEnabled->addBoolean(tr("Wireless adapter"), &m_actions, "emu");
+	rfuEnabled->connect([this](const QVariant& value) {
+		if (m_controller) {
+			m_controller->setRFUEnabled(value.toBool());
+		}
+	}, this);
+	m_config->updateOption("rfu.enabled");
 #endif
 
 	m_actions.addMenu(tr("Audio/&Video"), "av");
