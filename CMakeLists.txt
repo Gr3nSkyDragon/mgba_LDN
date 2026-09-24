@@ -64,6 +64,11 @@ if(NOT LIBMGBA_ONLY)
 	set(M_CORE_GBA ON CACHE BOOL "Build Game Boy Advance core")
 	set(M_CORE_GB ON CACHE BOOL "Build Game Boy core")
 	set(USE_LZMA ON CACHE BOOL "Whether or not to enable 7-Zip support")
+	if(WIN32)
+		set(USE_LDN_BROADCAST ON CACHE BOOL "Whether or not to build the Broadcast (LDN, via ldnd) wireless adapter backend")
+	else()
+		set(USE_LDN_BROADCAST OFF CACHE BOOL "Whether or not to build the Broadcast (LDN, via ldnd) wireless adapter backend")
+	endif()
 	set(USE_DISCORD_RPC ON CACHE BOOL "Whether or not to enable Discord RPC support")
 	set(ENABLE_SCRIPTING ON CACHE BOOL "Whether or not to enable scripting support")
 	set(BUILD_QT ON CACHE BOOL "Build Qt frontend")
@@ -223,6 +228,9 @@ if(WIN32)
 		endif()
 	endif()
 	list(APPEND OS_LIB ws2_32 shlwapi)
+	if(USE_LDN_BROADCAST)
+		list(APPEND OS_LIB bcrypt)
+	endif()
 	list(APPEND OS_DEFINES ENABLE_VFS_FD)
 	list(APPEND CORE_VFS_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/util/vfs/vfs-fd.c)
 	list(APPEND VFS_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/windows/vfs-w32.c)
@@ -849,6 +857,56 @@ add_subdirectory(src/gb)
 add_subdirectory(src/gba)
 add_subdirectory(src/sm83)
 add_subdirectory(src/util)
+
+if(USE_LDN_BROADCAST)
+	add_definitions(-DUSE_LDN_BROADCAST)
+	# Development tool: talks to a running ldnd and lists the Wi-Fi device it exposes.
+	add_executable(ldnd-probe
+		src/gba/sio/ldn/ldnd-probe.c
+		src/gba/sio/ldn/ldnd.c
+		src/gba/sio/ldn/netlink.c)
+	# Development tool: listens for a Switch's LDN advertisements (monitor mode) and decodes them.
+	add_executable(ldn-scan
+		src/gba/sio/ldn/ldn-scan.c
+		src/gba/sio/ldn/ldn.c
+		src/gba/sio/ldn/ldn-monitor.c
+		src/gba/sio/ldn/ldnd.c
+		src/gba/sio/ldn/netlink.c)
+	if(WIN32)
+		target_link_libraries(ldn-scan bcrypt)
+	endif()
+	# Development tool: scans for a Switch's advertisement, then attempts real WPA2-PSK association with it.
+	add_executable(ldn-join
+		src/gba/sio/ldn/ldn-join.c
+		src/gba/sio/ldn/ldn.c
+		src/gba/sio/ldn/ldn-monitor.c
+		src/gba/sio/ldn/ldn-station.c
+		src/gba/sio/ldn/ldn-auth.c
+		src/gba/sio/ldn/ldnd.c
+		src/gba/sio/ldn/netlink.c)
+	if(WIN32)
+		target_link_libraries(ldn-join bcrypt)
+	endif()
+	# Development tool: like ldn-join, then also brings up and drives the Pia connection layer (Net/Session/RTT)
+	# to see whether the host accepts a Pia session - does not yet bridge any RFU/game data.
+	add_executable(ldn-pia-join
+		src/gba/sio/ldn/ldn-pia-join.c
+		src/gba/sio/ldn/ldn.c
+		src/gba/sio/ldn/ldn-monitor.c
+		src/gba/sio/ldn/ldn-station.c
+		src/gba/sio/ldn/ldn-auth.c
+		src/gba/sio/ldn/ldn-pia.c
+		src/gba/sio/ldn/ldn-pia-reliable.c
+		src/gba/sio/ldn/ldn-pia-connect.c
+		src/gba/sio/ldn/ldnd.c
+		src/gba/sio/ldn/netlink.c
+		src/util/crc32.c
+		src/third-party/zstd/zstdlib.c)
+	target_include_directories(ldn-pia-join PRIVATE include)
+	if(WIN32)
+		target_link_libraries(ldn-pia-join bcrypt)
+	endif()
+endif()
 
 list(APPEND GUI_SRC ${EXTRA_GUI_SRC})
 list(APPEND UTIL_BASE_SRC ${CMAKE_CURRENT_BINARY_DIR}/version.c)

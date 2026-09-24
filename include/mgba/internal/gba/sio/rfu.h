@@ -204,6 +204,12 @@ struct GBASIORFU {
 void GBASIORFUCreate(struct GBASIORFU*, struct GBASIORFUBackend*);
 void GBASIORFUDestroy(struct GBASIORFU*);
 
+// The backends a wireless adapter can be attached to, by name: "local" (other mGBA processes on this computer, UDP),
+// "broadcast" (a real Switch over LDN) and "usb" (an external adapter such as an ESP32). The last two are stubs for
+// now. Returns NULL for an unknown name. Destroy releases a backend that was not (or is no longer) attached.
+struct GBASIORFUBackend* GBASIORFUBackendCreate(const char* name);
+void GBASIORFUBackendDestroy(struct GBASIORFUBackend*);
+
 // Send the protocol trace to a file (used for development). Pass NULL to stop.
 void GBASIORFUSetTraceFile(struct GBASIORFU*, const char* path);
 

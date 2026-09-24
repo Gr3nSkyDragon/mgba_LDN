@@ -1532,7 +1532,35 @@
          </item>
         </layout>
        </item>
+       <item row="4" column="0">
+        <widget class="QLabel" name="label_31">
+         <property name="text">
+          <string>prod.keys file:</string>
+         </property>
+        </widget>
+       </item>
        <item row="4" column="1">
+        <layout class="QHBoxLayout" name="horizontalLayout_31">
+         <item>
+          <widget class="QLineEdit" name="prodKeys">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="prodKeysBrowse">
+           <property name="text">
+            <string>Browse</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item row="5" column="1">
         <widget class="QCheckBox" name="useBios">
          <property name="text">
           <string>Use BIOS file if found</string>
@@ -1542,7 +1570,7 @@
          </property>
         </widget>
        </item>
-       <item row="5" column="1">
+       <item row="6" column="1">
         <widget class="QCheckBox" name="skipBios">
          <property name="text">
           <string>Skip BIOS intro</string>

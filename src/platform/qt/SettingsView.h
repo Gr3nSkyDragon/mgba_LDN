@@ -71,6 +71,7 @@ public slots:
 
 private slots:
 	void selectBios(QLineEdit*);
+	void selectFile(QLineEdit*, const QString& title, const QString& filter = {});
 	void selectPath(QLineEdit*, QCheckBox*);
 	void selectImage(QLineEdit*);
 	void updateConfig();

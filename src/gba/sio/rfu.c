@@ -329,6 +329,10 @@ static void _processEvent(struct GBASIORFU* rfu, const struct GBASIORFUEvent* ev
 	}
 	case RFU_EVENT_CONNECT_RESULT:
 		if (rfu->state != RFU_STATE_CONNECTING) {
+			// TEMPORARY diagnostic: confirms/refutes the theory that the backend's own async connect result
+			// arrives too late (after the game already gave up via FINISH_CONNECTION) and gets silently dropped.
+			_trace(rfu, "EVENT  connect result DROPPED (state=%d, not CONNECTING) accepted=%s dev=%04X", rfu->state,
+			       event->accepted ? "true" : "false", event->deviceId);
 			break;
 		}
 		_trace(rfu, "EVENT  connect %s dev=%04X slot=%d", event->accepted ? "accepted" : "refused", event->deviceId, event->slot);
@@ -649,6 +653,8 @@ static int _processCommand(struct GBASIORFU* rfu) {
 		} else {
 			buffer[0] = rfu->client.deviceId | (rfu->client.slot << 16);
 		}
+		// TEMPORARY diagnostic: how many times, and over how long, does the game poll this before giving up?
+		_trace(rfu, "POLL   IsConnectionComplete state=%d -> %08X", rfu->state, buffer[0]);
 		return 1;
 
 	case RFU_CMD_FINISH_CONNECTION:
@@ -658,6 +664,9 @@ static int _processCommand(struct GBASIORFU* rfu) {
 		if (rfu->state == RFU_STATE_CLIENT) {
 			buffer[0] = rfu->client.deviceId | (rfu->client.slot << 16);
 		} else {
+			// TEMPORARY diagnostic: confirms/refutes the theory that the game gives up (forcing state back to
+			// IDLE here) before the backend's own async connect result ever arrives.
+			_trace(rfu, "FINISH_CONNECTION called while state=%d (not yet CLIENT) - forcing IDLE", rfu->state);
 			buffer[0] = RFU_CONNECTING;
 			rfu->state = RFU_STATE_IDLE;
 		}
@@ -773,6 +782,7 @@ static bool _dataAvailable(const struct GBASIORFU* rfu) {
 }
 
 static void _finishCommand(struct GBASIORFU* rfu) {
+	uint8_t command = rfu->command;
 	int result = _processCommand(rfu);
 	if (result < 0) {
 		rfu->link = RFU_LINK_ERROR_HEADER;
@@ -781,6 +791,16 @@ static void _finishCommand(struct GBASIORFU* rfu) {
 	} else {
 		rfu->link = RFU_LINK_RESPONSE_ACK;
 		rfu->length = result;
+		// DEBUG: dump the response words of the broadcast-search commands, to compare a working (local) peer
+		// against a synthesized (LDN) one word-for-word. TODO remove once the LDN search-list mystery is solved.
+		if ((command == RFU_CMD_BROADCAST_READ_POLL || command == RFU_CMD_BROADCAST_READ_END) && result > 0) {
+			char text[512];
+			int at = 0;
+			for (int i = 0; i < result && at < (int) sizeof(text) - 10; ++i) {
+				at += snprintf(&text[at], sizeof(text) - at, "%08X ", rfu->buffer[i]);
+			}
+			_trace(rfu, "RESP   cmd=%02X words=%d: %s", command, result, text);
+		}
 	}
 	rfu->count = 0;
 }

@@ -29,6 +29,9 @@
 #include <mgba/internal/gba/sio/dolphin.h>
 #include <mgba/internal/gba/sio/rfu.h>
 #include <mgba/internal/gba/sio/rfu-udp.h>
+#ifdef USE_LDN_BROADCAST
+#include <mgba/internal/gba/sio/rfu-broadcast.h>
+#endif
 #endif
 
 #ifdef M_CORE_GBA
@@ -205,7 +208,7 @@ public slots:
 #ifdef M_CORE_GBA
 	void attachBattleChipGate();
 	void detachBattleChipGate();
-	void setRFUEnabled(bool);
+	void setRFUBackend(const QString&);
 	bool rfuEnabled() const;
 	void setBattleChipId(uint16_t id);
 	void setBattleChipFlavor(int flavor);
@@ -260,7 +263,7 @@ private:
 #ifdef M_CORE_GBA
 	void attachRFU();
 	void detachRFU();
-	bool startRFU();
+	bool startRFU(const QString& backend);
 	void stopRFU();
 #endif
 
@@ -361,6 +364,8 @@ private:
 	GBASIORFU m_rfu;
 	GBASIORFUBackend* m_rfuBackend = nullptr;
 	bool m_rfuAttached = false;
+	QString m_rfuBackendName;
+	QString m_rfuLdnKeysPath; // rfu.ldn.keys, refreshed from loadConfig() (core->config does not carry ports.qt keys)
 	MultiplayerController* m_rfuSavedMultiplayer = nullptr;
 	QByteArray m_eReaderData;
 #endif

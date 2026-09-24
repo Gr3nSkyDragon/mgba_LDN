@@ -39,7 +39,23 @@ set(SIO_FILES
 	sio/dolphin.c
 	sio/lockstep.c
 	sio/rfu.c
+	sio/rfu-backends.c
 	sio/rfu-udp.c)
+
+if(USE_LDN_BROADCAST)
+	list(APPEND SIO_FILES
+		sio/ldn/ldnd.c
+		sio/ldn/netlink.c
+		sio/ldn/ldn.c
+		sio/ldn/ldn-monitor.c
+		sio/ldn/ldn-station.c
+		sio/ldn/ldn-auth.c
+		sio/ldn/ldn-pia.c
+		sio/ldn/ldn-pia-reliable.c
+		sio/ldn/ldn-pia-connect.c
+		sio/ldn/rfu-broadcast.c
+		../third-party/zstd/zstdlib.c)
+endif()
 
 set(EXTRA_FILES
 	extra/battlechip.c

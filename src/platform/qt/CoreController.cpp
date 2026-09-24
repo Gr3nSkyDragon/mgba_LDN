@@ -14,6 +14,7 @@
 
 #include <QAbstractButton>
 #include <QDateTime>
+#include <QDebug>
 #include <QMessageBox>
 #include <QMutexLocker>
 
@@ -334,6 +335,19 @@ void CoreController::loadConfig(ConfigController* config) {
 		m_threadContext.core->reloadConfigOption(m_threadContext.core, "sgb.borders", nullptr);
 	}
 	m_threadContext.core->reloadConfigOption(m_threadContext.core, "gb.pal", config->config());
+#endif
+
+#ifdef USE_LDN_BROADCAST
+	// core->config does not carry ports.qt-scoped keys (the same reason rfu.backend is pushed via setRFUBackend
+	// rather than read from it), so rfu.ldn.keys has to come from here, the one place we are handed the real
+	// ConfigController. Refreshed on every settings change, and pushed live if the Broadcast backend is already
+	// attached (searching does not need to be restarted to pick up a new value).
+	m_rfuLdnKeysPath = config->getOption("rfu.ldn.keys");
+	if (m_rfuBackend && m_rfuBackendName == QLatin1String("broadcast")) {
+		const char* envKeys = getenv("MGBA_RFU_LDN_KEYS");
+		QByteArray path = envKeys && envKeys[0] ? QByteArray(envKeys) : m_rfuLdnKeysPath.toUtf8();
+		GBASIORFUBroadcastSetKeysPath(m_rfuBackend, path.isEmpty() ? nullptr : path.constData());
+	}
 #endif
 }
 
@@ -1117,20 +1131,44 @@ void CoreController::endPrint() {
 #endif
 
 #ifdef M_CORE_GBA
-// The wireless adapter is switched on with the Emulation > "Wireless adapter" menu entry (saved as rfu.enabled in the
-// config). For development the MGBA_RFU_BACKEND environment variable (or rfu.backend config value) set to anything
-// but "off" or "0" also forces it on, and MGBA_RFU_TRACE=<file> (or rfu.trace) writes the adapter's protocol trace.
-// Behind the adapter is a local UDP "air" (rfu-udp.c): other mGBA processes on this machine with the adapter on are
-// in range. MGBA_RFU_BACKEND=none (or rfu.backend) leaves the adapter with nobody in range instead.
+// The wireless adapter is chosen with the Emulation > "Wireless adapter" submenu (saved as rfu.backend in the config):
+//   off        no adapter on the link port
+//   local      the adapter's "air" is UDP on this computer: other mGBA processes with the adapter on are in range
+//   broadcast  a real Switch over LDN (not implemented yet: the adapter works but nobody is in range)
+//   usb        an external adapter, e.g. an ESP32 (not implemented yet, same as broadcast)
+// For development the MGBA_RFU_BACKEND environment variable takes the same names (plus "none": an adapter with nobody
+// in range) and overrides the menu. MGBA_RFU_TRACE=<file> (or rfu.trace) writes the adapter's protocol trace.
 //
 // The adapter and mGBA's own multiplayer (lockstep) feature both need the game's single link-port driver, so a game
-// uses one or the other: enabling the adapter takes the game out of multiplayer, disabling it puts it back.
+// uses one or the other: turning the adapter on takes the game out of multiplayer, turning it off puts it back.
 static const char* rfuSetting(mCore* core, const char* env, const char* key) {
 	const char* value = getenv(env);
 	if (!value || !value[0]) {
 		value = mCoreConfigGetValue(&core->config, key);
 	}
 	return value;
+}
+
+static QString rfuNormalizeBackend(const QString& name) {
+	QString value = name.trimmed().toLower();
+	if (value.isEmpty() || value == QLatin1String("off") || value == QLatin1String("0")) {
+		return QStringLiteral("off");
+	}
+	if (value == QLatin1String("udp") || value == QLatin1String("1")) {
+		return QStringLiteral("local");
+	}
+	return value;
+}
+
+static bool rfuEnvironmentOverride(QString* name = nullptr) {
+	const char* env = getenv("MGBA_RFU_BACKEND");
+	if (!env || !env[0]) {
+		return false;
+	}
+	if (name) {
+		*name = rfuNormalizeBackend(QString::fromUtf8(env));
+	}
+	return true;
 }
 
 // True only while our driver really is the one on the link port (another driver may have replaced it).
@@ -1142,22 +1180,33 @@ bool CoreController::rfuEnabled() const {
 	return gba->sio.driver == &m_rfu.d;
 }
 
-bool CoreController::startRFU() {
-	if (rfuEnabled()) {
+bool CoreController::startRFU(const QString& backend) {
+	if (rfuEnabled() && m_rfuBackendName == backend) {
 		return true;
 	}
 	mCore* core = m_threadContext.core;
-	if (m_rfuAttached) {
-		// The driver was replaced behind our back; it is already deinitialised, just release what we hold.
-		GBASIORFUDestroy(&m_rfu);
-		GBASIORFUUDPDestroy(m_rfuBackend);
-		m_rfuBackend = nullptr;
-		m_rfuAttached = false;
-	}
+	// Also releases what we hold when the driver was replaced behind our back (it is already deinitialised then).
+	stopRFU();
 
-	const char* backendName = rfuSetting(core, "MGBA_RFU_BACKEND", "rfu.backend");
-	if (!backendName || strcmp(backendName, "none") != 0) {
-		m_rfuBackend = GBASIORFUUDPCreate();
+	if (backend != QLatin1String("none")) {
+		m_rfuBackend = GBASIORFUBackendCreate(backend.toUtf8().constData());
+		if (!m_rfuBackend) {
+			qWarning() << "Unknown wireless adapter backend" << backend;
+			return false;
+		}
+#ifdef USE_LDN_BROADCAST
+		if (backend == QLatin1String("broadcast")) {
+			// prod.keys: set in Tools > Settings > BIOS (rfu.ldn.keys), or MGBA_RFU_LDN_KEYS for development.
+			// mGBA never launches ldnd itself; this only tells the backend where to find the decryption keys once
+			// it connects to whatever ldnd the user already has running. m_rfuLdnKeysPath is kept up to date by
+			// loadConfig() - core->config does not carry ports.qt-scoped keys like rfu.ldn.keys, so it cannot be
+			// read here directly (the same reason the backend NAME comes in as a parameter rather than being
+			// read from config too).
+			const char* envKeys = getenv("MGBA_RFU_LDN_KEYS");
+			QByteArray keysPath = envKeys && envKeys[0] ? QByteArray(envKeys) : m_rfuLdnKeysPath.toUtf8();
+			GBASIORFUBroadcastSetKeysPath(m_rfuBackend, keysPath.isEmpty() ? nullptr : keysPath.constData());
+		}
+#endif
 	}
 	GBASIORFUCreate(&m_rfu, m_rfuBackend);
 
@@ -1173,6 +1222,7 @@ bool CoreController::startRFU() {
 	}
 
 	core->setPeripheral(core, mPERIPH_GBA_LINK_PORT, &m_rfu.d);
+	m_rfuBackendName = backend;
 	m_rfuAttached = true;
 	return true;
 }
@@ -1185,20 +1235,18 @@ void CoreController::stopRFU() {
 		m_threadContext.core->setPeripheral(m_threadContext.core, mPERIPH_GBA_LINK_PORT, nullptr);
 	}
 	GBASIORFUDestroy(&m_rfu);
-	GBASIORFUUDPDestroy(m_rfuBackend);
+	GBASIORFUBackendDestroy(m_rfuBackend);
 	m_rfuBackend = nullptr;
+	m_rfuBackendName.clear();
 	m_rfuAttached = false;
 }
 
-// Called on the emulation thread when a game starts: attach the adapter if the setting (or the dev variable) asks.
+// Called on the emulation thread when a game starts. Only the development override is handled here; the menu setting
+// is applied by Window once the game is up (the core's own config does not carry the Qt options).
 void CoreController::attachRFU() {
-	mCore* core = m_threadContext.core;
-	const char* force = rfuSetting(core, "MGBA_RFU_BACKEND", "rfu.backend");
-	bool forced = force && force[0] && strcmp(force, "off") != 0 && strcmp(force, "0") != 0;
-	int enabled = 0;
-	mCoreConfigGetIntValue(&core->config, "rfu.enabled", &enabled);
-	if (enabled || forced) {
-		startRFU();
+	QString name;
+	if (rfuEnvironmentOverride(&name) && name != QLatin1String("off")) {
+		startRFU(name);
 		if (m_rfuAttached && m_multiplayer) {
 			// Not part of multiplayer while the adapter has the link port; nothing has been attached yet at this point.
 			m_rfuSavedMultiplayer = m_multiplayer;
@@ -1211,22 +1259,14 @@ void CoreController::detachRFU() {
 	stopRFU();
 }
 
-// Called from the GUI thread by the menu toggle while a game may be running.
-void CoreController::setRFUEnabled(bool enabled) {
-	if (platform() != mPLATFORM_GBA) {
+// Called from the GUI thread by the menu while a game may be running. Switching backends detaches and re-attaches
+// the adapter, which the game sees as the adapter being unplugged and plugged back in.
+void CoreController::setRFUBackend(const QString& requested) {
+	if (platform() != mPLATFORM_GBA || rfuEnvironmentOverride()) {
 		return;
 	}
-	if (enabled) {
-		if (rfuEnabled()) {
-			return;
-		}
-		Interrupter interrupter(this);
-		if (m_multiplayer) {
-			m_rfuSavedMultiplayer = m_multiplayer;
-			clearMultiplayerController();
-		}
-		startRFU();
-	} else {
+	QString name = rfuNormalizeBackend(requested);
+	if (name == QLatin1String("off")) {
 		if (!m_rfuAttached) {
 			return;
 		}
@@ -1239,7 +1279,17 @@ void CoreController::setRFUEnabled(bool enabled) {
 			m_rfuSavedMultiplayer = nullptr;
 			setMultiplayerController(multiplayer);
 		}
+		return;
 	}
+	if (rfuEnabled() && m_rfuBackendName == name) {
+		return;
+	}
+	Interrupter interrupter(this);
+	if (m_multiplayer) {
+		m_rfuSavedMultiplayer = m_multiplayer;
+		clearMultiplayerController();
+	}
+	startRFU(name);
 }
 
 void CoreController::attachBattleChipGate() {

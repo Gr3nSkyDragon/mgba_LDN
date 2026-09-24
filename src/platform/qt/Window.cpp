@@ -925,8 +925,8 @@ void Window::gameStarted() {
 	m_config->updateOption("interframeBlending");
 	m_config->updateOption("resampleVideo");
 #ifdef M_CORE_GBA
-	// Re-applies the saved setting to the newly started game (attaches the wireless adapter if it is ticked).
-	m_config->updateOption("rfu.enabled");
+	// Applies the saved wireless adapter choice to the newly started game.
+	m_controller->setRFUBackend(m_config->getOption("rfu.backend", "off"));
 #endif
 	attachWidget(m_display.get());
 	setFocus();
@@ -1608,15 +1608,24 @@ void Window::setupMenu(QMenuBar* menubar) {
 	auto bcGate = addGameAction(tr("BattleChip Gate..."), "bcGate", openControllerTView<BattleChipView>(this), "emu");
 	m_platformActions.insert(mPLATFORM_GBA, bcGate);
 
-	// Wireless adapter (RFU). No network is behind it yet: the game sees an adapter with nobody else in range.
-	ConfigOption* rfuEnabled = m_config->addOption("rfu.enabled");
-	rfuEnabled->addBoolean(tr("Wireless adapter"), &m_actions, "emu");
-	rfuEnabled->connect([this](const QVariant& value) {
+	// Wireless adapter (RFU): off, or which backend carries its "air" (see CoreController::setRFUBackend).
+	m_actions.addMenu(tr("Wireless Adapter"), "rfu", "emu");
+	ConfigOption* rfuBackend = m_config->addOption("rfu.backend");
+	rfuBackend->addValue(tr("Off"), "off", &m_actions, "rfu");
+	m_actions.addSeparator("rfu");
+	rfuBackend->addValue(tr("Local"), "local", &m_actions, "rfu");
+	rfuBackend->addValue(tr("Broadcast"), "broadcast", &m_actions, "rfu");
+	rfuBackend->addValue(tr("Android"), "usb", &m_actions, "rfu"); // placeholder label; internal name "usb" unchanged
+	rfuBackend->connect([this](const QVariant& value) {
 		if (m_controller) {
-			m_controller->setRFUEnabled(value.toBool());
+			m_controller->setRFUBackend(value.toString());
 		}
 	}, this);
-	m_config->updateOption("rfu.enabled");
+	// Before the menu had a choice, ticking "Wireless adapter" meant the link between windows on this computer.
+	if (m_config->getOption("rfu.backend").isEmpty() && m_config->getOption("rfu.enabled").toInt()) {
+		m_config->setOption("rfu.backend", "local");
+	}
+	rfuBackend->setValue(QVariant(m_config->getOption("rfu.backend", "off")));
 #endif
 
 	m_actions.addMenu(tr("Audio/&Video"), "av");
