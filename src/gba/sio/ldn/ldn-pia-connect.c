@@ -79,18 +79,6 @@ static size_t _buildNetResponse(uint32_t seqid, uint8_t* out) {
 	return 8;
 }
 
-static size_t _buildNetPropertyAck(uint32_t seqid, uint8_t* out) {
-	out[0] = 0x01;
-	out[1] = LDN_PIA_NET_UPDATE_PROPERTY_ACK;
-	out[2] = 0;
-	out[3] = 0;
-	out[4] = (uint8_t) (seqid >> 24);
-	out[5] = (uint8_t) (seqid >> 16);
-	out[6] = (uint8_t) (seqid >> 8);
-	out[7] = (uint8_t) seqid;
-	return 8;
-}
-
 // ---------------------------------------------------------------------------------------------------------------
 // Session(13)
 // ---------------------------------------------------------------------------------------------------------------
@@ -202,14 +190,19 @@ void LdnPiaConnectOnMessage(struct LdnPiaConnect* c, uint8_t proto, const uint8_
 				size_t joinLength = _buildSessionJoin(c, join);
 				_queueOut(c, LDN_PIA_PROTO_SESSION, 0, c->ourVar, true, false, true, join, joinLength);
 			}
-		} else if (length >= 2 && payload[1] == LDN_PIA_NET_UPDATE_PROPERTY) {
-			uint32_t seqid = 1;
-			if (length >= 8) {
-				seqid = ((uint32_t) payload[4] << 24) | ((uint32_t) payload[5] << 16) | ((uint32_t) payload[6] << 8) | payload[7];
-			}
-			uint8_t ack[8];
-			size_t ackLength = _buildNetPropertyAck(seqid, ack);
-			_queueOut(c, LDN_PIA_PROTO_NET, 0, c->ourVar, false, false, false, ack, ackLength);
+		} else if (length >= 8 && (payload[1] == LDN_PIA_NET_CONN_REQUEST || payload[1] == LDN_PIA_NET_UPDATE_PROPERTY || payload[1] == LDN_PIA_NET_KEEP_ALIVE)) {
+			// Every other host net request - a repeated connection request, a network status update (0x11 again after the
+			// join), a network property update (0x50) or a keep-alive (0x80) - repeats every ~500 ms until answered with the
+			// request's type + 1 and the same sequence id (GB-Link's firmware, pia_conn.c: a property update left
+			// unanswered is retried for ~10 minutes, then the host stops taking this station's traffic). The host only
+			// takes the acknowledgement in the form it uses itself - packet id 0, establishing, no footer - never with a
+			// running packet id (which is what this branch used to send). Two copies go out: source 0 (the form it takes)
+			// and source = our station id (the form it uses itself); a duplicate is harmless.
+			uint32_t seqid = ((uint32_t) payload[4] << 24) | ((uint32_t) payload[5] << 16) | ((uint32_t) payload[6] << 8) | payload[7];
+			uint8_t ack[8] = {0x01, (uint8_t) (payload[1] + 1), 0, 0, (uint8_t) (seqid >> 24), (uint8_t) (seqid >> 16), (uint8_t) (seqid >> 8),
+			                  (uint8_t) seqid};
+			_queueOut(c, LDN_PIA_PROTO_NET, 0, 0, true, false, false, ack, sizeof(ack));
+			_queueOut(c, LDN_PIA_PROTO_NET, 0, c->ourVar, true, false, false, ack, sizeof(ack));
 		}
 	} else if (proto == LDN_PIA_PROTO_SESSION) {
 		uint8_t type = length > 0 ? payload[0] : 0xFF;

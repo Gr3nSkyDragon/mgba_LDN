@@ -144,6 +144,7 @@ struct GBASIORFUBroadcast {
 	// carriers both ways, and a 'K' ack from us for every host 'T'.
 	uint16_t piaConnectId; // our self-chosen, nonzero RFU connection id (the host just echoes it back)
 	bool piaConnectQueued; // 'C' has been queued
+	bool piaHostTSeen; // the host's own 'T' slot stream has started (its first idle keepalive arrived)
 	bool piaAccepted; // the host's 'A' arrived - only then do the game's slots go out as 'T' frames
 	uint32_t piaTs; // per-NEW-frame 'T' counter
 	uint32_t piaKSeq; // joiner-global 'K' counter (+1 from 1)
@@ -167,11 +168,20 @@ static void _onAdvertisement(void* context, const uint8_t* mac, const uint8_t* b
 	struct GBASIORFUBroadcast* broadcast = context;
 	(void) channel;
 	struct LdnAdvertisement ad;
+	static unsigned heard;
+	bool traceHeard = (heard++ % 20) == 0; // an LDN advertisement of any kind reached us: proves the radio is receiving
 	if (!LdnDecodeAdvertisement(body, bodyLength, broadcast->haveKeys ? &broadcast->keys : NULL, &ad) || !ad.infoDecoded) {
+		if (traceHeard) {
+			GBASIORFUTrace(broadcast->rfu, "LDN    heard an LDN advertisement (%zu bytes, channel %u) that could not be decoded (keys loaded: %d)", bodyLength, channel,
+			               broadcast->haveKeys);
+		}
 		return;
 	}
 	struct LdnRfuBeacon beacon;
 	if (!LdnDecodeRfuBeacon(ad.appData, ad.appDataSize, &beacon)) {
+		if (traceHeard) {
+			GBASIORFUTrace(broadcast->rfu, "LDN    heard a decoded advertisement (app data %zu bytes) that is not a Pokemon RFU beacon", (size_t) ad.appDataSize);
+		}
 		return;
 	}
 
@@ -657,7 +667,8 @@ static DWORD WINAPI _connectThreadProc(LPVOID arg) {
 		broadcast->piaConnectId = (uint16_t) (0x1000 | (GetTickCount() & 0x0FFF)); // any nonzero value works
 		broadcast->piaConnectQueued = false;
 		broadcast->piaAccepted = false;
-		broadcast->piaTs = 0;
+		broadcast->piaHostTSeen = false;
+		broadcast->piaTs = 0x362D; // the first 'T' is 0x362E: the reference simulator's and the firmware's seed
 		broadcast->piaKSeq = 0;
 		memcpy(broadcast->piaOurMac, ourMac, 6);
 		memcpy(broadcast->piaHostMac, hostMac, 6);
@@ -728,6 +739,14 @@ static void _connect(struct GBASIORFUBackend* backend, uint16_t deviceId) {
 	}
 	attempt->broadcast = broadcast;
 	attempt->deviceId = deviceId;
+	// The channel the advertisement was HEARD on is not necessarily the network's: the monitor hops 1/6/11 and can catch a
+	// frame from a neighbouring channel. Two of three attempts against the same room associated on the heard channel (6)
+	// and were rejected (WLAN status 1); the third, on channel 1, worked. The advertisement itself names the channel the
+	// host's network is on, so use that when it is a valid 2.4 GHz channel.
+	if (ad.advertisedChannel >= 1 && ad.advertisedChannel <= 13) {
+		GBASIORFUTrace(broadcast->rfu, "LDN    advertisement heard on channel %u, network advertises channel %u", channel, ad.advertisedChannel);
+		channel = ad.advertisedChannel;
+	}
 	attempt->channel = channel;
 	memcpy(attempt->adMac, adMac, 6);
 	attempt->ad = ad;
@@ -748,10 +767,28 @@ static void _connect(struct GBASIORFUBackend* backend, uint16_t deviceId) {
 
 enum { kGbaMarker = 0x57, kGbaC = 0x43, kGbaA = 0x41, kGbaT = 0x54, kGbaK = 0x4B, kGbaD = 0x44 };
 
+static bool _piaSendRaw(struct GBASIORFUBroadcast* broadcast, uint8_t proto, uint16_t dst, uint16_t src, bool establishing, bool footer,
+                        bool compress, bool haveMsgFlags, uint8_t msgFlags, const uint8_t* payload, size_t length);
+
+// A queued Reliable frame goes on the wire at once and is only retransmitted (LdnPiaReliablePoll) after the RTO. The
+// window code only ever transmits from Poll, so without this every new frame - the stream-open metadata, the connect
+// request, each K ack and each 'T' slot - waited a full RTO (200 ms bootstrap, and since a "retransmit" never yields an RTT
+// sample it never shortened) before its first send. GB-Link's firmware (pia_link.c) and the reference simulator
+// (_tx_reliable) both transmit immediately.
+static void _reliableTransmit(struct GBASIORFUBroadcast* broadcast, uint16_t seq, uint8_t flagsA, const uint8_t* payload, size_t length) {
+	uint8_t inner[8 + LDN_PIA_RELIABLE_MAX_PAYLOAD];
+	size_t innerLength = LdnPiaBuildReliableFrame(seq, LdnPiaReliableSendLow(broadcast->piaReliable), flagsA, payload, length, inner);
+	_piaSendRaw(broadcast, LDN_PIA_PROTO_RELIABLE, broadcast->piaConn.hostVar, broadcast->piaConn.ourVar, false, true, false, false, 0, inner,
+	            innerLength);
+}
+
 static bool _reliableQueue(struct GBASIORFUBroadcast* broadcast, const uint8_t* payload, size_t length) {
 	uint16_t seq = 0;
 	bool queued = LdnPiaReliableSend(broadcast->piaReliable, payload, length, GetTickCount(), &seq);
 	GBASIORFUTrace(broadcast->rfu, "PIA    queue reliable seq=%04X %zu bytes type=%c queued=%d", seq, length, length > 1 ? payload[1] : '?', queued);
+	if (queued) {
+		_reliableTransmit(broadcast, seq, LDN_PIA_FLAGSA_GBA, payload, length);
+	}
 	return queued;
 }
 
@@ -819,6 +856,7 @@ static void _gbaReceive(struct GBASIORFUBroadcast* broadcast, const uint8_t* dat
 			uint32_t ts = body[0] | (body[1] << 8) | (body[2] << 16) | ((uint32_t) body[3] << 24);
 			size_t slotLength = body[4];
 			GBASIORFUTrace(broadcast->rfu, "PIA    host 'T' ts=%u slot_len=%zu", ts, slotLength);
+			broadcast->piaHostTSeen = true;
 			_gbaSendAck(broadcast, ts);
 			if (slotLength > 1 && 8 + slotLength <= bodyLength) {
 				GBASIORFUDataReceived(broadcast->rfu, 0, &body[8], slotLength);
@@ -836,15 +874,38 @@ static void _gbaReceive(struct GBASIORFUBroadcast* broadcast, const uint8_t* dat
 #endif
 
 #ifdef _WIN32
+// Hex of the first bytes of a datagram's plaintext, for the byte-level comparison against the reference simulator; only
+// the first few dozen reliable-stream datagrams are dumped (the stream's setup, where the host's accept is missing).
+static void _hexTrace(struct GBASIORFUBroadcast* broadcast, const char* what, const uint8_t* data, size_t length) {
+	static unsigned dumped;
+	if (dumped++ >= 80) {
+		return;
+	}
+	char hex[400];
+	size_t shown = length < 128 ? length : 128;
+	for (size_t i = 0; i < shown; ++i) {
+		snprintf(&hex[i * 2], 3, "%02X", data[i]);
+	}
+	hex[shown * 2] = 0;
+	GBASIORFUTrace(broadcast->rfu, "PIA    %s (%zu bytes): %s", what, length, hex);
+}
+#endif
+
+#ifdef _WIN32
 // Sends one Pia message as its own datagram - mirrors ldn-pia-join.c's own `_sendRaw`/`_sendMessage` exactly
 // (including the live-confirmed dynamic header flags byte; see its comments for why), just operating on the
 // broadcast backend's own persistent session fields instead of a separate PiaSender struct.
 static bool _piaSendRaw(struct GBASIORFUBroadcast* broadcast, uint8_t proto, uint16_t dst, uint16_t src, bool establishing, bool footer,
-                        bool compress, const uint8_t* payload, size_t length) {
+                        bool compress, bool haveMsgFlags, uint8_t msgFlags, const uint8_t* payload, size_t length) {
 	uint8_t tiled[kPiaMaxTiled];
-	size_t tiledLength = LdnPiaBuildMessage(proto, payload, length, false, 0, tiled);
+	size_t tiledLength = LdnPiaBuildMessage(proto, payload, length, haveMsgFlags, msgFlags, tiled);
+	if (proto == LDN_PIA_PROTO_RELIABLE) {
+		_hexTrace(broadcast, "tx plaintext message", tiled, tiledLength);
+	}
 	bool compressed = false;
-	if (compress) {
+	// The native client compresses any message body of 62 bytes or more (GB-Link's firmware does the same); the
+	// Switch decompresses by the flag, so this is for fidelity rather than correctness.
+	if (compress || tiledLength >= 62) {
 		uint8_t compbuf[sizeof(tiled)];
 		size_t compLength = sizeof(compbuf);
 		if (LdnPiaCompress(tiled, tiledLength, compbuf, &compLength)) {
@@ -887,7 +948,7 @@ static bool _piaSendRaw(struct GBASIORFUBroadcast* broadcast, uint8_t proto, uin
 }
 
 static bool _piaSendMessage(struct GBASIORFUBroadcast* broadcast, const struct LdnPiaOutMessage* msg) {
-	return _piaSendRaw(broadcast, msg->proto, msg->dst, msg->src, msg->establishing, msg->footer, msg->compress, msg->payload, msg->length);
+	return _piaSendRaw(broadcast, msg->proto, msg->dst, msg->src, msg->establishing, msg->footer, msg->compress, false, 0, msg->payload, msg->length);
 }
 #endif
 
@@ -929,6 +990,7 @@ static void _frame(struct GBASIORFUBackend* backend) {
 				struct LdnPiaMessage messages[8];
 				size_t consumed;
 				size_t n = LdnPiaParseMessages(decompressed, decompressedLength, messages, 8, &consumed);
+				_hexTrace(broadcast, "rx plaintext body", decompressed, decompressedLength);
 				if (!n) {
 					GBASIORFUTrace(broadcast->rfu, "PIA    no tiled messages parsed (decompressed %zu bytes)", decompressedLength);
 				}
@@ -940,12 +1002,25 @@ static void _frame(struct GBASIORFUBackend* backend) {
 						if (LdnPiaParseReliableFrame(messages[i].payload, messages[i].payloadLength, &frame)) {
 							GBASIORFUTrace(broadcast->rfu, "PIA    rx reliable flagsA=%02X seq=%04X ack=%04X payload=%zu", frame.flagsA, frame.seq,
 							               frame.ack, frame.payloadLength);
+							if (!(frame.flagsA & LDN_PIA_FLAGSA_APP_DATA)) {
+								uint16_t ackId;
+								uint8_t mask[16];
+								if (LdnPiaParseBulkAck(frame.payload, frame.payloadLength, &ackId, mask)) {
+									GBASIORFUTrace(broadcast->rfu, "PIA    host bulk-ack: everything before %04X received; mask %02X%02X%02X%02X (our next seq %04X)", ackId,
+									               mask[0], mask[1], mask[2], mask[3], reliable->outSeq);
+								}
+							}
 							struct LdnPiaReliableEntry delivered[8];
 							size_t nd = LdnPiaReliableReceive(reliable, &frame, GetTickCount(), delivered, 8);
 							for (size_t d = 0; d < nd; ++d) {
+								bool streamOpen = (delivered[d].flagsA & LDN_PIA_FLAGSA_INITIALIZED) != 0;
 								GBASIORFUTrace(broadcast->rfu, "PIA    deliver seq=%04X flagsA=%02X len=%zu%s", delivered[d].seq, delivered[d].flagsA,
-								               delivered[d].length, (delivered[d].flagsA & LDN_PIA_FLAGSA_INITIALIZED) ? " (stream-open, not forwarded)" : "");
-								if (!(delivered[d].flagsA & LDN_PIA_FLAGSA_INITIALIZED)) {
+								               delivered[d].length, streamOpen ? " (stream-open)" : "");
+								// The host's stream-open frame is NOT bare metadata: it carries the host's emulator connect accept
+								// ('A', 57 41 06 00 <host session id:2> <our connect id:2> 00 00) as its payload. Dropping it as
+								// "not real RFU data" threw away the very frame the whole join waits for. Anything that is a gba
+								// frame (marker 0x57) is delivered; the metadata frames we send ourselves start with 0x4A.
+								if (!streamOpen || (delivered[d].length && delivered[d].payload[0] == kGbaMarker)) {
 									_gbaReceive(broadcast, delivered[d].payload, delivered[d].length);
 								}
 							}
@@ -971,9 +1046,12 @@ static void _frame(struct GBASIORFUBackend* backend) {
 		LdnPiaReliableOpen(reliable, kLdnPiaMetadataFrame, sizeof(kLdnPiaMetadataFrame), GetTickCount(), &seq);
 		broadcast->piaOpenedStream = true;
 		GBASIORFUTrace(broadcast->rfu, "PIA    opened reliable stream (metadata frame seq=%04X)", seq);
-		if (!broadcast->piaConnectQueued) {
-			_gbaSendConnect(broadcast);
-		}
+		_reliableTransmit(broadcast, seq, LDN_PIA_FLAGSA_INIT, kLdnPiaMetadataFrame, sizeof(kLdnPiaMetadataFrame));
+	} else if (broadcast->piaOpenedStream && !broadcast->piaConnectQueued) {
+		// The stream opens with the metadata frame alone; the emulator connect request follows on the next frame (as the
+		// reference simulator's _drive_reliable does). The host starts ITS stream only after it sees the connect request
+		// (waiting for its 'T' first, as an earlier experiment here did, deadlocks).
+		_gbaSendConnect(broadcast);
 	}
 
 	struct LdnPiaOutMessage outMsgs[4];
@@ -990,7 +1068,10 @@ static void _frame(struct GBASIORFUBackend* backend) {
 			size_t innerLength =
 			    LdnPiaBuildReliableFrame(due[i].seq, LdnPiaReliableSendLow(reliable), due[i].flagsA, due[i].payload, due[i].length, inner);
 			GBASIORFUTrace(broadcast->rfu, "PIA    tx reliable seq=%04X flagsA=%02X payload=%zu", due[i].seq, due[i].flagsA, due[i].length);
-			_piaSendRaw(broadcast, LDN_PIA_PROTO_RELIABLE, conn->hostVar, conn->ourVar, false, true, false, inner, innerLength);
+			// A pure ack frame (flagsA 0) carries the message-level flags byte 0x40, as the firmware's does; data frames
+			// (flagsA 7/15) carry none.
+			_piaSendRaw(broadcast, LDN_PIA_PROTO_RELIABLE, conn->hostVar, conn->ourVar, false, true, false, due[i].flagsA == LDN_PIA_FLAGSA_CTRL,
+			            0x40, inner, innerLength);
 		}
 	}
 #else
