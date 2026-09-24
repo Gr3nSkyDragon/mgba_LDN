@@ -1616,7 +1616,6 @@ void Window::setupMenu(QMenuBar* menubar) {
 	rfuBackend->addValue(tr("Local"), "local", &m_actions, "rfu");
 	rfuBackend->addValue(tr("Broadcast"), "broadcast", &m_actions, "rfu");
 	rfuBackend->addValue(tr("ESP32"), "esp32", &m_actions, "rfu");
-	rfuBackend->addValue(tr("Android"), "usb", &m_actions, "rfu"); // placeholder label; internal name "usb" unchanged
 	rfuBackend->connect([this](const QVariant& value) {
 		if (m_controller) {
 			m_controller->setRFUBackend(value.toString());

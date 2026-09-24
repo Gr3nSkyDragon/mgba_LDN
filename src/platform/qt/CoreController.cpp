@@ -1134,8 +1134,8 @@ void CoreController::endPrint() {
 // The wireless adapter is chosen with the Emulation > "Wireless adapter" submenu (saved as rfu.backend in the config):
 //   off        no adapter on the link port
 //   local      the adapter's "air" is UDP on this computer: other mGBA processes with the adapter on are in range
-//   broadcast  a real Switch over LDN (not implemented yet: the adapter works but nobody is in range)
-//   usb        an external adapter, e.g. an ESP32 (not implemented yet, same as broadcast)
+//   broadcast  a real Switch over LDN, through a separately-running ldnd
+//   esp32      a real Switch through GB-Link's ESP32 LDN bridge board on a USB serial port
 // For development the MGBA_RFU_BACKEND environment variable takes the same names (plus "none": an adapter with nobody
 // in range) and overrides the menu. MGBA_RFU_TRACE=<file> (or rfu.trace) writes the adapter's protocol trace.
 //
@@ -1156,6 +1156,10 @@ static QString rfuNormalizeBackend(const QString& name) {
 	}
 	if (value == QLatin1String("udp") || value == QLatin1String("1")) {
 		return QStringLiteral("local");
+	}
+	if (value == QLatin1String("usb")) {
+		// The old placeholder "Android" entry: a setting saved from it now simply means no adapter.
+		return QStringLiteral("off");
 	}
 	return value;
 }

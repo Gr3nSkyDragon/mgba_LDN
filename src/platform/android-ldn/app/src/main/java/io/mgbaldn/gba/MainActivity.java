@@ -752,13 +752,62 @@ public class MainActivity extends Activity implements UsbLink.Logger {
         return dot > 0 ? name.substring(0, dot) : name;
     }
 
-    private void copy(Uri from, File to) throws java.io.IOException {
-        try (InputStream in = getContentResolver().openInputStream(from); OutputStream out = new FileOutputStream(to)) {
+    // Picked files are first read completely into a temporary file and only then placed at their destination. Copying
+    // straight to the destination emptied a file that was picked from the mGBA folder itself (the destination and the source
+    // are then the same file: opening it for writing truncates it before a single byte has been read), and for a save the
+    // "keep the old one as .bak" step moved the source away before it was read.
+    private File stage(Uri from) throws java.io.IOException {
+        File temp = File.createTempFile("import", ".tmp", getCacheDir());
+        try (InputStream in = getContentResolver().openInputStream(from); OutputStream out = new FileOutputStream(temp)) {
             byte[] buffer = new byte[1 << 16];
             int n;
             while ((n = in.read(buffer)) > 0) {
                 out.write(buffer, 0, n);
             }
+        } catch (java.io.IOException | RuntimeException e) {
+            temp.delete();
+            throw e;
+        }
+        if (temp.length() == 0) {
+            temp.delete();
+            throw new java.io.IOException("the picked file is empty");
+        }
+        return temp;
+    }
+
+    private static boolean sameContent(File a, File b) throws java.io.IOException {
+        if (a.length() != b.length()) {
+            return false;
+        }
+        try (InputStream x = new FileInputStream(a); InputStream y = new FileInputStream(b)) {
+            byte[] bx = new byte[1 << 16];
+            byte[] by = new byte[1 << 16];
+            int n;
+            while ((n = x.read(bx)) > 0) {
+                int got = 0;
+                while (got < n) {
+                    int m = y.read(by, got, n - got);
+                    if (m <= 0) {
+                        return false;
+                    }
+                    got += m;
+                }
+                for (int i = 0; i < n; ++i) {
+                    if (bx[i] != by[i]) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    /** Puts a staged file at {@code target} (replacing what is there) and removes the staging file. */
+    private static void place(File staged, File target) throws java.io.IOException {
+        try {
+            java.nio.file.Files.copy(staged.toPath(), target.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        } finally {
+            staged.delete();
         }
     }
 
@@ -778,7 +827,7 @@ public class MainActivity extends Activity implements UsbLink.Logger {
                         saveUris.add(uri);
                     } else if (!saveOnly) {
                         File target = new File(romDir, name);
-                        copy(uri, target);
+                        place(stage(uri), target);
                         roms.add(target);
                     }
                 }
@@ -791,12 +840,15 @@ public class MainActivity extends Activity implements UsbLink.Logger {
                     emulator.stop(); // release the running game's save before replacing anything
                     for (Uri uri : saveUris) {
                         File target = new File(saveDir, sanitize(displayName(uri)));
-                        if (target.exists()) {
+                        File staged = stage(uri); // fully read first: the source may be the very file being replaced
+                        if (target.exists() && !sameContent(staged, target)) {
+                            // Keep what is being replaced. (Re-importing a save that is already in the folder replaces it
+                            // with identical bytes, so no backup is made in that case.)
                             File backup = new File(saveDir, target.getName() + ".bak");
-                            backup.delete();
-                            target.renameTo(backup);
+                            java.nio.file.Files.copy(target.toPath(), backup.toPath(),
+                                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
                         }
-                        copy(uri, target);
+                        place(staged, target);
                         saves.add(target);
                     }
                     for (File save : saves) {

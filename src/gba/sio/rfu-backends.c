@@ -17,11 +17,10 @@
  * The backends a game's wireless adapter can be attached to, by name:
  *   "local"     adapters in other mGBA processes on this computer (UDP on 127.0.0.1, rfu-udp.c)
  *   "broadcast" a real Switch over local wireless, through a separately-running ldnd (ldn/rfu-broadcast.c).
- *               Searching only so far; joining always fails. Built only when USE_LDN_BROADCAST is on
- *               (Windows only); a stub elsewhere.
- *   "esp32"     GB-Link's ESP32 LDN bridge board over USB serial (esp32/rfu-esp32.c); Windows only for now
- *   "usb"       an external adapter on a USB port, e.g. an ESP32 - NOT IMPLEMENTED YET (stub)
- * A stub backend leaves the adapter present and working, but nobody is ever in range.
+ *               Built only when USE_LDN_BROADCAST is on (Windows only); a stub elsewhere.
+ *   "esp32"     GB-Link's ESP32 LDN bridge board over USB serial (esp32/rfu-esp32.c). The serial port is the built-in
+ *               Windows one unless the host application supplies its own (esp32/esp32-serial.h; the Android app does).
+ * The stub backend leaves the adapter present and working, but nobody is ever in range.
  */
 
 struct StubBackend {
@@ -62,9 +61,6 @@ struct GBASIORFUBackend* GBASIORFUBackendCreate(const char* name) {
 	}
 	if (!strcmp(name, "esp32")) {
 		return GBASIORFUESP32Create();
-	}
-	if (!strcmp(name, "usb")) {
-		return _createStub("usb");
 	}
 	return NULL;
 }
