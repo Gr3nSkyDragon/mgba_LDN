@@ -2,7 +2,7 @@
 
 ### Note from GSD:
 
-This fork and its primary unique feature(s) were coded using LLM generated material. Consequently, this fork is not associated with nor endorsed by mGBA or its primary contributors. It's provided as-is and is designed to be used in a Windows environment when using a computer and Android when using a mobile device. 
+This fork and its primary unique feature(s) were coded using LLM generated material. Consequently, this fork is not associated with nor endorsed by mGBA or its primary contributors. It's provided as-is and is designed to be used in a Windows environment when using a computer and Android when using a mobile device. This was designed for trading between Gen 3 GBA Pokemon games and the Switch ports. 
 
 # How to run
 
@@ -18,13 +18,17 @@ If you're using an ESP32, you'll need to install the firmware either [manually](
 
 ### Trading
 
+**DO NOT USE SPEED-UP** under any circumstances. The trade setup or actual trade will likely break down. You probably won't mess up your save file, as the game should just throw a communication error and revert to the last save, but I didn't test this to verify.
+
+The Switch **must** host all trades. The emulator can only join for now. I may work on getting Broadcast mode hosting working, but for now, all Wireless Adapter modes except Local are join-only.
+
 Do not use the Wireless Union Room (the left window lady on the upper floor of the Pokemon Center). You can go exploring there if you want, but actual trading is the right window lady.
 
 For trading between instances of mGBA, you can choose to enable the Wireless Adapter (Emulation > Wireless Adapter > Local) for up to two instances. This is more of a novelty thing, as the link cable mode works for up to four players, but I used this for developing the other modes and therefore included it.
 
-For trading between a computer and a Switch, you can choose Broadcast (Emulation > Wireless Adapter > Broadcast) or ESP32 (Emulation > Wireless Adapter > ESP32). Broadcast is designed for a USB Wi-Fi adapter and requires ldnd.exe to be set up correctly and running, and ESP32 is designed for the GB-Link Switch LDN firmware configuration. **Broadcast is currently still in development.** Trading with the ESP32 is fully implemented and may have other functionality like battling, berry blending, etc implemented, but I only tested trading. 
+For trading between a computer and a Switch, you can choose Broadcast (Emulation > Wireless Adapter > Broadcast) or ESP32 (Emulation > Wireless Adapter > ESP32). Broadcast is designed for a USB Wi-Fi adapter and requires ldnd.exe to be set up correctly and running, and ESP32 is designed for the GB-Link Switch LDN firmware configuration. The ESP32 firmware may have other functionality like battling, berry blending, etc implemented, but I only tested trading. 
 
-For trading between a smartphone and a Switch, you can choose Android. *(I think. This is currently stubbed, as I'm cleaning up Broadcast and haven't started any Android development yet. I'm not sure if this will be an APK or a RetroArch core, either, so there's that.)*
+For trading between a smartphone and a Switch, you can choose Android. *(I think. This is currently stubbed, as I haven't started any Android development yet. I'm not sure if this will be an APK or a RetroArch core, either, so there's that.)*
 
 Original ReadMe
 --------
