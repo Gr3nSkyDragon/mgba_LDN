@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Espressif native USB Serial/JTAG (ESP32-S3/C3/C6): VID 0x303A = 12346, PID 0x1001 = 4097 -->
+    <usb-device vendor-id="12346" product-id="4097" />
+</resources>

@@ -1,0 +1,8 @@
+# Build output and machine-specific files
+/core/
+/core-build/
+build/
+.gradle/
+.cxx/
+local.properties
+*.apk
