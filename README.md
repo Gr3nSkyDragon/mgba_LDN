@@ -1,3 +1,33 @@
+# Important!!!
+
+### Note from GSD:
+
+This fork and its primary unique feature(s) were coded using LLM generated material. Consequently, this fork is not associated with nor endorsed by mGBA or its primary contributors. It's provided as-is and is designed to be used in a Windows environment when using a computer and Android when using a mobile device. 
+
+# How to run
+
+### Prerequisites
+
+You will need your Switch prod.keys. You **must** have your Switch prod.keys for this fork to work. Everything else can be done with retail hardware, including trading with a Switch 2.
+
+You'll also need a way to broadcast Wi-Fi, be that a USB Wi-Fi adapter or devboard like the ESP32. If you're getting an ESP32, I recommend an ESP32-S3, as that is also compatible with [Pokemon Automation](https://pokemonautomation.github.io/index.html)
+
+If you're using a USB Wi-Fi adapter, you'll need to set up ldnd.exe from [unlimitedcoder2](https://gist.github.com/unlimitedcoder2/af2f09694563c6a6cd3d3e9ec45750bd). You'll need to follow the steps in that repository to set up your USB Wi-Fi adapter (you will need a compatible USB Wi-Fi adapter). I've been using a cheap/generic AC1300 adapter in my testing. This is a Windows-only program. If you have experience with Linux, you can probably convert it to be Linux-compatible fairly easily. You'll also need to tell mGBA where your prod.keys are stored when using your desktop (Tools > Settings > BIOS > prod.keys). 
+
+If you're using an ESP32, you'll need to install the firmware either [manually](https://github.com/GB-Link/GB-Link-Switch-LDN) or via [the GB-Link Switch LDN webpage](https://switch.gblink.io/?from=gblink-launcher). You'll also need to install your prod.keys on the ESP32. The webpage is a little more convenient to use so I'd recommend trying that first.
+
+### Trading
+
+Do not use the Wireless Union Room (the left window lady on the upper floor of the Pokemon Center). You can go exploring there if you want, but actual trading is the right window lady.
+
+For trading between instances of mGBA, you can choose to enable the Wireless Adapter (Emulation > Wireless Adapter > Local) for up to two instances. This is more of a novelty thing, as the link cable mode works for up to four players, but I used this for developing the other modes and therefore included it.
+
+For trading between a computer and a Switch, you can choose Broadcast (Emulation > Wireless Adapter > Broadcast) or ESP32 (Emulation > Wireless Adapter > ESP32). Broadcast is designed for a USB Wi-Fi adapter and requires ldnd.exe to be set up correctly and running, and ESP32 is designed for the GB-Link Switch LDN firmware configuration. **Broadcast is currently still in development.** 
+
+For trading between a smartphone and a Switch, you can choose Android. *(I think. This is currently stubbed, as I'm cleaning up Broadcast and haven't started any Android development yet. I'm not sure if this will be an APK or a RetroArch core, either, so there's that.)*
+
+Original ReadMe
+====
 mGBA
 ====
 
