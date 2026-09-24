@@ -22,12 +22,12 @@ Do not use the Wireless Union Room (the left window lady on the upper floor of t
 
 For trading between instances of mGBA, you can choose to enable the Wireless Adapter (Emulation > Wireless Adapter > Local) for up to two instances. This is more of a novelty thing, as the link cable mode works for up to four players, but I used this for developing the other modes and therefore included it.
 
-For trading between a computer and a Switch, you can choose Broadcast (Emulation > Wireless Adapter > Broadcast) or ESP32 (Emulation > Wireless Adapter > ESP32). Broadcast is designed for a USB Wi-Fi adapter and requires ldnd.exe to be set up correctly and running, and ESP32 is designed for the GB-Link Switch LDN firmware configuration. **Broadcast is currently still in development.** 
+For trading between a computer and a Switch, you can choose Broadcast (Emulation > Wireless Adapter > Broadcast) or ESP32 (Emulation > Wireless Adapter > ESP32). Broadcast is designed for a USB Wi-Fi adapter and requires ldnd.exe to be set up correctly and running, and ESP32 is designed for the GB-Link Switch LDN firmware configuration. **Broadcast is currently still in development.** Trading with the ESP32 is fully implemented and may have other functionality like battling, berry blending, etc implemented, but I only tested trading. 
 
 For trading between a smartphone and a Switch, you can choose Android. *(I think. This is currently stubbed, as I'm cleaning up Broadcast and haven't started any Android development yet. I'm not sure if this will be an APK or a RetroArch core, either, so there's that.)*
 
 Original ReadMe
-====
+--------
 mGBA
 ====
 
