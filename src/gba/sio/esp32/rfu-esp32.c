@@ -12,8 +12,66 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * Portability: the backend needs one I/O thread, one lock, a millisecond tick and a sleep. Windows uses its native
+ * calls; everything else (Android, Linux, macOS) uses POSIX threads. Everything below is otherwise platform independent
+ * (the serial port itself comes from esp32-serial.h).
+ */
 #ifdef _WIN32
 #include <windows.h>
+
+typedef HANDLE EspThread;
+typedef CRITICAL_SECTION EspLock;
+typedef volatile LONG EspFlag;
+
+#define ESP_THREAD_FUNC(name) static DWORD WINAPI name(LPVOID context)
+#define ESP_THREAD_RETURN return 0
+
+static uint32_t _ticks(void) { return GetTickCount(); }
+static void _espSleep(unsigned ms) { Sleep(ms); }
+static void _lockInit(EspLock* lock) { InitializeCriticalSection(lock); }
+static void _lockEnter(EspLock* lock) { EnterCriticalSection(lock); }
+static void _lockLeave(EspLock* lock) { LeaveCriticalSection(lock); }
+static void _lockDelete(EspLock* lock) { DeleteCriticalSection(lock); }
+static void _flagSet(EspFlag* flag, int value) { InterlockedExchange(flag, value); }
+static bool _threadStart(EspThread* thread, LPTHREAD_START_ROUTINE function, void* context) {
+	*thread = CreateThread(NULL, 0, function, context, 0, NULL);
+	return *thread != NULL;
+}
+static void _threadJoin(EspThread* thread) {
+	WaitForSingleObject(*thread, 8000);
+	CloseHandle(*thread);
+}
+#else
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
+
+typedef pthread_t EspThread;
+typedef pthread_mutex_t EspLock;
+typedef volatile int EspFlag;
+
+#define ESP_THREAD_FUNC(name) static void* name(void* context)
+#define ESP_THREAD_RETURN return NULL
+
+static uint32_t _ticks(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint32_t) ((uint64_t) ts.tv_sec * 1000u + ts.tv_nsec / 1000000u);
+}
+static void _espSleep(unsigned ms) { usleep(ms * 1000u); }
+static void _lockInit(EspLock* lock) { pthread_mutex_init(lock, NULL); }
+static void _lockEnter(EspLock* lock) { pthread_mutex_lock(lock); }
+static void _lockLeave(EspLock* lock) { pthread_mutex_unlock(lock); }
+static void _lockDelete(EspLock* lock) { pthread_mutex_destroy(lock); }
+static void _flagSet(EspFlag* flag, int value) { __atomic_store_n(flag, value, __ATOMIC_SEQ_CST); }
+static bool _threadStart(EspThread* thread, void* (*function)(void*), void* context) {
+	return pthread_create(thread, NULL, function, context) == 0;
+}
+static void _threadJoin(EspThread* thread) {
+	pthread_join(*thread, NULL);
+}
+#endif
 
 /*
  * How this backend talks to GB-Link's ESP32 LDN bridge (everything below was observed against a real ESP32-S3
@@ -58,13 +116,14 @@ struct GBASIORFUESP32 {
 	struct GBASIORFU* rfu;
 	char configuredPort[32];
 
-	HANDLE thread;
-	volatile LONG stop;
-	volatile LONG ready; // handshake finished: the board is in adapter-host mode
+	EspThread thread;
+	bool threadValid;
+	EspFlag stop;
+	EspFlag ready; // handshake finished: the board is in adapter-host mode
 
 	// Emulation thread -> I/O thread, and the connect bookkeeping both threads share. Created in Create(), not init():
 	// the SIO driver calls backend->reset() before backend->init(), and reset() takes this lock.
-	CRITICAL_SECTION lock;
+	EspLock lock;
 	struct {
 		uint8_t data[kOutBytes];
 		size_t length;
@@ -74,7 +133,7 @@ struct GBASIORFUESP32 {
 	bool connectPending;
 	bool connected;
 	uint16_t connectDevice;
-	DWORD connectDeadline;
+	uint32_t connectDeadline;
 
 	// I/O thread only.
 	struct Esp32Serial* port;
@@ -108,7 +167,7 @@ static bool _enqueue(struct GBASIORFUESP32* esp, const uint8_t* gbFrame, size_t 
 		return false;
 	}
 	bool queued = false;
-	EnterCriticalSection(&esp->lock);
+	_lockEnter(&esp->lock);
 	if (esp->outCount < kOutSlots) {
 		unsigned slot = (esp->outHead + esp->outCount) % kOutSlots;
 		memcpy(esp->out[slot].data, gbFrame, length);
@@ -116,7 +175,7 @@ static bool _enqueue(struct GBASIORFUESP32* esp, const uint8_t* gbFrame, size_t 
 		++esp->outCount;
 		queued = true;
 	}
-	LeaveCriticalSection(&esp->lock);
+	_lockLeave(&esp->lock);
 	return queued;
 }
 
@@ -233,14 +292,14 @@ static void _handleRfu1(struct GBASIORFUESP32* esp, const uint8_t* rfu1, size_t 
 		}
 		GBASIORFUBroadcastReceived(esp->rfu, (uint16_t) header, occupied ? 0xFF : 0, words);
 	} else if (type == RFU1_CONNECT_ACK) {
-		EnterCriticalSection(&esp->lock);
+		_lockEnter(&esp->lock);
 		bool wasPending = esp->connectPending;
 		uint16_t device = esp->connectDevice;
 		if (wasPending) {
 			esp->connectPending = false;
 			esp->connected = true;
 		}
-		LeaveCriticalSection(&esp->lock);
+		_lockLeave(&esp->lock);
 		if (wasPending) {
 			GBASIORFUTrace(esp->rfu, "ESP32  connect accepted by the board (our id %04X)", header & 0xFFFF);
 			GBASIORFUConnectResult(esp->rfu, true, device, 0);
@@ -271,18 +330,18 @@ static void _pumpOnce(struct GBASIORFUESP32* esp, bool* failed) {
 		}
 	}
 	if (!got) {
-		Sleep(2);
+		_espSleep(2);
 	}
 }
 
 // Reads and parses for `ms`, then reports whether a response/event frame starting with `prefix` was seen (a NULL
 // prefix just pumps).
 static bool _await(struct GBASIORFUESP32* esp, const char* prefix, unsigned ms) {
-	DWORD end = GetTickCount() + ms;
+	uint32_t end = _ticks() + ms;
 	esp->awaitPrefix = prefix;
 	esp->awaitMatched = false;
 	bool failed = false;
-	while (!esp->stop && !failed && (int32_t) (end - GetTickCount()) > 0) {
+	while (!esp->stop && !failed && (int32_t) (end - _ticks()) > 0) {
 		_pumpOnce(esp, &failed);
 		if (esp->awaitMatched) {
 			break;
@@ -295,9 +354,9 @@ static bool _await(struct GBASIORFUESP32* esp, const char* prefix, unsigned ms) 
 }
 
 static bool _waitMs(struct GBASIORFUESP32* esp, unsigned ms) {
-	DWORD end = GetTickCount() + ms;
-	while (!esp->stop && (int32_t) (end - GetTickCount()) > 0) {
-		Sleep(20);
+	uint32_t end = _ticks() + ms;
+	while (!esp->stop && (int32_t) (end - _ticks()) > 0) {
+		_espSleep(20);
 	}
 	return !esp->stop;
 }
@@ -317,12 +376,12 @@ static bool _handshake(struct GBASIORFUESP32* esp) {
 	Esp32WireParserInit(&esp->parser);
 
 	// Let the board boot (its console text is discarded), then switch it to binary mode.
-	DWORD end = GetTickCount() + kBootWaitMs;
+	uint32_t end = _ticks() + kBootWaitMs;
 	bool failed = false;
-	while (!esp->stop && !failed && (int32_t) (end - GetTickCount()) > 0) {
+	while (!esp->stop && !failed && (int32_t) (end - _ticks()) > 0) {
 		uint8_t discard[256];
 		if (Esp32SerialRead(esp->port, discard, sizeof(discard)) <= 0) {
-			Sleep(20);
+			_espSleep(20);
 		}
 	}
 	if (esp->stop) {
@@ -348,7 +407,7 @@ static bool _handshake(struct GBASIORFUESP32* esp) {
 		               esp->bytesRead, esp->parser.framesOk, esp->parser.framesBad, esp->lastText);
 		return false;
 	}
-	uint32_t session = (GetTickCount() ^ 0x5A5A1234u) | 1u;
+	uint32_t session = (_ticks() ^ 0x5A5A1234u) | 1u;
 	char text[48];
 	snprintf(text, sizeof(text), "LDN_BEGIN %08X", session);
 	_command(esp, text);
@@ -379,13 +438,13 @@ static void _picoReport(struct GBASIORFUESP32* esp) {
 }
 
 static void _run(struct GBASIORFUESP32* esp) {
-	DWORD nextReport = GetTickCount();
-	DWORD nextPing = GetTickCount() + kPingMs;
+	uint32_t nextReport = _ticks();
+	uint32_t nextPing = _ticks() + kPingMs;
 	bool failed = false;
 	while (!esp->stop && !failed) {
 		_pumpOnce(esp, &failed);
 
-		DWORD now = GetTickCount();
+		uint32_t now = _ticks();
 		if ((int32_t) (now - nextReport) >= 0) {
 			_picoReport(esp);
 			nextReport = now + kPicoReportMs;
@@ -399,26 +458,26 @@ static void _run(struct GBASIORFUESP32* esp) {
 		for (;;) {
 			uint8_t frame[kOutBytes];
 			size_t length = 0;
-			EnterCriticalSection(&esp->lock);
+			_lockEnter(&esp->lock);
 			if (esp->outCount) {
 				length = esp->out[esp->outHead].length;
 				memcpy(frame, esp->out[esp->outHead].data, length);
 				esp->outHead = (esp->outHead + 1) % kOutSlots;
 				--esp->outCount;
 			}
-			LeaveCriticalSection(&esp->lock);
+			_lockLeave(&esp->lock);
 			if (!length) {
 				break;
 			}
 			_writeFrame(esp, ESP32_TYPE_GB_STREAM, 0, frame, length);
 		}
-		EnterCriticalSection(&esp->lock);
+		_lockEnter(&esp->lock);
 		bool timedOut = esp->connectPending && (int32_t) (now - esp->connectDeadline) >= 0;
 		uint16_t device = esp->connectDevice;
 		if (timedOut) {
 			esp->connectPending = false;
 		}
-		LeaveCriticalSection(&esp->lock);
+		_lockLeave(&esp->lock);
 		if (timedOut) {
 			GBASIORFUTrace(esp->rfu, "ESP32  connect to %04X timed out (no CONNECT_ACK from the board)", device);
 			GBASIORFUConnectResult(esp->rfu, false, device, 0);
@@ -426,19 +485,19 @@ static void _run(struct GBASIORFUESP32* esp) {
 	}
 }
 
-static DWORD WINAPI _thread(LPVOID context) {
+ESP_THREAD_FUNC(_thread) {
 	struct GBASIORFUESP32* esp = context;
 	bool reportedMissing = false;
 	while (!esp->stop) {
 		if (_handshake(esp)) {
 			reportedMissing = false;
-			InterlockedExchange(&esp->ready, 1);
+			_flagSet(&esp->ready, 1);
 			_run(esp);
-			InterlockedExchange(&esp->ready, 0);
+			_flagSet(&esp->ready, 0);
 			if (esp->port) {
 				// Hand the board back to its standalone GBA-cable mode.
 				_command(esp, "LDN_ADAPTER uart");
-				Sleep(100);
+				_espSleep(100);
 			}
 		} else if (!esp->stop && !esp->port && !reportedMissing) {
 			GBASIORFUTrace(esp->rfu, "ESP32  no board found (looking for an Espressif USB serial port; set MGBA_RFU_ESP32_PORT to name one)");
@@ -450,7 +509,7 @@ static DWORD WINAPI _thread(LPVOID context) {
 		}
 		_waitMs(esp, kRetryMs);
 	}
-	return 0;
+	ESP_THREAD_RETURN;
 }
 
 // ---- backend hooks (emulation thread) -------------------------------------------------------------------------
@@ -459,29 +518,28 @@ static bool _init(struct GBASIORFUBackend* backend, struct GBASIORFU* rfu) {
 	struct GBASIORFUESP32* esp = (struct GBASIORFUESP32*) backend;
 	esp->rfu = rfu;
 	esp->stop = 0;
-	esp->thread = CreateThread(NULL, 0, _thread, esp, 0, NULL);
+	esp->threadValid = _threadStart(&esp->thread, _thread, esp);
 	GBASIORFUTrace(rfu, "ESP32  backend attached");
-	return esp->thread != NULL;
+	return esp->threadValid;
 }
 
 static void _deinit(struct GBASIORFUBackend* backend) {
 	struct GBASIORFUESP32* esp = (struct GBASIORFUESP32*) backend;
-	InterlockedExchange(&esp->stop, 1);
-	if (esp->thread) {
-		WaitForSingleObject(esp->thread, 8000);
-		CloseHandle(esp->thread);
-		esp->thread = NULL;
+	_flagSet(&esp->stop, 1);
+	if (esp->threadValid) {
+		_threadJoin(&esp->thread);
+		esp->threadValid = false;
 	}
-	DeleteCriticalSection(&esp->lock);
+	_lockDelete(&esp->lock);
 }
 
 static void _reset(struct GBASIORFUBackend* backend) {
 	struct GBASIORFUESP32* esp = (struct GBASIORFUESP32*) backend;
-	EnterCriticalSection(&esp->lock);
+	_lockEnter(&esp->lock);
 	bool wasConnected = esp->connected;
 	esp->connected = false;
 	esp->connectPending = false;
-	LeaveCriticalSection(&esp->lock);
+	_lockLeave(&esp->lock);
 	if (wasConnected) {
 		_sendRfu1(esp, RFU1_DISCONNECT, 0, NULL, 0, 16);
 	}
@@ -515,12 +573,12 @@ static void _connect(struct GBASIORFUBackend* backend, uint16_t deviceId) {
 		GBASIORFUConnectResult(esp->rfu, false, deviceId, 0);
 		return;
 	}
-	EnterCriticalSection(&esp->lock);
+	_lockEnter(&esp->lock);
 	esp->connectPending = true;
 	esp->connected = false;
 	esp->connectDevice = deviceId;
-	esp->connectDeadline = GetTickCount() + kConnectTimeoutMs;
-	LeaveCriticalSection(&esp->lock);
+	esp->connectDeadline = _ticks() + kConnectTimeoutMs;
+	_lockLeave(&esp->lock);
 	GBASIORFUTrace(esp->rfu, "ESP32  connect request for %04X sent to the board", deviceId);
 	_sendRfu1(esp, RFU1_CONNECT_REQ, deviceId, NULL, 0, 16);
 }
@@ -528,11 +586,11 @@ static void _connect(struct GBASIORFUBackend* backend, uint16_t deviceId) {
 static void _disconnect(struct GBASIORFUBackend* backend, unsigned slotMask) {
 	(void) slotMask;
 	struct GBASIORFUESP32* esp = (struct GBASIORFUESP32*) backend;
-	EnterCriticalSection(&esp->lock);
+	_lockEnter(&esp->lock);
 	bool wasConnected = esp->connected || esp->connectPending;
 	esp->connected = false;
 	esp->connectPending = false;
-	LeaveCriticalSection(&esp->lock);
+	_lockLeave(&esp->lock);
 	if (wasConnected) {
 		GBASIORFUTrace(esp->rfu, "ESP32  disconnect");
 		_sendRfu1(esp, RFU1_DISCONNECT, 0, NULL, 0, 16);
@@ -557,7 +615,7 @@ struct GBASIORFUBackend* GBASIORFUESP32Create(void) {
 	if (!esp) {
 		return NULL;
 	}
-	InitializeCriticalSection(&esp->lock);
+	_lockInit(&esp->lock);
 	esp->d.init = _init;
 	esp->d.deinit = _deinit;
 	esp->d.reset = _reset;
@@ -581,16 +639,3 @@ void GBASIORFUESP32SetPort(struct GBASIORFUBackend* backend, const char* port) {
 	}
 	snprintf(esp->configuredPort, sizeof(esp->configuredPort), "%s", port);
 }
-
-#else // !_WIN32
-
-struct GBASIORFUBackend* GBASIORFUESP32Create(void) {
-	return NULL;
-}
-
-void GBASIORFUESP32SetPort(struct GBASIORFUBackend* backend, const char* port) {
-	(void) backend;
-	(void) port;
-}
-
-#endif

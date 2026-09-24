@@ -16,7 +16,7 @@ struct Esp32Serial {
 	HANDLE handle;
 };
 
-struct Esp32Serial* Esp32SerialOpen(const char* name, unsigned baud) {
+static struct Esp32Serial* _platformOpen(const char* name, unsigned baud) {
 	char path[64];
 	snprintf(path, sizeof(path), "\\\\.\\%s", name);
 	HANDLE handle = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
@@ -60,7 +60,7 @@ struct Esp32Serial* Esp32SerialOpen(const char* name, unsigned baud) {
 	return port;
 }
 
-void Esp32SerialClose(struct Esp32Serial* port) {
+static void _platformClose(struct Esp32Serial* port) {
 	if (!port) {
 		return;
 	}
@@ -68,7 +68,7 @@ void Esp32SerialClose(struct Esp32Serial* port) {
 	free(port);
 }
 
-int Esp32SerialRead(struct Esp32Serial* port, uint8_t* buffer, size_t capacity) {
+static int _platformRead(struct Esp32Serial* port, uint8_t* buffer, size_t capacity) {
 	DWORD got = 0;
 	if (!ReadFile(port->handle, buffer, (DWORD) capacity, &got, NULL)) {
 		return -1;
@@ -76,7 +76,7 @@ int Esp32SerialRead(struct Esp32Serial* port, uint8_t* buffer, size_t capacity) 
 	return (int) got;
 }
 
-bool Esp32SerialWrite(struct Esp32Serial* port, const void* data, size_t length) {
+static bool _platformWrite(struct Esp32Serial* port, const void* data, size_t length) {
 	const uint8_t* bytes = data;
 	while (length) {
 		DWORD put = 0;
@@ -89,7 +89,7 @@ bool Esp32SerialWrite(struct Esp32Serial* port, const void* data, size_t length)
 	return true;
 }
 
-bool Esp32SerialFindEspressif(char* out, size_t capacity) {
+static bool _platformFindEspressif(char* out, size_t capacity) {
 	// The COM port name is at HKLM\SYSTEM\CurrentControlSet\Enum\USB\VID_303A&PID_1001&MI_00\<instance>\Device
 	// Parameters\PortName (the composite device's interface 0 is the CDC serial function); a plain, non-composite
 	// enumeration without the MI_ suffix is checked too.
@@ -143,30 +143,69 @@ bool Esp32SerialFindEspressif(char* out, size_t capacity) {
 
 #else
 
-struct Esp32Serial* Esp32SerialOpen(const char* name, unsigned baud) {
+static struct Esp32Serial* _platformOpen(const char* name, unsigned baud) {
 	(void) name;
 	(void) baud;
 	return NULL;
 }
-void Esp32SerialClose(struct Esp32Serial* port) {
+static void _platformClose(struct Esp32Serial* port) {
 	(void) port;
 }
-int Esp32SerialRead(struct Esp32Serial* port, uint8_t* buffer, size_t capacity) {
+static int _platformRead(struct Esp32Serial* port, uint8_t* buffer, size_t capacity) {
 	(void) port;
 	(void) buffer;
 	(void) capacity;
 	return -1;
 }
-bool Esp32SerialWrite(struct Esp32Serial* port, const void* data, size_t length) {
+static bool _platformWrite(struct Esp32Serial* port, const void* data, size_t length) {
 	(void) port;
 	(void) data;
 	(void) length;
 	return false;
 }
-bool Esp32SerialFindEspressif(char* out, size_t capacity) {
+static bool _platformFindEspressif(char* out, size_t capacity) {
 	(void) out;
 	(void) capacity;
 	return false;
 }
 
 #endif
+
+// ---- Dispatch ---------------------------------------------------------------------------------------------------
+// The backend only ever calls the Esp32Serial* functions below. They forward to whichever implementation is installed:
+// the built-in one for this platform (Windows COM port; a stub elsewhere) unless a host application - e.g. an Android app
+// that owns the USB permission and device handle - replaces it with Esp32SerialSetOps.
+
+static const struct Esp32SerialOps kPlatformOps = {
+	_platformOpen,
+	_platformClose,
+	_platformRead,
+	_platformWrite,
+	_platformFindEspressif,
+};
+
+static const struct Esp32SerialOps* sOps = &kPlatformOps;
+
+void Esp32SerialSetOps(const struct Esp32SerialOps* ops) {
+	sOps = ops ? ops : &kPlatformOps;
+}
+
+struct Esp32Serial* Esp32SerialOpen(const char* name, unsigned baud) {
+	return sOps->open(name, baud);
+}
+
+void Esp32SerialClose(struct Esp32Serial* port) {
+	sOps->close(port);
+}
+
+int Esp32SerialRead(struct Esp32Serial* port, uint8_t* buffer, size_t capacity) {
+	return sOps->read(port, buffer, capacity);
+}
+
+bool Esp32SerialWrite(struct Esp32Serial* port, const void* data, size_t length) {
+	return sOps->write(port, data, length);
+}
+
+bool Esp32SerialFindEspressif(char* out, size_t capacity) {
+	return sOps->find(out, capacity);
+}
