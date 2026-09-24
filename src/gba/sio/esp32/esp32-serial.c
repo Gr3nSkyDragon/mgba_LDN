@@ -18,7 +18,7 @@ struct Esp32Serial {
 
 struct Esp32Serial* Esp32SerialOpen(const char* name, unsigned baud) {
 	char path[64];
-	snprintf(path, sizeof(path), "\\.\%s", name);
+	snprintf(path, sizeof(path), "\\\\.\\%s", name);
 	HANDLE handle = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
 	if (handle == INVALID_HANDLE_VALUE) {
 		return NULL;
@@ -89,6 +89,58 @@ bool Esp32SerialWrite(struct Esp32Serial* port, const void* data, size_t length)
 	return true;
 }
 
+bool Esp32SerialFindEspressif(char* out, size_t capacity) {
+	// The COM port name is at HKLM\SYSTEM\CurrentControlSet\Enum\USB\VID_303A&PID_1001&MI_00\<instance>\Device
+	// Parameters\PortName (the composite device's interface 0 is the CDC serial function); a plain, non-composite
+	// enumeration without the MI_ suffix is checked too.
+	static const char* const kKeys[] = {
+		"SYSTEM\\CurrentControlSet\\Enum\\USB\\VID_303A&PID_1001&MI_00",
+		"SYSTEM\\CurrentControlSet\\Enum\\USB\\VID_303A&PID_1001",
+	};
+	for (size_t k = 0; k < sizeof(kKeys) / sizeof(kKeys[0]); ++k) {
+		HKEY root;
+		if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, kKeys[k], 0, KEY_READ, &root) != ERROR_SUCCESS) {
+			continue;
+		}
+		char instance[256];
+		for (DWORD i = 0;; ++i) {
+			DWORD length = sizeof(instance);
+			if (RegEnumKeyExA(root, i, instance, &length, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) {
+				break;
+			}
+			char path[600];
+			snprintf(path, sizeof(path), "%s\\%s\\Device Parameters", kKeys[k], instance);
+			HKEY params;
+			if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, path, 0, KEY_READ, &params) != ERROR_SUCCESS) {
+				continue;
+			}
+			char name[64];
+			DWORD size = sizeof(name);
+			DWORD type = 0;
+			bool found = RegQueryValueExA(params, "PortName", NULL, &type, (LPBYTE) name, &size) == ERROR_SUCCESS && type == REG_SZ;
+			RegCloseKey(params);
+			if (!found || strlen(name) >= capacity) {
+				continue;
+			}
+			// The registry keeps entries for unplugged devices; only offer a port that exists right now.
+			char device[80];
+			snprintf(device, sizeof(device), "\\\\.\\%s", name);
+			HANDLE probe = CreateFileA(device, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+			bool present = probe != INVALID_HANDLE_VALUE || GetLastError() == ERROR_ACCESS_DENIED;
+			if (probe != INVALID_HANDLE_VALUE) {
+				CloseHandle(probe);
+			}
+			if (present) {
+				strcpy(out, name);
+				RegCloseKey(root);
+				return true;
+			}
+		}
+		RegCloseKey(root);
+	}
+	return false;
+}
+
 #else
 
 struct Esp32Serial* Esp32SerialOpen(const char* name, unsigned baud) {
@@ -109,6 +161,11 @@ bool Esp32SerialWrite(struct Esp32Serial* port, const void* data, size_t length)
 	(void) port;
 	(void) data;
 	(void) length;
+	return false;
+}
+bool Esp32SerialFindEspressif(char* out, size_t capacity) {
+	(void) out;
+	(void) capacity;
 	return false;
 }
 

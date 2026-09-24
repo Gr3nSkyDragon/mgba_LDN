@@ -5,6 +5,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 #include <mgba/internal/gba/sio/rfu.h>
 #include <mgba/internal/gba/sio/rfu-udp.h>
+#include <mgba/internal/gba/sio/rfu-esp32.h>
 #ifdef USE_LDN_BROADCAST
 #include <mgba/internal/gba/sio/rfu-broadcast.h>
 #endif
@@ -18,6 +19,7 @@
  *   "broadcast" a real Switch over local wireless, through a separately-running ldnd (ldn/rfu-broadcast.c).
  *               Searching only so far; joining always fails. Built only when USE_LDN_BROADCAST is on
  *               (Windows only); a stub elsewhere.
+ *   "esp32"     GB-Link's ESP32 LDN bridge board over USB serial (esp32/rfu-esp32.c); Windows only for now
  *   "usb"       an external adapter on a USB port, e.g. an ESP32 - NOT IMPLEMENTED YET (stub)
  * A stub backend leaves the adapter present and working, but nobody is ever in range.
  */
@@ -57,6 +59,9 @@ struct GBASIORFUBackend* GBASIORFUBackendCreate(const char* name) {
 #else
 		return _createStub("broadcast");
 #endif
+	}
+	if (!strcmp(name, "esp32")) {
+		return GBASIORFUESP32Create();
 	}
 	if (!strcmp(name, "usb")) {
 		return _createStub("usb");

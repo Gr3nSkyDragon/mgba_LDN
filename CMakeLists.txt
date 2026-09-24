@@ -908,6 +908,17 @@ if(USE_LDN_BROADCAST)
 	endif()
 endif()
 
+if(WIN32)
+	# Development tool for GB-Link's ESP32 LDN bridge: speaks its serial protocol so the real startup sequence and the
+	# RFU1 adapter frames can be observed before an mGBA backend is written against them.
+	add_executable(esp32-probe
+		src/gba/sio/esp32/esp32-probe.c
+		src/gba/sio/esp32/esp32-wire.c
+		src/gba/sio/esp32/esp32-serial.c
+		src/util/crc32.c)
+	target_include_directories(esp32-probe PRIVATE include)
+endif()
+
 list(APPEND GUI_SRC ${EXTRA_GUI_SRC})
 list(APPEND UTIL_BASE_SRC ${CMAKE_CURRENT_BINARY_DIR}/version.c)
 list(APPEND UTIL_SRC ${CMAKE_CURRENT_BINARY_DIR}/version.c)

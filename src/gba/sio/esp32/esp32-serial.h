@@ -21,4 +21,9 @@ void Esp32SerialClose(struct Esp32Serial*);
 int Esp32SerialRead(struct Esp32Serial*, uint8_t* buffer, size_t capacity);
 bool Esp32SerialWrite(struct Esp32Serial*, const void* data, size_t length);
 
+// Looks for an Espressif native USB Serial/JTAG device (VID 303A, PID 1001 - what the ESP32-S3/C3/C6 boards
+// enumerate as) among the ports Windows currently knows and writes its name (e.g. "COM4") to `out`. Returns false
+// if none is present.
+bool Esp32SerialFindEspressif(char* out, size_t capacity);
+
 #endif

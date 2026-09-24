@@ -40,7 +40,10 @@ set(SIO_FILES
 	sio/lockstep.c
 	sio/rfu.c
 	sio/rfu-backends.c
-	sio/rfu-udp.c)
+	sio/rfu-udp.c
+	sio/esp32/esp32-serial.c
+	sio/esp32/esp32-wire.c
+	sio/esp32/rfu-esp32.c)
 
 if(USE_LDN_BROADCAST)
 	list(APPEND SIO_FILES
