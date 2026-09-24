@@ -322,21 +322,11 @@ static int _authorize(struct LdnStation* station, uint32_t ifIndex, const uint8_
 
 int LdnStationConnect(struct LdnStation* station, uint32_t ifIndex, const char* ssid, unsigned channel, const uint8_t key[16],
                       const uint8_t targetBssid[6], uint8_t hostMac[6]) {
-#ifdef _WIN32
-	// TEMPORARY diagnostic: which sub-step of association is actually slow. Visible via stderr (redirect mGBA's
-	// stderr to a file to capture it - it is a GUI app with no visible console otherwise).
-	DWORD tStart = GetTickCount();
-#define STATION_CHECKPOINT(label) do { fprintf(stderr, "[ldn-station] %s t+%lums\n", (label), GetTickCount() - tStart); fflush(stderr); } while (0)
-#else
-#define STATION_CHECKPOINT(label)
-#endif
-	STATION_CHECKPOINT("enter");
 	int error = _setLink(station, ifIndex, true);
 	if (error) {
 		_fail("could not bring the station interface up (error %d)", error);
 		return error;
 	}
-	STATION_CHECKPOINT("interface up");
 
 	uint8_t rsnIe[22];
 	size_t rsnLength = _buildRsnIe(rsnIe);
@@ -365,9 +355,7 @@ int LdnStationConnect(struct LdnStation* station, uint32_t ifIndex, const char* 
 	NlAddAttr(&attrs, NL80211_ATTR_IE, rsnIe, rsnLength);
 	NlAddAttr(&attrs, NL80211_ATTR_PRIVACY, NULL, 0);
 
-	STATION_CHECKPOINT("about to send CONNECT request");
 	error = GenlRequest(station->genl, station->family, NL_F_ACK, NL80211_CMD_CONNECT, 1, attrs.data, attrs.length, NULL, NULL, 5000);
-	STATION_CHECKPOINT("CONNECT request ACKed");
 	if (error) {
 		_fail("CONNECT request failed (error %d)", error);
 		return error;
@@ -375,7 +363,6 @@ int LdnStationConnect(struct LdnStation* station, uint32_t ifIndex, const char* 
 
 	struct ConnectEventResult result = {0};
 	error = NlWaitForEvent(station->genl, NL80211_CMD_CONNECT, _onConnectEvent, &result, 8000);
-	STATION_CHECKPOINT("association result event received");
 	if (error) {
 		_fail("timed out waiting for the association result");
 		// The CONNECT request was already accepted (its own ACK came back above) even though no result event
@@ -405,21 +392,18 @@ int LdnStationConnect(struct LdnStation* station, uint32_t ifIndex, const char* 
 	memcpy(hostMac, result.mac, 6);
 
 	error = _installKey(station, ifIndex, result.mac, 0, key);
-	STATION_CHECKPOINT("pairwise key installed");
 	if (error) {
 		_fail("could not install the pairwise key (error %d)", error);
 		LdnStationDisconnect(station, ifIndex);
 		return error;
 	}
 	error = _installKey(station, ifIndex, NULL, 1, key);
-	STATION_CHECKPOINT("group key installed");
 	if (error) {
 		_fail("could not install the group key (error %d)", error);
 		LdnStationDisconnect(station, ifIndex);
 		return error;
 	}
 	error = _authorize(station, ifIndex, result.mac);
-	STATION_CHECKPOINT("authorized, returning");
 	if (error) {
 		_fail("could not mark the station authorized (error %d)", error);
 		LdnStationDisconnect(station, ifIndex);
@@ -427,7 +411,6 @@ int LdnStationConnect(struct LdnStation* station, uint32_t ifIndex, const char* 
 	}
 	return 0;
 }
-#undef STATION_CHECKPOINT
 
 void LdnStationDisconnect(struct LdnStation* station, uint32_t ifIndex) {
 	enum { NL80211_CMD_DISCONNECT = 48 };

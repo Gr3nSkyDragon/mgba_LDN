@@ -329,8 +329,7 @@ static void _processEvent(struct GBASIORFU* rfu, const struct GBASIORFUEvent* ev
 	}
 	case RFU_EVENT_CONNECT_RESULT:
 		if (rfu->state != RFU_STATE_CONNECTING) {
-			// TEMPORARY diagnostic: confirms/refutes the theory that the backend's own async connect result
-			// arrives too late (after the game already gave up via FINISH_CONNECTION) and gets silently dropped.
+			// A backend's async connect result that arrives after the game already gave up (FINISH_CONNECTION) is dropped.
 			_trace(rfu, "EVENT  connect result DROPPED (state=%d, not CONNECTING) accepted=%s dev=%04X", rfu->state,
 			       event->accepted ? "true" : "false", event->deviceId);
 			break;
@@ -653,8 +652,6 @@ static int _processCommand(struct GBASIORFU* rfu) {
 		} else {
 			buffer[0] = rfu->client.deviceId | (rfu->client.slot << 16);
 		}
-		// TEMPORARY diagnostic: how many times, and over how long, does the game poll this before giving up?
-		_trace(rfu, "POLL   IsConnectionComplete state=%d -> %08X", rfu->state, buffer[0]);
 		return 1;
 
 	case RFU_CMD_FINISH_CONNECTION:
@@ -664,8 +661,7 @@ static int _processCommand(struct GBASIORFU* rfu) {
 		if (rfu->state == RFU_STATE_CLIENT) {
 			buffer[0] = rfu->client.deviceId | (rfu->client.slot << 16);
 		} else {
-			// TEMPORARY diagnostic: confirms/refutes the theory that the game gives up (forcing state back to
-			// IDLE here) before the backend's own async connect result ever arrives.
+			// The game gave up (its ~4 s patience) before the backend's connect result arrived.
 			_trace(rfu, "FINISH_CONNECTION called while state=%d (not yet CLIENT) - forcing IDLE", rfu->state);
 			buffer[0] = RFU_CONNECTING;
 			rfu->state = RFU_STATE_IDLE;

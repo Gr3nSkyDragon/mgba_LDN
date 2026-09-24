@@ -874,24 +874,6 @@ static void _gbaReceive(struct GBASIORFUBroadcast* broadcast, const uint8_t* dat
 #endif
 
 #ifdef _WIN32
-// Hex of the first bytes of a datagram's plaintext, for the byte-level comparison against the reference simulator; only
-// the first few dozen reliable-stream datagrams are dumped (the stream's setup, where the host's accept is missing).
-static void _hexTrace(struct GBASIORFUBroadcast* broadcast, const char* what, const uint8_t* data, size_t length) {
-	static unsigned dumped;
-	if (dumped++ >= 80) {
-		return;
-	}
-	char hex[400];
-	size_t shown = length < 128 ? length : 128;
-	for (size_t i = 0; i < shown; ++i) {
-		snprintf(&hex[i * 2], 3, "%02X", data[i]);
-	}
-	hex[shown * 2] = 0;
-	GBASIORFUTrace(broadcast->rfu, "PIA    %s (%zu bytes): %s", what, length, hex);
-}
-#endif
-
-#ifdef _WIN32
 // Sends one Pia message as its own datagram - mirrors ldn-pia-join.c's own `_sendRaw`/`_sendMessage` exactly
 // (including the live-confirmed dynamic header flags byte; see its comments for why), just operating on the
 // broadcast backend's own persistent session fields instead of a separate PiaSender struct.
@@ -899,9 +881,6 @@ static bool _piaSendRaw(struct GBASIORFUBroadcast* broadcast, uint8_t proto, uin
                         bool compress, bool haveMsgFlags, uint8_t msgFlags, const uint8_t* payload, size_t length) {
 	uint8_t tiled[kPiaMaxTiled];
 	size_t tiledLength = LdnPiaBuildMessage(proto, payload, length, haveMsgFlags, msgFlags, tiled);
-	if (proto == LDN_PIA_PROTO_RELIABLE) {
-		_hexTrace(broadcast, "tx plaintext message", tiled, tiledLength);
-	}
 	bool compressed = false;
 	// The native client compresses any message body of 62 bytes or more (GB-Link's firmware does the same); the
 	// Switch decompresses by the flag, so this is for fidelity rather than correctness.
@@ -990,7 +969,6 @@ static void _frame(struct GBASIORFUBackend* backend) {
 				struct LdnPiaMessage messages[8];
 				size_t consumed;
 				size_t n = LdnPiaParseMessages(decompressed, decompressedLength, messages, 8, &consumed);
-				_hexTrace(broadcast, "rx plaintext body", decompressed, decompressedLength);
 				if (!n) {
 					GBASIORFUTrace(broadcast->rfu, "PIA    no tiled messages parsed (decompressed %zu bytes)", decompressedLength);
 				}
