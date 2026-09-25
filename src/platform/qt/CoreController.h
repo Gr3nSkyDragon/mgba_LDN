@@ -209,6 +209,7 @@ public slots:
 	void attachBattleChipGate();
 	void detachBattleChipGate();
 	void setRFUBackend(const QString&);
+	void setRFULogging(bool enabled);
 	bool rfuEnabled() const;
 	void setBattleChipId(uint16_t id);
 	void setBattleChipFlavor(int flavor);
@@ -365,6 +366,8 @@ private:
 	GBASIORFUBackend* m_rfuBackend = nullptr;
 	bool m_rfuAttached = false;
 	QString m_rfuBackendName;
+	bool m_rfuLogEnabled = false; // "Save adapter log": write <config dir>/rfu-trace.log while an adapter is attached
+	bool m_rfuTraceOn = false; // this controller currently holds a trace file
 	QString m_rfuLdnKeysPath; // rfu.ldn.keys, refreshed from loadConfig() (core->config does not carry ports.qt keys)
 	MultiplayerController* m_rfuSavedMultiplayer = nullptr;
 	QByteArray m_eReaderData;

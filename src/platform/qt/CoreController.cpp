@@ -14,6 +14,7 @@
 
 #include <QAbstractButton>
 #include <QDateTime>
+#include <QDir>
 #include <QDebug>
 #include <QMessageBox>
 #include <QMutexLocker>
@@ -1215,14 +1216,23 @@ bool CoreController::startRFU(const QString& backend) {
 	GBASIORFUCreate(&m_rfu, m_rfuBackend);
 
 	const char* trace = rfuSetting(core, "MGBA_RFU_TRACE", "rfu.trace");
+	QByteArray defaultTrace;
+	if ((!trace || !trace[0]) && m_rfuLogEnabled) {
+		// The menu's "Save adapter log": a fixed file in the config folder (Wireless Adapter > Open adapter log folder).
+		defaultTrace = QDir(ConfigController::configDir()).filePath("rfu-trace.log").toUtf8();
+		trace = defaultTrace.constData();
+	}
 	if (trace && trace[0]) {
 		// Several games (multiplayer windows) can have the adapter; give each its own trace file.
-		static int instances = 0;
+		static int activeTraces = 0;
 		QByteArray path(trace);
-		if (instances++ > 0) {
-			path += "." + QByteArray::number(instances);
+		if (activeTraces++ > 0) {
+			path += "." + QByteArray::number(activeTraces);
 		}
+		m_rfuTraceOn = true;
 		GBASIORFUSetTraceFile(&m_rfu, path.constData());
+		// The first lines say what produced the log, so a log sent in by someone else is self-explanatory.
+		GBASIORFUTrace(&m_rfu, "APP    mGBA %s, wireless adapter backend \"%s\"", projectVersion, backend.toUtf8().constData());
 	}
 
 	core->setPeripheral(core, mPERIPH_GBA_LINK_PORT, &m_rfu.d);
@@ -1240,6 +1250,7 @@ void CoreController::stopRFU() {
 	}
 	GBASIORFUDestroy(&m_rfu);
 	GBASIORFUBackendDestroy(m_rfuBackend);
+	m_rfuTraceOn = false;
 	m_rfuBackend = nullptr;
 	m_rfuBackendName.clear();
 	m_rfuAttached = false;
@@ -1261,6 +1272,22 @@ void CoreController::attachRFU() {
 
 void CoreController::detachRFU() {
 	stopRFU();
+}
+
+// Menu: "Save adapter log". Applies at once by re-attaching the adapter (the game sees it unplugged and plugged back in),
+// because the trace file is opened when the adapter is attached.
+void CoreController::setRFULogging(bool enabled) {
+	if (m_rfuLogEnabled == enabled) {
+		return;
+	}
+	m_rfuLogEnabled = enabled;
+	if (platform() != mPLATFORM_GBA || !m_rfuAttached || !rfuEnabled()) {
+		return;
+	}
+	const QString name = m_rfuBackendName;
+	Interrupter interrupter(this);
+	stopRFU();
+	startRFU(name); // a fresh attach, now with/without the trace file
 }
 
 // Called from the GUI thread by the menu while a game may be running. Switching backends detaches and re-attaches

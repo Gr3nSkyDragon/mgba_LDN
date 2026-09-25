@@ -5,6 +5,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 #include "Window.h"
 
+#include <QDesktopServices>
 #include <QKeyEvent>
 #include <QKeySequence>
 #include <QMenuBar>
@@ -12,6 +13,7 @@
 #include <QMimeData>
 #include <QPainter>
 #include <QScreen>
+#include <QUrl>
 #include <QWindow>
 
 #ifdef Q_OS_WIN
@@ -926,6 +928,7 @@ void Window::gameStarted() {
 	m_config->updateOption("resampleVideo");
 #ifdef M_CORE_GBA
 	// Applies the saved wireless adapter choice to the newly started game.
+	m_controller->setRFULogging(m_config->getOption("rfu.log", "0").toInt() != 0);
 	m_controller->setRFUBackend(m_config->getOption("rfu.backend", "off"));
 #endif
 	attachWidget(m_display.get());
@@ -1626,6 +1629,21 @@ void Window::setupMenu(QMenuBar* menubar) {
 		m_config->setOption("rfu.backend", "local");
 	}
 	rfuBackend->setValue(QVariant(m_config->getOption("rfu.backend", "off")));
+
+	// Diagnostics for a wireless adapter that misbehaves: a log of what the adapter and its backend did (Wi-Fi association,
+	// LDN authentication, the Pia session, the game's link traffic). It holds addresses and network names, not prod.keys.
+	m_actions.addSeparator("rfu");
+	ConfigOption* rfuLog = m_config->addOption("rfu.log");
+	rfuLog->addBoolean(tr("Save adapter log"), &m_actions, "rfu");
+	rfuLog->connect([this](const QVariant& value) {
+		if (m_controller) {
+			m_controller->setRFULogging(value.toBool());
+		}
+	}, this);
+	m_actions.addAction(tr("Open adapter log folder"), "rfuLogFolder", []() {
+		QDesktopServices::openUrl(QUrl::fromLocalFile(ConfigController::configDir()));
+	}, "rfu");
+	m_config->updateOption("rfu.log");
 #endif
 
 	m_actions.addMenu(tr("Audio/&Video"), "av");
