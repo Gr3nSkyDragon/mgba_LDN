@@ -95,6 +95,18 @@ struct GBASIORFUBroadcast {
 	HANDLE stopEvent;
 	CRITICAL_SECTION lastAdLock;
 	HANDLE connectThread;
+
+	// Opening the monitor is several round trips to ldnd, each allowed 5s; a radio that stops answering used to freeze
+	// the emulation thread for 10s inside the game's search-start command. It is opened on openThread instead (see
+	// _openThreadProc). monitorLock guards `monitor`, `hopThread` and the three flags below:
+	// - monitorWanted: a search asked for the monitor and no reset/deinit has dropped it since,
+	// - hopWanted: channel hopping should run once the monitor is up (cleared when the game stops searching),
+	// - monitorOpening: openThread is running.
+	CRITICAL_SECTION monitorLock;
+	HANDLE openThread;
+	bool monitorWanted;
+	bool hopWanted;
+	bool monitorOpening;
 #endif
 
 	struct {
@@ -239,20 +251,62 @@ static DWORD WINAPI _hopThread(LPVOID context) {
 
 static void _joinConnectThread(struct GBASIORFUBroadcast* broadcast);
 
+#ifdef _WIN32
+// Caller holds monitorLock, and broadcast->monitor is set.
+static void _startHopLocked(struct GBASIORFUBroadcast* broadcast) {
+	if (!broadcast->hopThread) {
+		ResetEvent(broadcast->stopEvent);
+		broadcast->hopThread = CreateThread(NULL, 0, _hopThread, broadcast, 0, NULL);
+	}
+}
+
+// Opens the monitor off the emulation thread. The game keeps polling its search (it just sees no rooms yet) while
+// this waits on ldnd. When it finishes, the result is installed only if a search still wants it; a reset that came
+// in meanwhile gets it closed again right here. If a new search starts while that close is running, it opens again.
+static DWORD WINAPI _openThreadProc(LPVOID context) {
+	struct GBASIORFUBroadcast* broadcast = context;
+	while (true) {
+		DWORD start = GetTickCount();
+		struct LdnMonitor* monitor = LdnMonitorOpen(NULL, kChannels[0], NULL, _onAdvertisement, broadcast);
+		if (!monitor) {
+			GBASIORFUTrace(broadcast->rfu, "LDN    %s (after %lums)", LdnMonitorLastError(), GetTickCount() - start);
+		}
+		EnterCriticalSection(&broadcast->monitorLock);
+		if (broadcast->monitorWanted) {
+			broadcast->monitor = monitor;
+			if (monitor) {
+				GBASIORFUTrace(broadcast->rfu, "LDN    monitor open after %lums", GetTickCount() - start);
+				if (broadcast->hopWanted) {
+					_startHopLocked(broadcast);
+					GBASIORFUTrace(broadcast->rfu, "LDN    searching (channels 1, 6, 11)");
+				}
+			}
+			broadcast->monitorOpening = false;
+			LeaveCriticalSection(&broadcast->monitorLock);
+			return 0;
+		}
+		LeaveCriticalSection(&broadcast->monitorLock);
+
+		if (monitor) {
+			LdnMonitorClose(monitor);
+			GBASIORFUTrace(broadcast->rfu, "LDN    monitor closed (reset while it was opening)");
+		}
+		EnterCriticalSection(&broadcast->monitorLock);
+		if (!broadcast->monitorWanted) {
+			broadcast->monitorOpening = false;
+			LeaveCriticalSection(&broadcast->monitorLock);
+			return 0;
+		}
+		LeaveCriticalSection(&broadcast->monitorLock);
+	}
+}
+#endif
+
 static void _startSearching(struct GBASIORFUBroadcast* broadcast) {
 #ifdef _WIN32
-	if (broadcast->monitor) {
-		// A monitor left parked by _stopSearching (see there): just resume hopping. Any earlier connect attempt still
-		// running on that shared monitor connection must be finished first - it would otherwise be associating while
-		// the hop thread yanks the radio between channels.
-		_joinConnectThread(broadcast);
-		if (!broadcast->hopThread) {
-			ResetEvent(broadcast->stopEvent);
-			broadcast->hopThread = CreateThread(NULL, 0, _hopThread, broadcast, 0, NULL);
-			GBASIORFUTrace(broadcast->rfu, "LDN    searching again (monitor was parked)");
-		}
-		return;
-	}
+	// A monitor left parked by _stopSearching (see there) is shared with any earlier connect attempt, which must be
+	// finished first - it would otherwise be associating while the hop thread yanks the radio between channels.
+	_joinConnectThread(broadcast);
 	if (broadcast->keysPath[0] && !broadcast->haveKeys) {
 		broadcast->haveKeys = LdnKeysLoad(broadcast->keysPath, &broadcast->keys);
 		if (!broadcast->haveKeys) {
@@ -262,14 +316,31 @@ static void _startSearching(struct GBASIORFUBroadcast* broadcast) {
 	if (!broadcast->haveKeys) {
 		GBASIORFUTrace(broadcast->rfu, "LDN    no prod.keys configured (Tools > Settings > BIOS); advertisements cannot be decoded");
 	}
-	broadcast->monitor = LdnMonitorOpen(NULL, kChannels[0], NULL, _onAdvertisement, broadcast);
-	if (!broadcast->monitor) {
-		GBASIORFUTrace(broadcast->rfu, "LDN    %s", LdnMonitorLastError());
-		return;
+
+	EnterCriticalSection(&broadcast->monitorLock);
+	broadcast->monitorWanted = true;
+	broadcast->hopWanted = true;
+	if (broadcast->monitor) {
+		if (!broadcast->hopThread) {
+			_startHopLocked(broadcast);
+			GBASIORFUTrace(broadcast->rfu, "LDN    searching again (monitor was parked)");
+		}
+	} else if (!broadcast->monitorOpening) {
+		if (broadcast->openThread) {
+			// The previous opener already cleared monitorOpening, so it is exiting (or has exited).
+			WaitForSingleObject(broadcast->openThread, INFINITE);
+			CloseHandle(broadcast->openThread);
+		}
+		broadcast->monitorOpening = true;
+		broadcast->openThread = CreateThread(NULL, 0, _openThreadProc, broadcast, 0, NULL);
+		if (broadcast->openThread) {
+			GBASIORFUTrace(broadcast->rfu, "LDN    opening the monitor in the background...");
+		} else {
+			broadcast->monitorOpening = false;
+			GBASIORFUTrace(broadcast->rfu, "LDN    could not start the monitor thread");
+		}
 	}
-	ResetEvent(broadcast->stopEvent);
-	broadcast->hopThread = CreateThread(NULL, 0, _hopThread, broadcast, 0, NULL);
-	GBASIORFUTrace(broadcast->rfu, "LDN    searching (channels 1, 6, 11)");
+	LeaveCriticalSection(&broadcast->monitorLock);
 #else
 	(void) broadcast;
 #endif
@@ -280,14 +351,18 @@ static void _startSearching(struct GBASIORFUBroadcast* broadcast) {
 // radio mid-reconfiguration, and the connect thread's very next RTM_NEWLINK (interface up) and CMD_CONNECT each
 // stalled ~2.3s waiting on it (measured: 2313ms + 2312ms + 2485ms) - long enough to blow through FRLG's ~4s
 // IsConnectionComplete patience. The standalone ldn-pia-join tool never tears the monitor down before associating.
+// Also keeps a monitor that is still opening from starting to hop once it is up.
 static void _stopHop(struct GBASIORFUBroadcast* broadcast) {
 #ifdef _WIN32
+	EnterCriticalSection(&broadcast->monitorLock);
+	broadcast->hopWanted = false;
 	if (broadcast->hopThread) {
 		SetEvent(broadcast->stopEvent);
 		WaitForSingleObject(broadcast->hopThread, 5000);
 		CloseHandle(broadcast->hopThread);
 		broadcast->hopThread = NULL;
 	}
+	LeaveCriticalSection(&broadcast->monitorLock);
 #else
 	(void) broadcast;
 #endif
@@ -296,19 +371,27 @@ static void _stopHop(struct GBASIORFUBroadcast* broadcast) {
 static void _stopSearching(struct GBASIORFUBroadcast* broadcast) {
 	_stopHop(broadcast);
 #ifdef _WIN32
-	if (broadcast->monitor) {
+	EnterCriticalSection(&broadcast->monitorLock);
+	bool open = broadcast->monitor != NULL;
+	LeaveCriticalSection(&broadcast->monitorLock);
+	if (open) {
 		GBASIORFUTrace(broadcast->rfu, "LDN    stopped searching (monitor kept open)");
 	}
 #endif
 }
 
 // Full teardown of the monitor (vif + connection). Only for reset/deinit, after any connect thread has been joined.
+// A monitor still being opened is not waited for: its opener sees monitorWanted cleared and closes it itself.
 static void _closeMonitor(struct GBASIORFUBroadcast* broadcast) {
 	_stopHop(broadcast);
 #ifdef _WIN32
-	if (broadcast->monitor) {
-		LdnMonitorClose(broadcast->monitor);
-		broadcast->monitor = NULL;
+	EnterCriticalSection(&broadcast->monitorLock);
+	broadcast->monitorWanted = false;
+	struct LdnMonitor* monitor = broadcast->monitor;
+	broadcast->monitor = NULL;
+	LeaveCriticalSection(&broadcast->monitorLock);
+	if (monitor) {
+		LdnMonitorClose(monitor);
 		GBASIORFUTrace(broadcast->rfu, "LDN    monitor closed");
 	}
 #endif
@@ -386,12 +469,20 @@ static void _deinit(struct GBASIORFUBackend* backend) {
 	_piaTeardown(broadcast); // uses the monitor's connection for the deauth - close the monitor only afterward
 	_closeMonitor(broadcast);
 #ifdef _WIN32
+	if (broadcast->openThread) {
+		// It references this backend, so it must be gone first; monitorWanted is already cleared, so it closes
+		// whatever it opened and exits.
+		WaitForSingleObject(broadcast->openThread, INFINITE);
+		CloseHandle(broadcast->openThread);
+		broadcast->openThread = NULL;
+	}
 	if (broadcast->stopEvent) {
 		CloseHandle(broadcast->stopEvent);
 		broadcast->stopEvent = NULL;
 	}
 	DeleteCriticalSection(&broadcast->lastAdLock);
 	DeleteCriticalSection(&broadcast->piaLock);
+	DeleteCriticalSection(&broadcast->monitorLock);
 #endif
 }
 
@@ -439,14 +530,18 @@ static DWORD WINAPI _connectThreadProc(LPVOID arg) {
 	// stops hopping (see _stopHop) and leaves the monitor's ldnd connection open, which is shared here exactly as
 	// ldn-pia-join.c does - no teardown/reopen churn on the radio between the scan and the join. The connection is
 	// owned by the monitor and is never closed from this thread.
-	if (!broadcast->monitor) {
+	// reset()/deinit() join this thread before they close the monitor, so it stays valid for the whole attempt.
+	EnterCriticalSection(&broadcast->monitorLock);
+	struct LdnMonitor* monitor = broadcast->monitor;
+	LeaveCriticalSection(&broadcast->monitorLock);
+	if (!monitor) {
 		GBASIORFUTrace(broadcast->rfu, "LDN    connect to %04X requested, but the search monitor is gone", attempt->deviceId);
 		goto done;
 	}
-	conn = LdnMonitorConnection(broadcast->monitor);
+	conn = LdnMonitorConnection(monitor);
 	// Pin the (no longer hopping) monitor to the host's channel first, so the radio is not left with a monitor vif on
 	// one channel while the station associates on another.
-	if (LdnMonitorSetChannel(broadcast->monitor, attempt->channel)) {
+	if (LdnMonitorSetChannel(monitor, attempt->channel)) {
 		GBASIORFUTrace(broadcast->rfu, "LDN    %s", LdnMonitorLastError());
 	}
 	station = LdnStationOpen(conn);
@@ -1118,6 +1213,7 @@ struct GBASIORFUBackend* GBASIORFUBroadcastCreate(void) {
 	broadcast->stopEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
 	InitializeCriticalSection(&broadcast->lastAdLock);
 	InitializeCriticalSection(&broadcast->piaLock);
+	InitializeCriticalSection(&broadcast->monitorLock);
 #endif
 	broadcast->d.init = _init;
 	broadcast->d.deinit = _deinit;

@@ -55,6 +55,10 @@ struct LdnMonitor {
 	uint16_t family;
 	uint32_t ifIndex;
 	bool weCreatedTheInterface;
+	// Set once any request to ldnd timed out (the radio stopped answering). LdnMonitorClose then skips its own
+	// DEL_INTERFACE request, which would only sit out another full timeout; the leftover interface is found and
+	// reused by the next LdnMonitorOpen.
+	bool timedOut;
 	uint32_t packetSocket;
 
 	LdnMonitorRawCallback rawCallback;
@@ -173,7 +177,11 @@ static int _setLink(struct LdnMonitor* monitor, bool up) {
 		message[8 + i] = flags >> (8 * i);
 		message[12 + i] = change >> (8 * i);
 	}
-	return NlRequest(monitor->route, RTM_NEWLINK, NL_F_ACK, message, sizeof(message), NULL, NULL, 5000);
+	int error = NlRequest(monitor->route, RTM_NEWLINK, NL_F_ACK, message, sizeof(message), NULL, NULL, 5000);
+	if (error == LDND_ERR_TIMEOUT) {
+		monitor->timedOut = true;
+	}
+	return error;
 }
 
 struct LdndConnection* LdnMonitorConnection(struct LdnMonitor* monitor) {
@@ -186,6 +194,9 @@ int LdnMonitorSetChannel(struct LdnMonitor* monitor, unsigned channel) {
 	NlAddAttrU32(&attrs, NL80211_ATTR_IFINDEX, monitor->ifIndex);
 	NlAddAttrU32(&attrs, NL80211_ATTR_WIPHY_FREQ, _frequency(channel));
 	int error = GenlRequest(monitor->genl, monitor->family, NL_F_ACK, NL80211_CMD_SET_CHANNEL, 1, attrs.data, attrs.length, NULL, NULL, 5000);
+	if (error == LDND_ERR_TIMEOUT) {
+		monitor->timedOut = true;
+	}
 	if (error) {
 		_fail("could not switch to channel %u (error %d)", channel, error);
 	} else {
@@ -308,7 +319,7 @@ void LdnMonitorClose(struct LdnMonitor* monitor) {
 	if (monitor->packetSocket) {
 		LdndCloseSocket(monitor->conn, monitor->packetSocket);
 	}
-	if (monitor->genl && monitor->weCreatedTheInterface && monitor->ifIndex) {
+	if (monitor->genl && monitor->weCreatedTheInterface && monitor->ifIndex && !monitor->timedOut) {
 		struct NlMessage attrs;
 		attrs.length = 0;
 		NlAddAttrU32(&attrs, NL80211_ATTR_IFINDEX, monitor->ifIndex);
