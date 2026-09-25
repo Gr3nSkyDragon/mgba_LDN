@@ -28,7 +28,9 @@ For trading between instances of mGBA, you can choose to enable the Wireless Ada
 
 For trading between a computer and a Switch, you can choose Broadcast (Emulation > Wireless Adapter > Broadcast) or ESP32 (Emulation > Wireless Adapter > ESP32). Broadcast is designed for a USB Wi-Fi adapter and requires ldnd.exe to be set up correctly and running, and ESP32 is designed for the GB-Link Switch LDN firmware configuration. The ESP32 firmware may have other functionality like battling, berry blending, etc implemented, but I only tested trading. 
 
-For trading between a smartphone and a Switch, you can choose Android. *(I think. This is currently stubbed, as I haven't started any Android development yet. I'm not sure if this will be an APK or a RetroArch core, either, so there's that.)*
+For trading between a smartphone and a Switch, you need to install the APK, then click the three bars (☰) menu in the top right, select Wireless Adapter, choose your adapter (currently supports an ESP32 running the GB-Link Switch LDN firmware; I'm using an ESP32-S3, other models may be added later), and plug the adapter into your smartphone via its USB-C port. You will need a USB-C-to-USB-C cable for this. 
+
+Open ROM copies your ROM into the emulator's ROM folder. You can also select your save at the same time to load the save into the game and copy it into the emulator's save folder. If you select multiple ROMs and saves, all will be copied into the correct folders, but only one will be launched.
 
 Original ReadMe
 --------
