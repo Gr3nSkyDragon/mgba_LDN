@@ -31,7 +31,7 @@
  * (see pokeldn/frlgsim's `ConnectionManager.on_message`, the only `_q(..., compress=True, ...)` call site) -
  * matches live capture, which showed the host's own Net/Session messages arriving zstd-compressed too (see
  * ldn-pia.c's LdnPiaDecompress/LdnPiaCompress). `LdnPiaOutMessage.compress` is set true only for the Session
- * join queued below; the caller (ldn-pia-join.c) is responsible for actually compressing the tiled bytes via
+ * join queued below; the caller (rfu-broadcast.c) is responsible for actually compressing the tiled bytes via
  * LdnPiaCompress before appending any footer/padding and encrypting.
  */
 

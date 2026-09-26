@@ -20,7 +20,11 @@
 #include <mgba/core/input.h>
 #include <mgba/core/serialize.h>
 #include <mgba/core/thread.h>
+#include <mgba/core/version.h>
 #include <mgba/internal/gba/input.h>
+#ifdef M_CORE_GBA
+#include <mgba/internal/gba/sio/rfu.h>
+#endif
 
 #include <mgba/feature/commandline.h>
 #include <mgba-util/vfs.h>
@@ -44,10 +48,81 @@ static void _loadState(struct mCoreThread* thread) {
 	mCoreLoadStateNamed(thread->core, _state, SAVESTATE_RTC);
 }
 
+#ifdef M_CORE_GBA
+// The wireless adapter, attached the way the Qt frontend's Emulation > Wireless Adapter menu attaches it. rfu.backend
+// (e.g. `-C rfu.backend=broadcast`, or the MGBA_RFU_BACKEND environment variable, which wins) names what carries its
+// "air": "local" (other mGBA processes on this computer), "broadcast" (a Switch through ldnd; LDN_DAEMON names ldnd's
+// pipe if it is not the default one), "esp32", or "none" (an adapter with nobody in range). The adapter writes
+// rfu-trace.log in the working directory by default; rfu.trace (or MGBA_RFU_TRACE) can override its path.
+static struct GBASIORFU _rfu;
+static struct GBASIORFUBackend* _rfuBackend;
+static bool _rfuCreated;
+
+static const char* _rfuSetting(struct mCore* core, const char* env, const char* key) {
+	const char* value = getenv(env);
+	if (!value || !value[0]) {
+		value = mCoreConfigGetValue(&core->config, key);
+	}
+	return value;
+}
+
+// Before the game starts; false if the backend named is not one there is.
+static bool _createRFU(struct mCore* core) {
+	const char* backend = _rfuSetting(core, "MGBA_RFU_BACKEND", "rfu.backend");
+	if (!backend || !backend[0] || !strcmp(backend, "off") || core->platform(core) != mPLATFORM_GBA) {
+		return true;
+	}
+	_rfuBackend = NULL;
+	if (strcmp(backend, "none")) {
+		_rfuBackend = GBASIORFUBackendCreate(backend);
+		if (!_rfuBackend) {
+			printf("Unknown wireless adapter backend \"%s\": use local, broadcast, esp32 or none.\n", backend);
+			return false;
+		}
+	}
+	GBASIORFUCreate(&_rfu, _rfuBackend);
+	const char* trace = _rfuSetting(core, "MGBA_RFU_TRACE", "rfu.trace");
+	if (!trace || !trace[0]) {
+		trace = "rfu-trace.log";
+	}
+	GBASIORFUSetTraceFile(&_rfu, trace);
+	GBASIORFUTrace(&_rfu, "APP    mGBA %s (SDL), wireless adapter backend \"%s\"", projectVersion, backend);
+	printf("Wireless adapter: %s, logging to %s\n", backend, trace);
+	_rfuCreated = true;
+	return true;
+}
+
+// The emulation thread's start and clean callbacks: the adapter is on the link port for as long as the game runs.
+static void _attachRFU(struct mCoreThread* thread) {
+	if (_rfuCreated) {
+		thread->core->setPeripheral(thread->core, mPERIPH_GBA_LINK_PORT, &_rfu.d);
+	}
+}
+
+static void _detachRFU(struct mCoreThread* thread) {
+	if (_rfuCreated) {
+		thread->core->setPeripheral(thread->core, mPERIPH_GBA_LINK_PORT, NULL);
+	}
+}
+
+static void _destroyRFU(void) {
+	if (!_rfuCreated) {
+		return;
+	}
+	GBASIORFUDestroy(&_rfu);
+	GBASIORFUBackendDestroy(_rfuBackend);
+	_rfuBackend = NULL;
+	_rfuCreated = false;
+}
+#endif
+
 int main(int argc, char** argv) {
 #ifdef _WIN32
-	AttachConsole(ATTACH_PARENT_PROCESS);
-	freopen("CONOUT$", "w", stdout);
+	// Without a parent console (e.g. launched from Explorer), freopen("CONOUT$") fails and
+	// leaves stdout closed, so the next printf trips the CRT's file handle validation.
+	if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+		freopen("CONOUT$", "w", stdout);
+	}
 #endif
 	struct mSDLRenderer renderer = {0};
 
@@ -204,7 +279,17 @@ int mSDLRun(struct mSDLRenderer* renderer, struct mArguments* args) {
 	struct mCoreThread thread = {
 		.core = renderer->core
 	};
+#ifdef M_CORE_GBA
+	if (!_createRFU(renderer->core)) {
+		return 1;
+	}
+	thread.startCallback = _attachRFU;
+	thread.cleanCallback = _detachRFU;
+#endif
 	if (!mCoreLoadFile(renderer->core, args->fname)) {
+#ifdef M_CORE_GBA
+		_destroyRFU();
+#endif
 		return 1;
 	}
 	mCoreAutoloadSave(renderer->core);
@@ -283,6 +368,9 @@ int mSDLRun(struct mSDLRenderer* renderer, struct mArguments* args) {
 	} else {
 		printf("Could not run game. Are you sure the file exists and is a compatible game?\n");
 	}
+#ifdef M_CORE_GBA
+	_destroyRFU();
+#endif
 	renderer->core->unloadROM(renderer->core);
 
 #ifdef ENABLE_SCRIPTING

@@ -11,85 +11,14 @@
 #include <stdint.h>
 
 /*
- * Nintendo LDN (local wireless) pieces: the keys needed to read a Switch's advertisements and the advertisement
- * decoder. Windows only (crypto through CNG). Layout and key derivation follow the format the Switch's action frames
- * are known to have (as implemented by other LDN clients such as ldn_mitm / Ryujinx's LdnReal).
+ * Nintendo LDN (local wireless) pieces mGBA still needs itself now that ldnd (see ldnd.h) does the scanning, joining
+ * and key handling: the GBA emulator's LDN passphrase, the crypto primitives the Pia transport (ldn-pia.c) is built
+ * on, and the FireRed/LeafGreen room beacon found in a network's application data. The crypto is Windows only (CNG).
  */
 
-// Set to 1 to have the decoder describe on stderr why an advertisement could not be decoded.
-extern int gLdnDebug;
-
-struct LdnKeys {
-	uint8_t masterKey00[16];
-	uint8_t masterKey12[16];
-	uint8_t aesKekGenerationSource[16];
-	uint8_t aesKeyGenerationSource[16];
-};
-
-// Reads the four keys LDN needs out of a prod.keys file. The key values are never printed or logged.
-bool LdnKeysLoad(const char* path, struct LdnKeys* keys);
-
-enum {
-	LDN_MAX_PARTICIPANTS = 8,
-	LDN_MAX_APP_DATA = 384,
-};
-
-struct LdnParticipant {
-	bool present;
-	uint8_t ip[4];
-	uint8_t mac[6];
-	uint8_t index;
-	uint8_t platform;
-	char name[33];
-};
-
-struct LdnAdvertisement {
-	int protocol; // 1 or 3
-	uint8_t format;  // 1 plain, 2 AES-CTR, 3 AES-GCM
-	uint8_t version;
-	uint64_t localCommunicationId;
-	uint16_t sceneId;
-	uint8_t ssid[16];
-	uint8_t serverRandom[16];
-	uint64_t challenge;
-	uint8_t securityMode;
-	uint8_t stationAcceptPolicy;
-	uint16_t appVersion;
-	unsigned advertisedChannel;
-	uint8_t maxParticipants;
-	uint8_t numParticipants;
-	struct LdnParticipant participants[LDN_MAX_PARTICIPANTS];
-	uint16_t appDataSize;
-	uint8_t appData[LDN_MAX_APP_DATA];
-	bool infoDecoded; // false when only the envelope (ids, ssid) could be read
-};
-
-// `body` is the payload of a vendor-specific action frame, starting at the category byte (0x7F).
-// Returns false when it is not an LDN advertisement (or cannot be decrypted with the keys given).
-bool LdnDecodeAdvertisement(const uint8_t* body, size_t length, const struct LdnKeys* keys, struct LdnAdvertisement* out);
-
-// The 16-byte WPA2 PSK to join a network, derived from its advertisement's `serverRandom` (16 bytes), `protocol`
-// and the keys - see ldn.c for the recipe. Needed to actually associate (nl80211 CMD_CONNECT with an RSN/CCMP/PSK
-// information element built around this key) with the network a decoded LdnAdvertisement described.
-bool LdnDeriveWlanKey(const struct LdnKeys* keys, int protocol, const uint8_t serverRandom[16], uint8_t out[16]);
-
-// The actual over-the-air Wi-Fi SSID for a decoded advertisement's network: its 16-byte `ssid` field, lowercase
-// hex-encoded to 32 ASCII characters (that is literally how Nintendo derives it - not a coincidence of naming).
-// `out` must hold at least 33 bytes (32 characters + a NUL).
-void LdnAdvertisementWlanSsid(const struct LdnAdvertisement* advertisement, char out[33]);
-
-// The key used to encrypt/decrypt an authentication frame's payload (protocol 3 / AES-GCM only - see ldn-auth.h),
-// derived from the CLIENT's own random nonce. Same KDF chain/source as LdnDeriveWlanKey (DataKeySource), different
-// data, so both sides end up with the same key once the host echoes clientRandom back in its response.
-bool LdnDeriveAuthenticationKey(const struct LdnKeys* keys, int protocol, const uint8_t clientRandom[16], uint8_t out[16]);
-
-// AES-GCM with an explicit, caller-supplied 12-byte nonce and a separate tag (unlike LdnDecodeAdvertisement's own
-// AES-GCM format, which pads a 4-byte nonce and concatenates the tag with the ciphertext) - what LDN's
-// authentication frame and challenge use instead.
-bool LdnAesGcmEncrypt(const uint8_t key[16], const uint8_t nonce[12], const uint8_t* aad, size_t aadLength, const uint8_t* in, size_t length, uint8_t* out,
-                      uint8_t tag[16]);
-bool LdnAesGcmDecrypt(const uint8_t key[16], const uint8_t nonce[12], const uint8_t* aad, size_t aadLength, const uint8_t tag[16], const uint8_t* in,
-                      size_t length, uint8_t* out);
+// The GBA Virtual Console's LDN passphrase, shared by all of its titles: a join passes it to ldnd (it goes into the
+// link key, so without it the host accepts the join and then drops everything we send).
+extern const uint8_t kLdnGbaPassphrase[64];
 
 // AES-GCM with a caller-chosen tag length (1-16 bytes) - Windows CNG's own GCM refuses anything under 12, but the
 // Pia transport (ldn-pia.c) needs an 8-byte tag, so this is implemented from the raw algorithm instead of CNG.
@@ -98,19 +27,16 @@ bool LdnAesGcmEncryptTag(const uint8_t key[16], const uint8_t nonce12[12], const
 bool LdnAesGcmDecryptTag(const uint8_t key[16], const uint8_t nonce12[12], const uint8_t* aad, size_t aadLength, const uint8_t* tag, size_t tagLength,
                          const uint8_t* in, size_t length, uint8_t* out);
 
-// HMAC-SHA256, for the authentication challenge's integrity check (see ldn-auth.c's ChallengeRequest).
-bool LdnHmacSha256(const uint8_t* key, size_t keyLength, const uint8_t* data, size_t dataLength, uint8_t out[32]);
-
-// `length` cryptographically random bytes (CNG's RNG). Used for the authentication handshake's client-side nonces.
+// `length` cryptographically random bytes (CNG's RNG): the Pia connection's nonce, a join's device id.
 bool LdnRandomBytes(uint8_t* out, size_t length);
 
-// One AES-128-ECB block, no padding - the Pia session key derivation (ldn-pia.c) needs this directly (AES of the
-// LDN SSID under a fixed game key), unlike every other AES use in this project which goes through _deriveKey.
+// One AES-128-ECB block, no padding - the Pia session key derivation (ldn-pia.c): AES of the LDN SSID under a fixed
+// game key.
 bool LdnAesEcbEncryptBlock(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]);
 
 /*
  * The FRLG Switch port's own RFU search beacon: a small record it embeds in its LDN advertisement's
- * application data (LdnAdvertisement.appData), describing the host for the game's own Wireless Club purposes.
+ * application data (LdndNetworkInfo.applicationData), describing the host for the game's own Wireless Club purposes.
  * It is NOT the same layout as a real GBA cartridge's 24-byte RFU broadcast record (see rfu.c's BCAST trace) -
  * this is the Switch port's own, simpler record. LdnBeaconToBroadcastWords() below turns it into the 6-word
  * record our emulated adapter's BroadcastRead command expects, filling in the pieces (compat/serial code,
@@ -139,8 +65,8 @@ struct LdnRfuBeacon {
 	uint16_t tradeSpecies;
 };
 
-// `appData`/`appDataSize` are LdnAdvertisement's fields. False when appData is too short to hold the header
-// and the record.
+// `appData`/`appDataSize` are a network's application data (LdndNetworkInfo). False when appData is too short to
+// hold the header and the record.
 bool LdnDecodeRfuBeacon(const uint8_t* appData, size_t appDataSize, struct LdnRfuBeacon* out);
 
 // One FRLG character <-> ASCII. Letters and digits only (what a trainer name can hold); anything else maps to

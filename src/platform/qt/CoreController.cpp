@@ -337,19 +337,6 @@ void CoreController::loadConfig(ConfigController* config) {
 	}
 	m_threadContext.core->reloadConfigOption(m_threadContext.core, "gb.pal", config->config());
 #endif
-
-#ifdef USE_LDN_BROADCAST
-	// core->config does not carry ports.qt-scoped keys (the same reason rfu.backend is pushed via setRFUBackend
-	// rather than read from it), so rfu.ldn.keys has to come from here, the one place we are handed the real
-	// ConfigController. Refreshed on every settings change, and pushed live if the Broadcast backend is already
-	// attached (searching does not need to be restarted to pick up a new value).
-	m_rfuLdnKeysPath = config->getOption("rfu.ldn.keys");
-	if (m_rfuBackend && m_rfuBackendName == QLatin1String("broadcast")) {
-		const char* envKeys = getenv("MGBA_RFU_LDN_KEYS");
-		QByteArray path = envKeys && envKeys[0] ? QByteArray(envKeys) : m_rfuLdnKeysPath.toUtf8();
-		GBASIORFUBroadcastSetKeysPath(m_rfuBackend, path.isEmpty() ? nullptr : path.constData());
-	}
-#endif
 }
 
 #ifdef ENABLE_DEBUGGERS
@@ -1199,19 +1186,6 @@ bool CoreController::startRFU(const QString& backend) {
 			qWarning() << "Unknown wireless adapter backend" << backend;
 			return false;
 		}
-#ifdef USE_LDN_BROADCAST
-		if (backend == QLatin1String("broadcast")) {
-			// prod.keys: set in Tools > Settings > BIOS (rfu.ldn.keys), or MGBA_RFU_LDN_KEYS for development.
-			// mGBA never launches ldnd itself; this only tells the backend where to find the decryption keys once
-			// it connects to whatever ldnd the user already has running. m_rfuLdnKeysPath is kept up to date by
-			// loadConfig() - core->config does not carry ports.qt-scoped keys like rfu.ldn.keys, so it cannot be
-			// read here directly (the same reason the backend NAME comes in as a parameter rather than being
-			// read from config too).
-			const char* envKeys = getenv("MGBA_RFU_LDN_KEYS");
-			QByteArray keysPath = envKeys && envKeys[0] ? QByteArray(envKeys) : m_rfuLdnKeysPath.toUtf8();
-			GBASIORFUBroadcastSetKeysPath(m_rfuBackend, keysPath.isEmpty() ? nullptr : keysPath.constData());
-		}
-#endif
 	}
 	GBASIORFUCreate(&m_rfu, m_rfuBackend);
 

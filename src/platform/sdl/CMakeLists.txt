@@ -40,6 +40,19 @@ if (SDL_VERSION EQUAL "2")
 			set(CMAKE_OSX_DEPLOYMENT_TARGET "10.7")
 		endif()
 		set(SDLMAIN_LIBRARY ${SDL2MAIN_LIBRARY})
+
+		# FindSDL2 only finds vcpkg's release SDL2, so Debug binaries imported SDL2.dll, which vcpkg doesn't
+		# deploy for Debug (it copies from debug/bin), and Windows loaded whatever SDL2.dll was on PATH.
+		# Link the debug variants in Debug so vcpkg deploys SDL2d.dll next to the binaries.
+		if(MSVC)
+			get_filename_component(SDL2_INSTALL_DIR "${SDL2_LIBRARIES}/../.." ABSOLUTE)
+			if(EXISTS "${SDL2_INSTALL_DIR}/debug/lib/SDL2d.lib")
+				set(SDL_LIBRARY "$<IF:$<CONFIG:Debug>,${SDL2_INSTALL_DIR}/debug/lib/SDL2d.lib,${SDL2_LIBRARIES}>")
+			endif()
+			if(SDL2MAIN_LIBRARY AND EXISTS "${SDL2_INSTALL_DIR}/debug/lib/manual-link/SDL2maind.lib")
+				set(SDLMAIN_LIBRARY "$<IF:$<CONFIG:Debug>,${SDL2_INSTALL_DIR}/debug/lib/manual-link/SDL2maind.lib,${SDL2MAIN_LIBRARY}>")
+			endif()
+		endif()
 	else()
 		set(SDL_VERSION "1.2")
 	endif()

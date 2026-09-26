@@ -860,51 +860,12 @@ add_subdirectory(src/util)
 
 if(USE_LDN_BROADCAST)
 	add_definitions(-DUSE_LDN_BROADCAST)
-	# Development tool: talks to a running ldnd and lists the Wi-Fi device it exposes.
 	add_executable(ldnd-probe
 		src/gba/sio/ldn/ldnd-probe.c
 		src/gba/sio/ldn/ldnd.c
-		src/gba/sio/ldn/netlink.c)
-	# Development tool: listens for a Switch's LDN advertisements (monitor mode) and decodes them.
-	add_executable(ldn-scan
-		src/gba/sio/ldn/ldn-scan.c
-		src/gba/sio/ldn/ldn.c
-		src/gba/sio/ldn/ldn-monitor.c
-		src/gba/sio/ldn/ldnd.c
-		src/gba/sio/ldn/netlink.c)
+		src/gba/sio/ldn/ldn.c)
 	if(WIN32)
-		target_link_libraries(ldn-scan bcrypt)
-	endif()
-	# Development tool: scans for a Switch's advertisement, then attempts real WPA2-PSK association with it.
-	add_executable(ldn-join
-		src/gba/sio/ldn/ldn-join.c
-		src/gba/sio/ldn/ldn.c
-		src/gba/sio/ldn/ldn-monitor.c
-		src/gba/sio/ldn/ldn-station.c
-		src/gba/sio/ldn/ldn-auth.c
-		src/gba/sio/ldn/ldnd.c
-		src/gba/sio/ldn/netlink.c)
-	if(WIN32)
-		target_link_libraries(ldn-join bcrypt)
-	endif()
-	# Development tool: like ldn-join, then also brings up and drives the Pia connection layer (Net/Session/RTT)
-	# to see whether the host accepts a Pia session - does not yet bridge any RFU/game data.
-	add_executable(ldn-pia-join
-		src/gba/sio/ldn/ldn-pia-join.c
-		src/gba/sio/ldn/ldn.c
-		src/gba/sio/ldn/ldn-monitor.c
-		src/gba/sio/ldn/ldn-station.c
-		src/gba/sio/ldn/ldn-auth.c
-		src/gba/sio/ldn/ldn-pia.c
-		src/gba/sio/ldn/ldn-pia-reliable.c
-		src/gba/sio/ldn/ldn-pia-connect.c
-		src/gba/sio/ldn/ldnd.c
-		src/gba/sio/ldn/netlink.c
-		src/util/crc32.c
-		src/third-party/zstd/zstdlib.c)
-	target_include_directories(ldn-pia-join PRIVATE include)
-	if(WIN32)
-		target_link_libraries(ldn-pia-join bcrypt)
+		target_link_libraries(ldnd-probe bcrypt)
 	endif()
 endif()
 

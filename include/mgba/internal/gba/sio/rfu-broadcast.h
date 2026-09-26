@@ -14,25 +14,20 @@ CXX_GUARD_START
 
 /*
  * The "Broadcast" wireless adapter backend: a real Switch over local wireless (LDN), reached through a running
- * ldnd. mGBA never starts or manages ldnd itself - the user runs it separately, however their setup needs, before
- * choosing Broadcast; if ldnd is not reachable, the adapter is simply left with nobody in range, exactly like the
- * "usb"/"broadcast"-before-this-existed stubs did.
+ * ldnd (protocol 7; its pipe is \\.\pipe\ldnd unless the LDN_DAEMON environment variable names another). mGBA never
+ * starts or manages ldnd itself - the user runs it separately, with their adapter and prod.keys, before choosing
+ * Broadcast; if ldnd is not reachable, the adapter is simply left with nobody in range.
  *
  * Only built when USE_LDN_BROADCAST is on (Windows only for now; see src/gba/sio/ldn/rfu-broadcast.c and its
- * siblings). When it is off, GBASIORFUBackendCreate("broadcast") returns the old stub instead, and this header is
- * simply not used.
+ * siblings). When it is off, GBASIORFUBackendCreate("broadcast") returns a stub instead, and this header is simply
+ * not used.
  *
- * Scope so far: searching only. While the game is polling for broadcasts (BroadcastReadStart/Poll/End), this
- * backend puts the Wi-Fi adapter into monitor mode, hops the LDN channels, and turns every FRLG advertisement it
- * decodes into a synthesized RFU broadcast record the driver hands the game. Joining (Connect) is not implemented
- * yet: it always fails immediately with a trace line, rather than hanging.
+ * Client role only: while the game searches, ldnd scans and every FireRed/LeafGreen room it finds becomes an RFU
+ * broadcast record for the game; connecting joins that room through ldnd and runs the Switch game's Pia session
+ * over it. Hosting is not implemented.
  */
 
 struct GBASIORFUBackend* GBASIORFUBroadcastCreate(void);
-
-// Give it the path to a prod.keys file before it is attached (before core->setPeripheral). Without it, the
-// backend still puts the adapter in monitor mode while searching, but cannot decrypt what it captures.
-void GBASIORFUBroadcastSetKeysPath(struct GBASIORFUBackend*, const char* prodKeysPath);
 
 CXX_GUARD_END
 

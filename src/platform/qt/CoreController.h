@@ -29,9 +29,6 @@
 #include <mgba/internal/gba/sio/dolphin.h>
 #include <mgba/internal/gba/sio/rfu.h>
 #include <mgba/internal/gba/sio/rfu-udp.h>
-#ifdef USE_LDN_BROADCAST
-#include <mgba/internal/gba/sio/rfu-broadcast.h>
-#endif
 #endif
 
 #ifdef M_CORE_GBA
@@ -368,7 +365,6 @@ private:
 	QString m_rfuBackendName;
 	bool m_rfuLogEnabled = false; // "Save adapter log": write <config dir>/rfu-trace.log while an adapter is attached
 	bool m_rfuTraceOn = false; // this controller currently holds a trace file
-	QString m_rfuLdnKeysPath; // rfu.ldn.keys, refreshed from loadConfig() (core->config does not carry ports.qt keys)
 	MultiplayerController* m_rfuSavedMultiplayer = nullptr;
 	QByteArray m_eReaderData;
 #endif

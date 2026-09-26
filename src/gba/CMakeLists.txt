@@ -48,11 +48,7 @@ set(SIO_FILES
 if(USE_LDN_BROADCAST)
 	list(APPEND SIO_FILES
 		sio/ldn/ldnd.c
-		sio/ldn/netlink.c
 		sio/ldn/ldn.c
-		sio/ldn/ldn-monitor.c
-		sio/ldn/ldn-station.c
-		sio/ldn/ldn-auth.c
 		sio/ldn/ldn-pia.c
 		sio/ldn/ldn-pia-reliable.c
 		sio/ldn/ldn-pia-connect.c
