@@ -10,6 +10,7 @@
 #include "ldn-pia.h"
 #include "ldn.h"
 #include "ldnd.h"
+#include "trade-shim.h"
 
 #include <mgba/core/version.h>
 
@@ -182,6 +183,11 @@ struct GBASIORFUBroadcast {
 	bool piaAccepted; // the host's 'A' arrived - only then do the game's slots go out as 'T' frames
 	uint32_t piaTs; // per-NEW-frame 'T' counter
 	uint32_t piaKSeq; // joiner-global 'K' counter (+1 from 1)
+
+	// Sits between the game's slots and the Switch's: a retail cartridge runs one post-trade standby round fewer than
+	// the Switch release, which deadlocks both at "Communication standby" (see trade-shim.h). Reset for each session,
+	// and owned by the emulation thread like the rest of the session.
+	struct LdnTradeShim piaShim;
 };
 
 #ifdef _WIN32
@@ -630,6 +636,7 @@ static bool _piaHandshake(struct GBASIORFUBroadcast* broadcast, uint16_t deviceI
 		broadcast->piaNonceCounter = nonceCounter;
 		broadcast->piaPktids = pktids;
 		broadcast->piaTick = tick;
+		LdnTradeShimReset(&broadcast->piaShim);
 		broadcast->piaActive = true;
 		if (broadcast->connectWanted && broadcast->connectDeviceId == deviceId) {
 			broadcast->connectWanted = false;
@@ -1050,6 +1057,13 @@ static void _gbaSendSlot(struct GBASIORFUBroadcast* broadcast, const uint8_t* sl
 	_reliableQueue(broadcast, frame, 4 + bodyLength);
 }
 
+// Every child slot bound for the host goes through here, the game's own and the shim's injected ones alike, so each
+// command frame gets the next consecutive sequence tag (the host drops the child after five out-of-sequence commands).
+static void _gbaSendChildSlot(struct GBASIORFUBroadcast* broadcast, uint8_t* slot, size_t length) {
+	LdnTradeShimStamp(&broadcast->piaShim, slot, length);
+	_gbaSendSlot(broadcast, slot, length);
+}
+
 // 57 4b 0c 00 <k_seq:u32><mid:u32><acked_host_ts:u32>, all LE - one per unique host 'T'.
 static void _gbaSendAck(struct GBASIORFUBroadcast* broadcast, uint32_t ackedTs) {
 	uint8_t frame[16] = {kGbaMarker, kGbaK, 12, 0};
@@ -1083,7 +1097,14 @@ static void _gbaReceive(struct GBASIORFUBroadcast* broadcast, const uint8_t* dat
 			broadcast->piaHostTSeen = true;
 			_gbaSendAck(broadcast, ts);
 			if (slotLength > 1 && 8 + slotLength <= bodyLength) {
-				GBASIORFUDataReceived(broadcast->rfu, 0, &body[8], slotLength);
+				uint8_t slot[256];
+				uint8_t pre[4 * LDN_TRADE_SHIM_HOST_FRAME];
+				memcpy(slot, &body[8], slotLength);
+				size_t preLength = LdnTradeShimHost(&broadcast->piaShim, slot, slotLength, GetTickCount(), pre, sizeof(pre));
+				for (size_t at = 0; at + LDN_TRADE_SHIM_HOST_FRAME <= preLength; at += LDN_TRADE_SHIM_HOST_FRAME) {
+					GBASIORFUDataReceived(broadcast->rfu, 0, &pre[at], LDN_TRADE_SHIM_HOST_FRAME);
+				}
+				GBASIORFUDataReceived(broadcast->rfu, 0, slot, slotLength);
 			}
 		} else if (type == kGbaD) {
 			GBASIORFUTrace(broadcast->rfu, "PIA    host sent 'D' (disconnect)");
@@ -1295,6 +1316,21 @@ static void _frame(struct GBASIORFUBackend* backend) {
 		_gbaSendConnect(broadcast);
 	}
 
+	if (broadcast->piaAccepted && gameConnected) {
+		DWORD now = GetTickCount();
+		LdnTradeShimPoll(&broadcast->piaShim, now);
+		uint8_t extra[LDN_TRADE_SHIM_CHILD_FRAME];
+		size_t extraLength = LdnTradeShimInject(&broadcast->piaShim, now, extra, sizeof(extra));
+		if (extraLength) {
+			_gbaSendChildSlot(broadcast, extra, extraLength);
+		}
+		uint8_t repeat[LDN_TRADE_SHIM_HOST_FRAME];
+		size_t repeatLength = LdnTradeShimHostInject(&broadcast->piaShim, now, repeat, sizeof(repeat));
+		if (repeatLength) {
+			GBASIORFUDataReceived(broadcast->rfu, 0, repeat, repeatLength);
+		}
+	}
+
 	struct LdnPiaOutMessage outMsgs[4];
 	size_t nOut = LdnPiaConnectDrain(conn, outMsgs, 4);
 	for (size_t i = 0; i < nOut; ++i) {
@@ -1336,8 +1372,23 @@ static void _sendData(struct GBASIORFUBackend* backend, const uint8_t* data, siz
 		GBASIORFUTrace(broadcast->rfu, "PIA    sendData %zu bytes held back (host has not accepted our connect yet)", length);
 		return;
 	}
-	GBASIORFUTrace(broadcast->rfu, "PIA    sendData %zu bytes -> 'T' frame", length);
-	_gbaSendSlot(broadcast, data, length);
+	uint8_t slot[RFU_PACKET_MAX];
+	uint8_t reply[2 * LDN_TRADE_SHIM_HOST_FRAME];
+	if (length > sizeof(slot)) {
+		length = sizeof(slot);
+	}
+	memcpy(slot, data, length);
+	bool forward;
+	size_t replyLength = LdnTradeShimChild(&broadcast->piaShim, slot, length, GetTickCount(), reply, sizeof(reply), &forward);
+	if (forward) {
+		GBASIORFUTrace(broadcast->rfu, "PIA    sendData %zu bytes -> 'T' frame", length);
+		_gbaSendChildSlot(broadcast, slot, length);
+	} else {
+		GBASIORFUTrace(broadcast->rfu, "PIA    sendData %zu bytes repeat the previous command frame; not sent again", length);
+	}
+	for (size_t at = 0; at + LDN_TRADE_SHIM_HOST_FRAME <= replyLength; at += LDN_TRADE_SHIM_HOST_FRAME) {
+		GBASIORFUDataReceived(broadcast->rfu, 0, &reply[at], LDN_TRADE_SHIM_HOST_FRAME);
+	}
 #else
 	(void) broadcast;
 	(void) data;
@@ -1381,6 +1432,11 @@ static void _noopReply(struct GBASIORFUBackend* backend, uint16_t clientId, bool
 	(void) slot;
 }
 
+static void _shimLog(void* user, const char* message) {
+	struct GBASIORFUBroadcast* broadcast = user;
+	GBASIORFUTrace(broadcast->rfu, "SHIM   %s", message);
+}
+
 struct GBASIORFUBackend* GBASIORFUBroadcastCreate(void) {
 	struct GBASIORFUBroadcast* broadcast = calloc(1, sizeof(*broadcast));
 	if (!broadcast) {
@@ -1392,6 +1448,7 @@ struct GBASIORFUBackend* GBASIORFUBroadcastCreate(void) {
 	broadcast->wake = CreateEventA(NULL, FALSE, FALSE, NULL);
 	InitializeCriticalSection(&broadcast->lock);
 #endif
+	LdnTradeShimInit(&broadcast->piaShim, _shimLog, broadcast);
 	broadcast->d.init = _init;
 	broadcast->d.deinit = _deinit;
 	broadcast->d.reset = _reset;
