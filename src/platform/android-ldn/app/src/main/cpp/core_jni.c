@@ -40,6 +40,7 @@ static struct mCore* gCore;
 static mColor* gVideo;
 static unsigned gWidth, gHeight;
 static volatile uint32_t gKeys;
+static bool gPreviousValid; // whether gPrevious (the last frame, for frame blending) holds a picture
 
 // The GBA's audio rate is not fixed: a game changes it through SOUNDBIAS (32768, 65536, 131072 or 262144 Hz; FireRed
 // uses one of the high ones) and the core reports that through mAVStream.audioRateChanged, producing samples at the new
@@ -199,6 +200,7 @@ JNIEXPORT jboolean JNICALL Java_io_mgbaldn_gba_Native_load(JNIEnv* env, jclass c
 	gSumL = gSumR = 0;
 	gCount = 0;
 	gCore = core;
+	gPreviousValid = false;
 	return JNI_TRUE;
 }
 
@@ -240,6 +242,21 @@ JNIEXPORT void JNICALL Java_io_mgbaldn_gba_Native_setKeys(JNIEnv* env, jclass cl
 	gKeys = (uint32_t) keys;
 }
 
+// Frame blending, done on the finished frame before the app draws it: each frame is averaged with the one before (the
+// ghosting of a real GBA LCD; games that flicker sprites on alternate frames to fake transparency look right with it).
+// Settable from any thread (a plain flag read once per frame).
+static volatile int gBlend;
+static uint32_t gPrevious[256 * 224];
+
+JNIEXPORT void JNICALL Java_io_mgbaldn_gba_Native_setFrameBlending(JNIEnv* env, jclass clazz, jboolean blend) {
+	(void) env;
+	(void) clazz;
+	if (blend && !gBlend) {
+		gPreviousValid = false;
+	}
+	gBlend = blend ? 1 : 0;
+}
+
 // Runs one frame. The picture is left in the video buffer (alpha forced opaque); the audio is copied into `audio` as
 // interleaved 16-bit stereo, and the number of stereo frames is returned (0 when no game is loaded).
 JNIEXPORT jint JNICALL Java_io_mgbaldn_gba_Native_runFrame(JNIEnv* env, jclass clazz, jshortArray audio) {
@@ -250,12 +267,25 @@ JNIEXPORT jint JNICALL Java_io_mgbaldn_gba_Native_runFrame(JNIEnv* env, jclass c
 	gCore->setKeys(gCore, gKeys);
 	gCore->runFrame(gCore);
 	gCore->currentVideoSize(gCore, &gWidth, &gHeight);
+	int blend = gBlend;
+	bool blendNow = blend && gPreviousValid;
 	for (unsigned y = 0; y < gHeight; ++y) {
-		mColor* row = gVideo + (size_t) y * 256;
+		uint32_t* row = (uint32_t*) (gVideo + (size_t) y * 256);
+		uint32_t* previous = gPrevious + (size_t) y * 256;
 		for (unsigned x = 0; x < gWidth; ++x) {
-			row[x] |= 0xFF000000u;
+			uint32_t c = row[x] & 0x00FFFFFFu;
+			if (blend) {
+				uint32_t p = previous[x];
+				previous[x] = c;
+				if (blendNow) {
+					// per-channel average of this frame and the last
+					c = ((c & 0x00FEFEFEu) >> 1) + ((p & 0x00FEFEFEu) >> 1) + (c & p & 0x00010101u);
+				}
+			}
+			row[x] = c | 0xFF000000u;
 		}
 	}
+	gPreviousValid = blend != 0;
 
 	struct mAudioBuffer* buffer = gCore->getAudioBuffer(gCore);
 	size_t available = mAudioBufferAvailable(buffer);
@@ -470,4 +500,11 @@ JNIEXPORT void JNICALL Java_io_mgbaldn_gba_Native_setUsbLink(JNIEnv* env, jclass
 		gPresent = (*env)->GetMethodID(env, cls, "present", "()Z");
 	}
 	Esp32SerialSetOps(&kJavaOps);
+}
+
+// The core's frame counter (frames since the game was loaded or reset), like the desktop build's frame counter overlay.
+JNIEXPORT jint JNICALL Java_io_mgbaldn_gba_Native_frameCounter(JNIEnv* env, jclass clazz) {
+	(void) env;
+	(void) clazz;
+	return gCore ? (jint) gCore->frameCounter(gCore) : 0;
 }

@@ -41,6 +41,12 @@ final class Native {
     /** 0 = no adapter, 1 = wireless adapter (ESP32), 2 = cable adapter (RFU cable wrapper over the ESP32). */
     static native boolean setAdapter(int mode);
 
+    /** Averages each frame with the previous one. Safe from any thread, like setKeys. */
+    static native void setFrameBlending(boolean blend);
+
+    /** Frames emulated since the game was loaded or reset. */
+    static native int frameCounter();
+
     /** The USB serial link the ESP32 backend talks through (UsbLink). */
     static native void setUsbLink(UsbLink link);
 }

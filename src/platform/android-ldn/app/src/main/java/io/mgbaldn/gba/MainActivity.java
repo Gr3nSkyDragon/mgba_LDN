@@ -56,6 +56,10 @@ public class MainActivity extends Activity implements UsbLink.Logger {
     private int adapter = ADAPTER_OFF;
     private volatile int currentFps;
     private boolean showFps = true;
+    private boolean showFrameCounter = false;
+    private int colorMode = GameView.MODE_ORIGINAL;
+    private int saturation = 100;
+    private TextView menuButton;
     private boolean showEspStatus = true;
     private File baseDir;
     private File romDir;
@@ -66,6 +70,10 @@ public class MainActivity extends Activity implements UsbLink.Logger {
     private int controlsOpacity = 35;
     private boolean scanlines;
     private int scanlineStrength = 35;
+    private boolean vScanlines;
+    private int vScanlineStrength = 35;
+    private int pixelMode = GameView.PIXEL_OFF;
+    private boolean frameBlend;
     private int[] colors = DEFAULT_COLORS.clone();
 
     private final BroadcastReceiver usbReceiver = new BroadcastReceiver() {
@@ -122,6 +130,7 @@ public class MainActivity extends Activity implements UsbLink.Logger {
         FrameLayout.LayoutParams menuParams = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.END);
         menuParams.setMargins(0, 6, 6, 0);
         root.addView(menu, menuParams);
+        menuButton = menu;
         status = new TextView(this);
         status.setTextColor(0xFFFFFFFF);
         status.setBackgroundColor(0x66000000);
@@ -141,15 +150,27 @@ public class MainActivity extends Activity implements UsbLink.Logger {
 
         adapter = prefs.getInt("adapter", ADAPTER_OFF);
         showFps = prefs.getBoolean("showFps", true);
+        showFrameCounter = prefs.getBoolean("showFrameCounter", false);
+        colorMode = Math.min(prefs.getInt("colorMode", GameView.MODE_ORIGINAL), GameView.MODE_NAMES.length - 1); // (an older build had a sixth mode)
+        saturation = prefs.getInt("saturation", 100);
         showEspStatus = prefs.getBoolean("showEspStatus", true);
         controlsShown = prefs.getBoolean("controls", true);
         controlsOpacity = prefs.getInt("opacity", 35);
         scanlines = prefs.getBoolean("scanlines", false);
         scanlineStrength = prefs.getInt("scanlineStrength", 35);
+        vScanlines = prefs.getBoolean("vScanlines", false);
+        vScanlineStrength = prefs.getInt("vScanlineStrength", 35);
+        pixelMode = prefs.getInt("pixelMode", GameView.PIXEL_OFF);
+        frameBlend = prefs.getBoolean("frameBlend", false);
         colors = loadColors();
         gameView.setControlsVisible(controlsShown);
         gameView.setControlsOpacity(controlsOpacity);
         gameView.setScanlines(scanlines, scanlineStrength);
+        gameView.setColorMode(colorMode, saturation);
+        gameView.setVerticalScanlines(vScanlines, vScanlineStrength);
+        gameView.setPixelMode(pixelMode);
+        applyPostProcess();
+        applyFrameCounter();
         gameView.setColors(colors);
         loadBackground();
         String last = prefs.getString("rom", null);
@@ -489,6 +510,16 @@ public class MainActivity extends Activity implements UsbLink.Logger {
         column.addView(bar);
     }
 
+    // The counter sits in the top right corner, to the left of the menu button (which is measured once it has been laid out).
+    private void applyPostProcess() { // (only the frame blending is native now)
+        Native.setFrameBlending(frameBlend);
+    }
+
+    private void applyFrameCounter() {
+        gameView.setFrameCounter(showFrameCounter, menuButton.getWidth() + 6);
+        menuButton.post(() -> gameView.setFrameCounter(showFrameCounter, menuButton.getWidth() + 6));
+    }
+
     private void displaySettings() {
         android.widget.LinearLayout column = new android.widget.LinearLayout(this);
         column.setOrientation(android.widget.LinearLayout.VERTICAL);
@@ -504,6 +535,28 @@ public class MainActivity extends Activity implements UsbLink.Logger {
             prefs.edit().putBoolean("showEspStatus", on).apply();
             refreshStatus();
         }));
+        column.addView(checkBox("Frame counter", showFrameCounter, (v, on) -> {
+            showFrameCounter = on;
+            prefs.edit().putBoolean("showFrameCounter", on).apply();
+            applyFrameCounter();
+        }));
+        android.widget.Button modeButton = new android.widget.Button(this);
+        modeButton.setText("Color mode: " + GameView.MODE_NAMES[colorMode]);
+        modeButton.setOnClickListener(v -> new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle("Color mode").setSingleChoiceItems(GameView.MODE_NAMES, colorMode, (d, which) -> {
+                    colorMode = which;
+                    prefs.edit().putInt("colorMode", which).apply();
+                    gameView.setColorMode(colorMode, saturation);
+                    applyPostProcess();
+                    modeButton.setText("Color mode: " + GameView.MODE_NAMES[which]);
+                    d.dismiss();
+                }).show());
+        column.addView(modeButton);
+        addSlider(column, "Color saturation (0 = black and white)", 0, 100, saturation, value -> {
+            saturation = value;
+            gameView.setColorMode(colorMode, value);
+            prefs.edit().putInt("saturation", value).apply();
+        });
         column.addView(checkBox("On-screen controls", controlsShown, (v, on) -> {
             controlsShown = on;
             gameView.setControlsVisible(on);
@@ -541,15 +594,41 @@ public class MainActivity extends Activity implements UsbLink.Logger {
         hint.setText("The photo fills the area behind the buttons when the phone is held upright.");
         hint.setTextSize(12);
         column.addView(hint);
-        column.addView(checkBox("Scanlines", scanlines, (v, on) -> {
+        column.addView(checkBox("Frame blending", frameBlend, (v, on) -> {
+            frameBlend = on;
+            prefs.edit().putBoolean("frameBlend", on).apply();
+            applyPostProcess();
+        }));
+        android.widget.Button pixelButton = new android.widget.Button(this);
+        pixelButton.setText("Pixel effect: " + GameView.PIXEL_NAMES[pixelMode]);
+        pixelButton.setOnClickListener(v -> new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle("Pixel effect").setSingleChoiceItems(GameView.PIXEL_NAMES, pixelMode, (d, which) -> {
+                    pixelMode = which;
+                    prefs.edit().putInt("pixelMode", which).apply();
+                    gameView.setPixelMode(which);
+                    pixelButton.setText("Pixel effect: " + GameView.PIXEL_NAMES[which]);
+                    d.dismiss();
+                }).show());
+        column.addView(pixelButton);
+        column.addView(checkBox("Horizontal scanlines", scanlines, (v, on) -> {
             scanlines = on;
             gameView.setScanlines(on, scanlineStrength);
             prefs.edit().putBoolean("scanlines", on).apply();
         }));
-        addSlider(column, "Scanline strength", 5, 100, scanlineStrength, value -> {
+        addSlider(column, "Horizontal scanline strength", 5, 100, scanlineStrength, value -> {
             scanlineStrength = value;
             gameView.setScanlines(scanlines, value);
             prefs.edit().putInt("scanlineStrength", value).apply();
+        });
+        column.addView(checkBox("Vertical scanlines", vScanlines, (v, on) -> {
+            vScanlines = on;
+            gameView.setVerticalScanlines(on, vScanlineStrength);
+            prefs.edit().putBoolean("vScanlines", on).apply();
+        }));
+        addSlider(column, "Vertical scanline strength", 5, 100, vScanlineStrength, value -> {
+            vScanlineStrength = value;
+            gameView.setVerticalScanlines(vScanlines, value);
+            prefs.edit().putInt("vScanlineStrength", value).apply();
         });
 
         android.widget.ScrollView scroll = new android.widget.ScrollView(this);
