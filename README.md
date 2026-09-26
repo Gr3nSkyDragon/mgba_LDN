@@ -47,7 +47,7 @@ Import Save lets you use other saves with your ROM. This will update your defaul
 Display Settings lets you enable or disable the FPS counter, ESP32 status message, on-screen controls, and pixelation ("scanlines"). You can also change the button colors, either with presets or hexadecimal values for individual buttons. Background Photo lets you set an image as your "shell" image when in vertical mode. Color Mode and Frame Counter (for you RNG manipulation nerds) coming soon.
 
 # Original ReadMe
---------
+
 mGBA
 ====
 
