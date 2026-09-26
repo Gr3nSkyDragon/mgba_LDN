@@ -278,6 +278,18 @@ void GBASIORFUConnectRequested(struct GBASIORFU* rfu, uint16_t clientId) {
 	MutexUnlock(&rfu->eventMutex);
 }
 
+bool GBASIORFUPopEvent(struct GBASIORFU* rfu, struct GBASIORFUEvent* out) {
+	MutexLock(&rfu->eventMutex);
+	if (rfu->eventHead == rfu->eventTail) {
+		MutexUnlock(&rfu->eventMutex);
+		return false;
+	}
+	*out = rfu->events[rfu->eventTail];
+	rfu->eventTail = (rfu->eventTail + 1) % RFU_EVENT_QUEUE;
+	MutexUnlock(&rfu->eventMutex);
+	return true;
+}
+
 static void _pushPacket(struct GBASIORFU* rfu, struct GBASIORFUPacket packets[RFU_QUEUE_DEPTH], const uint8_t* data, unsigned length, unsigned maxLength) {
 	if (length > maxLength) {
 		length = maxLength;

@@ -8,6 +8,9 @@
 #include <mgba/internal/gba/gba.h>
 #include <mgba/internal/gba/io.h>
 
+#include <stdarg.h>
+#include <stdio.h>
+
 #define DRIVER_ID 0x6B636F4C
 #define DRIVER_STATE_VERSION 1
 #define LOCKSTEP_INTERVAL 4096
@@ -114,6 +117,100 @@ static void _setReady(struct GBASIOLockstepCoordinator*, struct GBASIOLockstepPl
 static void _hardSync(struct GBASIOLockstepCoordinator*, struct GBASIOLockstepPlayer*);
 
 static void _lockstepEvent(struct mTiming*, void* context, uint32_t cyclesLate);
+
+// Optional trace of the cable traffic (Emulation > RFU Cable Wrapper > Save adapter log). The coordinator is shared by every
+// window in the process, so the sink is process-wide and reference counted; each line is tagged with the player it is for.
+static FILE* sTrace;
+static Mutex sTraceMutex;
+static bool sTraceMutexReady;
+static int sTraceRefs;
+
+bool GBASIOLockstepTraceAcquire(const char* path) {
+	if (!sTraceMutexReady) {
+		MutexInit(&sTraceMutex);
+		sTraceMutexReady = true;
+	}
+	MutexLock(&sTraceMutex);
+	if (!sTrace) {
+		sTrace = path && path[0] ? fopen(path, "w") : NULL;
+		if (!sTrace) {
+			MutexUnlock(&sTraceMutex);
+			return false;
+		}
+		fprintf(sTrace, "# RFU wrapper trace: cable (lockstep) traffic. Columns: cycle frame Pn EVENT ...\n");
+		fflush(sTrace);
+	}
+	++sTraceRefs;
+	MutexUnlock(&sTraceMutex);
+	return true;
+}
+
+void GBASIOLockstepTraceRelease(void) {
+	if (!sTraceMutexReady) {
+		return;
+	}
+	MutexLock(&sTraceMutex);
+	if (sTraceRefs > 0 && --sTraceRefs == 0 && sTrace) {
+		fclose(sTrace);
+		sTrace = NULL;
+	}
+	MutexUnlock(&sTraceMutex);
+}
+
+// Also used by the RFU Cable Wrapper driver (rfu-wrapper.c), which writes to the same file when it is the link driver.
+void GBASIOCableTrace(struct GBASIO* sio, const char* format, ...) {
+	if (!sTrace) {
+		return;
+	}
+	MutexLock(&sTraceMutex);
+	if (sTrace) {
+		struct GBA* gba = sio ? sio->p : NULL;
+		fprintf(sTrace, "%10u %6u W  ", gba ? mTimingCurrentTime(&gba->timing) : 0, gba ? gba->video.frameCounter : 0);
+		va_list args;
+		va_start(args, format);
+		vfprintf(sTrace, format, args);
+		va_end(args);
+		fputc('\n', sTrace);
+		fflush(sTrace);
+	}
+	MutexUnlock(&sTraceMutex);
+}
+
+static const char* _modeName(enum GBASIOMode mode) {
+	switch (mode) {
+	case GBA_SIO_NORMAL_8:
+		return "NORMAL8";
+	case GBA_SIO_NORMAL_32:
+		return "NORMAL32";
+	case GBA_SIO_MULTI:
+		return "MULTI";
+	case GBA_SIO_UART:
+		return "UART";
+	case GBA_SIO_GPIO:
+		return "GPIO";
+	case GBA_SIO_JOYBUS:
+		return "JOYBUS";
+	}
+	return "?";
+}
+
+static void _trace(struct GBASIOLockstepDriver* lockstep, int playerId, const char* format, ...) {
+	if (!sTrace) {
+		return;
+	}
+	MutexLock(&sTraceMutex);
+	if (sTrace) {
+		struct GBA* gba = lockstep->d.p ? lockstep->d.p->p : NULL;
+		fprintf(sTrace, "%10u %6u P%d ", gba ? mTimingCurrentTime(&gba->timing) : 0, gba ? gba->video.frameCounter : 0, playerId);
+		va_list args;
+		va_start(args, format);
+		vfprintf(sTrace, format, args);
+		va_end(args);
+		fputc('\n', sTrace);
+		fflush(sTrace);
+	}
+	MutexUnlock(&sTraceMutex);
+}
 
 static void _verifyAwake(struct GBASIOLockstepCoordinator* coordinator) {
 #ifdef NDEBUG
@@ -479,6 +576,7 @@ static void GBASIOLockstepDriverSetMode(struct GBASIODriver* driver, enum GBASIO
 	struct GBASIOLockstepPlayer* player = TableLookup(&coordinator->players, lockstep->lockstepId);
 	if (mode != player->mode) {
 		mLOG(GBA_SIO, DEBUG, "Switching mode from %d to %d", player->mode, mode);
+		_trace(lockstep, player->playerId, "MODE %s -> %s", _modeName(player->mode), _modeName(mode));
 		player->mode = mode;
 		struct GBASIOLockstepEvent event = {
 			.type = SIO_EV_MODE_SET,
@@ -560,6 +658,7 @@ static bool GBASIOLockstepDriverStart(struct GBASIODriver* driver) {
 	mLOG(GBA_SIO, DEBUG, "Transfer starting at %08X", coordinator->cycle);
 	memset(coordinator->multiData, 0xFF, sizeof(coordinator->multiData));
 	_setData(coordinator, 0, player->driver->d.p);
+	_trace(lockstep, 0, "START %s send=%08X", _modeName(coordinator->transferMode), coordinator->transferMode == GBA_SIO_MULTI ? coordinator->multiData[0] : coordinator->normalData[0]);
 
 	int32_t timestamp = GBASIOLockstepTime(player);
 	struct GBASIOLockstepEvent event = {
@@ -584,6 +683,7 @@ static void GBASIOLockstepDriverFinishMultiplayer(struct GBASIODriver* driver, u
 		struct GBASIOLockstepPlayer* player = TableLookup(&coordinator->players, lockstep->lockstepId);
 		if (!player->dataReceived) {
 			mLOG(GBA_SIO, WARN, "MULTI did not receive data. Are we running behind?");
+			_trace(lockstep, player->playerId, "MULTI MISS (no data received)");
 			memset(data, 0xFF, sizeof(uint16_t) * 4);
 		} else {
 			mLOG(GBA_SIO, DEBUG, "MULTI transfer finished: %04X %04X %04X %04X",
@@ -592,6 +692,8 @@ static void GBASIOLockstepDriverFinishMultiplayer(struct GBASIODriver* driver, u
 			     coordinator->multiData[2],
 			     coordinator->multiData[3]);
 			memcpy(data, coordinator->multiData, sizeof(uint16_t) * 4);
+			_trace(lockstep, player->playerId, "MULTI %04X %04X %04X %04X",
+			       coordinator->multiData[0], coordinator->multiData[1], coordinator->multiData[2], coordinator->multiData[3]);
 		}
 		player->dataReceived = false;
 		if (player->playerId == 0) {
@@ -611,9 +713,11 @@ static uint8_t GBASIOLockstepDriverFinishNormal8(struct GBASIODriver* driver) {
 		if (player->playerId > 0) {
 			if (!player->dataReceived) {
 				mLOG(GBA_SIO, WARN, "NORMAL did not receive data. Are we running behind?");
+				_trace(lockstep, player->playerId, "NORMAL8 MISS (no data received)");
 			} else {
 				data = coordinator->normalData[player->playerId - 1];
 				mLOG(GBA_SIO, DEBUG, "NORMAL8 transfer finished: %02X", data);
+				_trace(lockstep, player->playerId, "NORMAL8 %02X", data);
 			}
 		}
 		player->dataReceived = false;
@@ -635,9 +739,11 @@ static uint32_t GBASIOLockstepDriverFinishNormal32(struct GBASIODriver* driver) 
 		if (player->playerId > 0) {
 			if (!player->dataReceived) {
 				mLOG(GBA_SIO, WARN, "Did not receive data. Are we running behind?");
+				_trace(lockstep, player->playerId, "NORMAL32 MISS (no data received)");
 			} else {
 				data = coordinator->normalData[player->playerId - 1];
 				mLOG(GBA_SIO, DEBUG, "NORMAL32 transfer finished: %08X", data);
+				_trace(lockstep, player->playerId, "NORMAL32 %08X", data);
 			}
 		}
 		player->dataReceived = false;
@@ -666,6 +772,7 @@ void GBASIOLockstepCoordinatorAttach(struct GBASIOLockstepCoordinator* coordinat
 		abort();
 	}
 	driver->coordinator = coordinator;
+	_trace(driver, -1, "ATTACH id=%u", driver->lockstepId);
 }
 
 void GBASIOLockstepCoordinatorDetach(struct GBASIOLockstepCoordinator* coordinator, struct GBASIOLockstepDriver* driver) {
@@ -676,6 +783,7 @@ void GBASIOLockstepCoordinatorDetach(struct GBASIOLockstepCoordinator* coordinat
 	}
 	MutexLock(&coordinator->mutex);
 	struct GBASIOLockstepPlayer* player = TableLookup(&coordinator->players, driver->lockstepId);
+	_trace(driver, player ? player->playerId : -1, "DETACH id=%u", driver->lockstepId);
 	if (player) {
 		_removePlayer(coordinator, player);
 	}

@@ -28,6 +28,8 @@
 #ifdef M_CORE_GBA
 #include <mgba/internal/gba/sio/dolphin.h>
 #include <mgba/internal/gba/sio/rfu.h>
+#include <mgba/internal/gba/sio/rfu-wrapper.h>
+#include <mgba/internal/gba/sio/rfu-wrapper-air.h>
 #include <mgba/internal/gba/sio/rfu-udp.h>
 #ifdef USE_LDN_BROADCAST
 #include <mgba/internal/gba/sio/rfu-broadcast.h>
@@ -211,6 +213,9 @@ public slots:
 	void setRFUBackend(const QString&);
 	void setRFULogging(bool enabled);
 	bool rfuEnabled() const;
+	void setRFUWrapperBackend(const QString&);
+	void setRFUWrapperLogging(bool enabled);
+	bool rfuWrapperEnabled() const;
 	void setBattleChipId(uint16_t id);
 	void setBattleChipFlavor(int flavor);
 
@@ -264,6 +269,9 @@ private:
 #ifdef M_CORE_GBA
 	void attachRFU();
 	void detachRFU();
+	void updateRFUWrapperTrace();
+	bool startRFUWrapper(const QString& connection);
+	void stopRFUWrapper();
 	bool startRFU(const QString& backend);
 	void stopRFU();
 #endif
@@ -366,10 +374,18 @@ private:
 	GBASIORFUBackend* m_rfuBackend = nullptr;
 	bool m_rfuAttached = false;
 	QString m_rfuBackendName;
+	QString m_rfuRequestedBackend = QStringLiteral("off"); // what the menu asked for, whether or not it is attached
 	bool m_rfuLogEnabled = false; // "Save adapter log": write <config dir>/rfu-trace.log while an adapter is attached
 	bool m_rfuTraceOn = false; // this controller currently holds a trace file
 	QString m_rfuLdnKeysPath; // rfu.ldn.keys, refreshed from loadConfig() (core->config does not carry ports.qt keys)
 	MultiplayerController* m_rfuSavedMultiplayer = nullptr;
+	GBASIORFUWrapper m_rfuWrapper;
+	bool m_rfuWrapperAttached = false;
+	QString m_rfuWrapperConnection; // the connection the attached wrapper was started with
+	QByteArray m_rfuWrapperConnectionName;
+	QString m_rfuWrapperBackend = QStringLiteral("off"); // RFU Cable Wrapper: connections are stubs for now
+	bool m_rfuWrapperLogEnabled = false; // "Save adapter log" of the wrapper: <config dir>/rfu-wrapper-trace.log
+	bool m_rfuWrapperTraceHeld = false; // this controller holds a reference on the cable trace file
 	QByteArray m_eReaderData;
 #endif
 };

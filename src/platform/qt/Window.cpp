@@ -928,8 +928,11 @@ void Window::gameStarted() {
 	m_config->updateOption("resampleVideo");
 #ifdef M_CORE_GBA
 	// Applies the saved wireless adapter choice to the newly started game.
-	m_controller->setRFULogging(m_config->getOption("rfu.log", "0").toInt() != 0);
-	m_controller->setRFUBackend(m_config->getOption("rfu.backend", "off"));
+	// This window's own choices (the options are per window, see the menu setup).
+	m_controller->setRFULogging(m_rfuLog);
+	m_controller->setRFUBackend(m_rfuBackend);
+	m_controller->setRFUWrapperBackend(m_rfuWrapBackend);
+	m_controller->setRFUWrapperLogging(m_rfuWrapLog);
 #endif
 	attachWidget(m_display.get());
 	setFocus();
@@ -1478,7 +1481,7 @@ void Window::setupMenu(QMenuBar* menubar) {
 	}
 
 	m_actions.addSeparator("file");
-	m_multiWindow = m_actions.addAction(tr("New multiplayer window"), "multiWindow", GBAApp::app(), &GBAApp::newWindow, "file");
+	m_multiWindow = m_actions.addAction(tr("New multiplayer window"), "multiWindow", GBAApp::app(), &GBAApp::newWindow, "file", QKeySequence("Ctrl+N"));
 
 #ifdef M_CORE_GBA
 	auto dolphin = m_actions.addAction(tr("Connect to Dolphin..."), "connectDolphin", openNamedTView<DolphinConnector>(&m_dolphinView, true, this), "file");
@@ -1514,7 +1517,7 @@ void Window::setupMenu(QMenuBar* menubar) {
 	}, "emu", QKeySequence("Ctrl+P"));
 	connect(this, &Window::paused, pause.get(), &Action::setActive);
 
-	addGameAction(tr("&Next frame"), "frameAdvance", &CoreController::frameAdvance, "emu", QKeySequence("Ctrl+N"));
+	addGameAction(tr("&Next frame"), "frameAdvance", &CoreController::frameAdvance, "emu", QKeySequence("Ctrl+Shift+N"));
 
 	m_actions.addSeparator("emu");
 
@@ -1611,39 +1614,96 @@ void Window::setupMenu(QMenuBar* menubar) {
 	auto bcGate = addGameAction(tr("BattleChip Gate..."), "bcGate", openControllerTView<BattleChipView>(this), "emu");
 	m_platformActions.insert(mPLATFORM_GBA, bcGate);
 
+	// Wireless adapter (RFU) and RFU Cable Wrapper: per window. These options are deliberately NOT registered with the
+	// shared ConfigController (addOption), whose values are broadcast to every window: two windows in a multiplayer setup
+	// need different settings (one with the adapter, one without). Each window owns its options; the last choice is only
+	// saved as the default for the next launch.
+	// Only the first window of a run reads and saves them: a window opened later starts with the adapter and the wrapper
+	// off, so it cannot inherit (and silently apply) what another window was last set to.
+	static bool sPrimaryTaken = false;
+	const bool primary = !sPrimaryTaken;
+	sPrimaryTaken = true;
+	auto localOption = [this, primary](const char* key) {
+		ConfigOption* option = new ConfigOption(key, this);
+		connect(option, &ConfigOption::valueChanged, this, [this, option, key, primary](const QVariant& value) {
+			option->setValue(value);
+			if (primary) {
+				m_config->setOption(key, value);
+			}
+		});
+		return option;
+	};
+	auto savedOr = [this, primary](const char* key, const char* fallback) {
+		return primary ? m_config->getOption(key, fallback) : QString(fallback);
+	};
+
 	// Wireless adapter (RFU): off, or which backend carries its "air" (see CoreController::setRFUBackend).
 	m_actions.addMenu(tr("Wireless Adapter"), "rfu", "emu");
-	ConfigOption* rfuBackend = m_config->addOption("rfu.backend");
+	ConfigOption* rfuBackend = localOption("rfu.backend");
 	rfuBackend->addValue(tr("Off"), "off", &m_actions, "rfu");
 	m_actions.addSeparator("rfu");
 	rfuBackend->addValue(tr("Local"), "local", &m_actions, "rfu");
 	rfuBackend->addValue(tr("Broadcast"), "broadcast", &m_actions, "rfu");
 	rfuBackend->addValue(tr("ESP32"), "esp32", &m_actions, "rfu");
 	rfuBackend->connect([this](const QVariant& value) {
+		m_rfuBackend = value.toString();
 		if (m_controller) {
-			m_controller->setRFUBackend(value.toString());
+			m_controller->setRFUBackend(m_rfuBackend);
 		}
 	}, this);
 	// Before the menu had a choice, ticking "Wireless adapter" meant the link between windows on this computer.
 	if (m_config->getOption("rfu.backend").isEmpty() && m_config->getOption("rfu.enabled").toInt()) {
 		m_config->setOption("rfu.backend", "local");
 	}
-	rfuBackend->setValue(QVariant(m_config->getOption("rfu.backend", "off")));
+	rfuBackend->setValue(QVariant(savedOr("rfu.backend", "off")));
 
 	// Diagnostics for a wireless adapter that misbehaves: a log of what the adapter and its backend did (Wi-Fi association,
 	// LDN authentication, the Pia session, the game's link traffic). It holds addresses and network names, not prod.keys.
 	m_actions.addSeparator("rfu");
-	ConfigOption* rfuLog = m_config->addOption("rfu.log");
+	ConfigOption* rfuLog = localOption("rfu.log");
 	rfuLog->addBoolean(tr("Save adapter log"), &m_actions, "rfu");
 	rfuLog->connect([this](const QVariant& value) {
+		m_rfuLog = value.toBool();
 		if (m_controller) {
-			m_controller->setRFULogging(value.toBool());
+			m_controller->setRFULogging(m_rfuLog);
 		}
 	}, this);
 	m_actions.addAction(tr("Open adapter log folder"), "rfuLogFolder", []() {
 		QDesktopServices::openUrl(QUrl::fromLocalFile(ConfigController::configDir()));
 	}, "rfu");
-	m_config->updateOption("rfu.log");
+	rfuLog->setValue(QVariant(savedOr("rfu.log", "0").toInt() != 0));
+
+	// RFU Cable Wrapper: lets a cable-only game (Ruby/Sapphire) talk to an FRLG leader. Local joins a leader in another
+	// mGBA; Broadcast and ESP32 are still stubs. Its log is the wrapper's own trace (or, with the wrapper off, the
+	// cable traffic between games in mGBA's multiplayer).
+	m_actions.addMenu(tr("RFU Cable Wrapper"), "rfuwrap", "emu");
+	ConfigOption* wrapBackend = localOption("rfuwrap.backend");
+	wrapBackend->addValue(tr("Off"), "off", &m_actions, "rfuwrap");
+	m_actions.addSeparator("rfuwrap");
+	wrapBackend->addValue(tr("Local"), "local", &m_actions, "rfuwrap");
+	wrapBackend->addValue(tr("Broadcast"), "broadcast", &m_actions, "rfuwrap");
+	wrapBackend->addValue(tr("ESP32"), "esp32", &m_actions, "rfuwrap");
+	wrapBackend->connect([this](const QVariant& value) {
+		m_rfuWrapBackend = value.toString();
+		if (m_controller) {
+			m_controller->setRFUWrapperBackend(m_rfuWrapBackend);
+		}
+	}, this);
+	wrapBackend->setValue(QVariant(savedOr("rfuwrap.backend", "off")));
+
+	m_actions.addSeparator("rfuwrap");
+	ConfigOption* wrapLog = localOption("rfuwrap.log");
+	wrapLog->addBoolean(tr("Save adapter log"), &m_actions, "rfuwrap");
+	wrapLog->connect([this](const QVariant& value) {
+		m_rfuWrapLog = value.toBool();
+		if (m_controller) {
+			m_controller->setRFUWrapperLogging(m_rfuWrapLog);
+		}
+	}, this);
+	m_actions.addAction(tr("Open adapter log folder"), "rfuwrapLogFolder", []() {
+		QDesktopServices::openUrl(QUrl::fromLocalFile(ConfigController::configDir()));
+	}, "rfuwrap");
+	wrapLog->setValue(QVariant(savedOr("rfuwrap.log", "0").toInt() != 0));
 #endif
 
 	m_actions.addMenu(tr("Audio/&Video"), "av");

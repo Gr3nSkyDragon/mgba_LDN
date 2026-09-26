@@ -1192,6 +1192,7 @@ bool CoreController::startRFU(const QString& backend) {
 	mCore* core = m_threadContext.core;
 	// Also releases what we hold when the driver was replaced behind our back (it is already deinitialised then).
 	stopRFU();
+	stopRFUWrapper();
 
 	if (backend != QLatin1String("none")) {
 		m_rfuBackend = GBASIORFUBackendCreate(backend.toUtf8().constData());
@@ -1272,6 +1273,113 @@ void CoreController::attachRFU() {
 
 void CoreController::detachRFU() {
 	stopRFU();
+	stopRFUWrapper();
+	if (m_rfuWrapperTraceHeld) {
+		GBASIOLockstepTraceRelease();
+		m_rfuWrapperTraceHeld = false;
+	}
+}
+
+// Emulation > "RFU Cable Wrapper": presents a cable-linked game (Ruby/Sapphire) with a second player it can talk to. Its
+// "Local" connection joins an FRLG leader in another mGBA process (rfu-wrapper-air.c); Broadcast and ESP32 are still
+// stubs that attach the built-in stub peer (a FireRed at the far end of the cable) and go nowhere. Its "Save adapter log" writes
+// rfu-wrapper-trace.log next to the wireless adapter's rfu-trace.log: the wrapper's own cable/peer trace while it is
+// attached, and otherwise the real cable (lockstep) traffic between games in mGBA's own multiplayer, which is the capture
+// the wrapper is built from. The log does not depend on the chosen connection.
+// Like the wireless adapter, the wrapper needs the game's single link-port driver, so it takes the game out of
+// multiplayer (and replaces the adapter) while it is on.
+bool CoreController::rfuWrapperEnabled() const {
+	if (!m_rfuWrapperAttached || m_threadContext.core->platform(m_threadContext.core) != mPLATFORM_GBA) {
+		return false;
+	}
+	GBA* gba = static_cast<GBA*>(m_threadContext.core->board);
+	return gba->sio.driver == &m_rfuWrapper.d;
+}
+
+bool CoreController::startRFUWrapper(const QString& connection) {
+	mCore* core = m_threadContext.core;
+	if (core->platform(core) != mPLATFORM_GBA) {
+		return false;
+	}
+	stopRFUWrapper();
+	stopRFU();
+	m_rfuWrapperConnectionName = connection.toUtf8();
+	GBASIORFUWrapperCreate(&m_rfuWrapper, m_rfuWrapperConnectionName.constData());
+	if (connection == QLatin1String("local")) {
+		// Ruby/Sapphire <-> an FRLG leader in another mGBA whose Wireless Adapter is also "Local".
+		if (!GBASIORFUWrapperAttachAir(&m_rfuWrapper, "local")) {
+			qWarning() << "RFU cable wrapper: could not open the local wireless side";
+		}
+	}
+	core->setPeripheral(core, mPERIPH_GBA_LINK_PORT, &m_rfuWrapper.d);
+	m_rfuWrapperAttached = true;
+	return true;
+}
+
+void CoreController::stopRFUWrapper() {
+	if (!m_rfuWrapperAttached) {
+		return;
+	}
+	if (rfuWrapperEnabled()) {
+		m_threadContext.core->setPeripheral(m_threadContext.core, mPERIPH_GBA_LINK_PORT, nullptr);
+	}
+	GBASIORFUWrapperDestroy(&m_rfuWrapper);
+	m_rfuWrapperAttached = false;
+}
+
+void CoreController::setRFUWrapperBackend(const QString& requested) {
+	m_rfuWrapperBackend = rfuNormalizeBackend(requested);
+	if (platform() != mPLATFORM_GBA) {
+		return;
+	}
+	if (m_rfuWrapperBackend == QLatin1String("off")) {
+		if (!m_rfuWrapperAttached) {
+			return;
+		}
+		{
+			Interrupter interrupter(this);
+			stopRFUWrapper();
+		}
+		// The wrapper had taken the link port from the wireless adapter; give it back if the adapter is still wanted.
+		if (m_rfuRequestedBackend != QLatin1String("off") && !m_rfuAttached) {
+			setRFUBackend(m_rfuRequestedBackend);
+		} else if (m_rfuSavedMultiplayer && !m_rfuAttached) {
+			MultiplayerController* multiplayer = m_rfuSavedMultiplayer;
+			m_rfuSavedMultiplayer = nullptr;
+			setMultiplayerController(multiplayer);
+		}
+		return;
+	}
+	if (rfuWrapperEnabled() && m_rfuWrapperConnection == m_rfuWrapperBackend) {
+		return;
+	}
+	Interrupter interrupter(this);
+	if (m_multiplayer) {
+		m_rfuSavedMultiplayer = m_multiplayer;
+		clearMultiplayerController();
+	}
+	if (startRFUWrapper(m_rfuWrapperBackend)) {
+		m_rfuWrapperConnection = m_rfuWrapperBackend;
+	}
+}
+
+void CoreController::setRFUWrapperLogging(bool enabled) {
+	m_rfuWrapperLogEnabled = enabled;
+	updateRFUWrapperTrace();
+}
+
+void CoreController::updateRFUWrapperTrace() {
+	bool want = m_rfuWrapperLogEnabled && platform() == mPLATFORM_GBA;
+	if (want == m_rfuWrapperTraceHeld) {
+		return;
+	}
+	if (!want) {
+		GBASIOLockstepTraceRelease();
+		m_rfuWrapperTraceHeld = false;
+		return;
+	}
+	QByteArray path = QDir(ConfigController::configDir()).filePath("rfu-wrapper-trace.log").toUtf8();
+	m_rfuWrapperTraceHeld = GBASIOLockstepTraceAcquire(path.constData());
 }
 
 // Menu: "Save adapter log". Applies at once by re-attaching the adapter (the game sees it unplugged and plugged back in),
@@ -1293,6 +1401,7 @@ void CoreController::setRFULogging(bool enabled) {
 // Called from the GUI thread by the menu while a game may be running. Switching backends detaches and re-attaches
 // the adapter, which the game sees as the adapter being unplugged and plugged back in.
 void CoreController::setRFUBackend(const QString& requested) {
+	m_rfuRequestedBackend = rfuNormalizeBackend(requested);
 	if (platform() != mPLATFORM_GBA || rfuEnvironmentOverride()) {
 		return;
 	}
