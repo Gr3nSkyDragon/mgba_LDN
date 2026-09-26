@@ -24,16 +24,30 @@ The Switch **must** host all trades. The emulator can only join for now. I may w
 
 Do not use the Wireless Union Room (the left window lady on the upper floor of the Pokemon Center). You can go exploring there if you want, but actual trading is the right window lady.
 
-For trading between instances of mGBA, you can choose to enable the Wireless Adapter (Emulation > Wireless Adapter > Local) for up to two instances. This is more of a novelty thing, as the link cable mode works for up to four players, but I used this for developing the other modes and therefore included it.
+### Desktop
 
-For trading between a computer and a Switch, you can choose Broadcast (Emulation > Wireless Adapter > Broadcast) or ESP32 (Emulation > Wireless Adapter > ESP32). Broadcast is designed for a USB Wi-Fi adapter and requires ldnd.exe to be set up correctly and running, and ESP32 is designed for the GB-Link Switch LDN firmware configuration. The ESP32 firmware may have other functionality like battling, berry blending, etc implemented, but I only tested trading. 
+For trading between instances of mGBA, you can choose to enable the Wireless Adapter (Emulation > Wireless Adapter > Local) for up to two instances. This is more of a novelty thing, as the link cable mode works for up to four players, but I used this for developing the other modes and therefore included it. If you want to familiarize yourself with the Ruby/Sapphire to FRLG process, you can enable the local Cable Wrapper (Emulation > RFU Cable Wrapper > Local) in the Ruby/Sapphire instance and the Wireless Adapter (Emulation > Wireless Adapter > Local) for the FRLG instance. **FRLG must host the trade**. Let FRLG host before talking to the Link Cable Trade lady at the middle window in Ruby/Sapphire.
 
-For trading between a smartphone and a Switch, you need to install the APK, then click the three bars (☰) menu in the top right, select Wireless Adapter, choose your adapter (currently supports an ESP32 running the GB-Link Switch LDN firmware; I'm using an ESP32-S3, other models may be added later), and plug the adapter into your smartphone via its USB-C port. You will need a USB-C-to-USB-C cable for this. 
+For trading between a computer (FRLG/Emerald) and a Switch, you can choose Broadcast (Emulation > Wireless Adapter > Broadcast) or ESP32 (Emulation > Wireless Adapter > ESP32). Broadcast is designed for a USB Wi-Fi adapter and requires ldnd.exe to be set up correctly and running, and ESP32 is designed for the GB-Link Switch LDN firmware configuration. The ESP32 firmware may have other functionality like battling, berry blending, etc implemented, but I only tested trading. 
+
+For trading between a computer (Ruby/Sapphire) and a Switch, you **must** choose ESP32 (Emulation > RFU Cable Wrapper > ESP32) for Ruby/Sapphire. Broadcast is currently stubbed and does not work. Let FRLG host the trade before interacting with the Link Trade Cable lady at the middle window in Ruby/Sapphire. 
+
+### Android
+
+For trading between a smartphone (FRLG/Emerald) and a Switch, you need to install the APK, then click the three bars (☰) menu in the top right, select Wireless Adapter, choose ESP32 (currently supports an ESP32 running the GB-Link Switch LDN firmware; I'm using an ESP32-S3, other models may be added later), and plug the adapter into your smartphone via its USB-C port. You will need a USB-C-to-USB-C cable for this. 
+
+For trading between a smartphone (Ruby/Sapphire) and a Switch, click the three bars (☰) menu in the top right, select Wireless Adapter, choose Cable Adapter (currently supports an ESP32 running the GB-Link Switch LDN firmware; I'm using an ESP32-S3, other models may be added later), and plug the adapter into your smartphone via its USB-C port. Let FRLG host the trade before interacting with the Link Cable Trade lady at the middle window in Ruby/Sapphire.
+
+### Other Android mGBA Features
 
 Open ROM copies your ROM into the emulator's ROM folder. You can also select your save at the same time to load the save into the game and copy it into the emulator's save folder. If you select multiple ROMs and saves, all will be copied into the correct folders, but only one will be launched.
 
-Original ReadMe
---------
+Import Save lets you use other saves with your ROM. This will update your default save for that ROM until you import another save into the ROM.
+
+Display Settings lets you enable or disable the FPS counter, ESP32 status message, on-screen controls, and pixelation ("scanlines"). You can also change the button colors, either with presets or hexadecimal values for individual buttons. Background Photo lets you set an image as your "shell" image when in vertical mode. Color Mode and Frame Counter (for you RNG manipulation nerds) coming soon.
+
+# Original ReadMe
+
 mGBA
 ====
 
