@@ -44,6 +44,7 @@ public class MainActivity extends Activity implements UsbLink.Logger {
     private static final int[] DEFAULT_COLORS = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
     private static final int ADAPTER_OFF = 0;
     private static final int ADAPTER_ESP32 = 1;
+    private static final int ADAPTER_CABLE = 2; // the RFU Cable Wrapper over the ESP32 (Ruby/Sapphire with a cable-only link)
 
     private GameView gameView;
     private Emulator emulator;
@@ -175,7 +176,7 @@ public class MainActivity extends Activity implements UsbLink.Logger {
         super.onResume();
         setupFolders();
         emulator.setPaused(false);
-        if (adapter == ADAPTER_ESP32 && !usbLink.isOpen()) {
+        if (adapter != ADAPTER_OFF && !usbLink.isOpen()) {
             connectUsb(false);
         }
     }
@@ -362,7 +363,7 @@ public class MainActivity extends Activity implements UsbLink.Logger {
             if (showFps) {
                 parts.append(currentFps).append(" FPS");
             }
-            if (showEspStatus && adapter == ADAPTER_ESP32) {
+            if (showEspStatus && adapter != ADAPTER_OFF) {
                 if (parts.length() > 0) {
                     parts.append("  |  ");
                 }
@@ -660,13 +661,13 @@ public class MainActivity extends Activity implements UsbLink.Logger {
     }
 
     private void chooseAdapter() {
-        String[] names = {"Off", "ESP32 (GB-Link Switch LDN board, USB)"};
+        String[] names = {"Off", "ESP32 (GB-Link Switch LDN board, USB)", "Cable adapter (Ruby/Sapphire, ESP32)"};
         new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert).setTitle("Wireless adapter")
                 .setSingleChoiceItems(names, adapter, (dialog, which) -> {
                     adapter = which;
                     prefs.edit().putInt("adapter", adapter).apply();
                     applyAdapter();
-                    if (adapter == ADAPTER_ESP32) {
+                    if (adapter != ADAPTER_OFF) {
                         connectUsb(true);
                     }
                     refreshStatus();
@@ -965,7 +966,11 @@ public class MainActivity extends Activity implements UsbLink.Logger {
             }
             String where;
             try {
-                where = saveToDownloads();
+                where = saveToDownloads(traceFile, "mgba-ldn-trace-");
+                File backend = new File(traceFile.getPath() + ".backend");
+                if (backend.exists() && backend.length() > 0) {
+                    where += " and " + saveToDownloads(backend, "mgba-ldn-trace-backend-");
+                }
             } catch (Exception e) {
                 where = null;
                 toast("Couldn't write the log to Downloads: " + e.getMessage());
@@ -988,8 +993,8 @@ public class MainActivity extends Activity implements UsbLink.Logger {
         }, "log-export").start();
     }
 
-    private String saveToDownloads() throws java.io.IOException {
-        String name = "mgba-ldn-trace-" + new java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
+    private String saveToDownloads(File source, String prefix) throws java.io.IOException {
+        String name = prefix + new java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
                 .format(new java.util.Date()) + ".txt";
         if (Build.VERSION.SDK_INT >= 29) {
             android.content.ContentValues values = new android.content.ContentValues();
@@ -1000,7 +1005,7 @@ public class MainActivity extends Activity implements UsbLink.Logger {
             if (uri == null) {
                 throw new java.io.IOException("the system refused to create the file");
             }
-            try (InputStream in = new FileInputStream(traceFile); OutputStream out = getContentResolver().openOutputStream(uri)) {
+            try (InputStream in = new FileInputStream(source); OutputStream out = getContentResolver().openOutputStream(uri)) {
                 byte[] buffer = new byte[1 << 16];
                 int n;
                 while ((n = in.read(buffer)) > 0) {
@@ -1009,8 +1014,8 @@ public class MainActivity extends Activity implements UsbLink.Logger {
             }
             return "Downloads/" + name;
         }
-        File target = new File(traceFile.getParentFile(), name);
-        try (InputStream in = new FileInputStream(traceFile); OutputStream out = new FileOutputStream(target)) {
+        File target = new File(source.getParentFile(), name);
+        try (InputStream in = new FileInputStream(source); OutputStream out = new FileOutputStream(target)) {
             byte[] buffer = new byte[1 << 16];
             int n;
             while ((n = in.read(buffer)) > 0) {

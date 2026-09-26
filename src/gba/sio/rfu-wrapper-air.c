@@ -1408,6 +1408,18 @@ static void _airFrame(void* context) {
 		_startSearch(air);
 	}
 	_drainEvents(air);
+	// A joining child speaks first: after the connect its game sends the NI_START of its game data on its own, and the
+	// leader answers frame by frame. A leader that has nothing to send until it hears from us (a Switch behind the ESP32
+	// board sends parent slots only once it has our connect and game data) would otherwise be waited for forever, so
+	// until the first frame from it arrives, the same NI_START is repeated every few frames (it is idempotent).
+	if (air->link == AIR_NI && air->hostFrames == 0 && air->ni.state == 0 && ++air->linkFrames % 8 == 0) {
+		struct NI copy = air->ni;
+		uint8_t frame[16];
+		unsigned len = _niNext(&copy, frame);
+		if (len) {
+			_airSend(air, frame, len);
+		}
+	}
 	if (air->link == AIR_NI || air->link == AIR_UNI) {
 		if (++air->silentFrames > HOST_SILENT_FRAMES) {
 			AIRLOG(air, "the leader went quiet");
@@ -1522,7 +1534,7 @@ static void _airDestroy(void* context) {
 	free(air);
 }
 
-bool GBASIORFUWrapperAttachAir(struct GBASIORFUWrapper* wrapper, const char* backend) {
+bool GBASIORFUWrapperAttachAir(struct GBASIORFUWrapper* wrapper, const char* backend, const char* tracePath) {
 	struct GBASIORFUBackend* b = GBASIORFUBackendCreate(backend);
 	if (!b) {
 		return false;
@@ -1536,6 +1548,9 @@ bool GBASIORFUWrapperAttachAir(struct GBASIORFUWrapper* wrapper, const char* bac
 	air->backend = b;
 	snprintf(air->backendName, sizeof(air->backendName), "%s", backend);
 	GBASIORFUCreate(&air->rfu, b);
+	if (tracePath && tracePath[0]) {
+		GBASIORFUSetTraceFile(&air->rfu, tracePath);
+	}
 	_barrierInit(&air->bar);
 	_recvReset(&air->rx0);
 	_recvReset(&air->rx1);

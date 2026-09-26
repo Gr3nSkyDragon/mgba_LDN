@@ -931,8 +931,9 @@ void Window::gameStarted() {
 	// This window's own choices (the options are per window, see the menu setup).
 	m_controller->setRFULogging(m_rfuLog);
 	m_controller->setRFUBackend(m_rfuBackend);
-	m_controller->setRFUWrapperBackend(m_rfuWrapBackend);
+	// The log first: the wrapper's wireless side opens its backend trace when it starts, and only if logging is already on.
 	m_controller->setRFUWrapperLogging(m_rfuWrapLog);
+	m_controller->setRFUWrapperBackend(m_rfuWrapBackend);
 #endif
 	attachWidget(m_display.get());
 	setFocus();

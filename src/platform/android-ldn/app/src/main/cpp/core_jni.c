@@ -11,7 +11,11 @@
 #include <mgba/core/config.h>
 #include <mgba/core/core.h>
 #include <mgba/gba/interface.h>
+#include <mgba/internal/gba/gba.h>
+#include <mgba/internal/gba/sio/lockstep.h>
 #include <mgba/internal/gba/sio/rfu.h>
+#include <mgba/internal/gba/sio/rfu-wrapper.h>
+#include <mgba/internal/gba/sio/rfu-wrapper-air.h>
 #include <mgba-util/audio-buffer.h>
 #include <mgba-util/vfs.h>
 #include <fcntl.h>
@@ -61,7 +65,49 @@ static bool gRfuAttached;
 static char gTracePath[512];
 static char gSaveDir[512];
 
+// The RFU Cable Wrapper ("Cable adapter"): a cable-only game (Ruby/Sapphire) gets a virtual cable partner whose other end
+// is an FRLG leader reached through the same ESP32 backend. It takes the game's link port like the adapter does.
+static struct GBASIORFUWrapper gWrapper;
+static bool gWrapperAttached;
+static bool gWrapperTraceHeld;
+
+static void _detachWrapper(void) {
+	if (!gWrapperAttached) {
+		return;
+	}
+	if (gCore) {
+		gCore->setPeripheral(gCore, mPERIPH_GBA_LINK_PORT, NULL);
+	}
+	GBASIORFUWrapperDestroy(&gWrapper);
+	gWrapperAttached = false;
+	if (gWrapperTraceHeld) {
+		GBASIOLockstepTraceRelease();
+		gWrapperTraceHeld = false;
+	}
+}
+
+static bool _attachWrapper(const char* backend) {
+	if (!gCore || !backend || !backend[0]) {
+		return true;
+	}
+	char backendTrace[600] = "";
+	if (gTracePath[0]) {
+		// The wrapper's own cable/translator trace goes to the trace file the app shares; the wireless side's protocol
+		// trace goes to a second file beside it.
+		gWrapperTraceHeld = GBASIOLockstepTraceAcquire(gTracePath);
+		snprintf(backendTrace, sizeof(backendTrace), "%s.backend", gTracePath);
+	}
+	GBASIORFUWrapperCreate(&gWrapper, backend);
+	if (!GBASIORFUWrapperAttachAir(&gWrapper, backend, backendTrace)) {
+		LOGI("RFU cable wrapper: could not open the wireless side %s", backend);
+	}
+	gCore->setPeripheral(gCore, mPERIPH_GBA_LINK_PORT, &gWrapper.d);
+	gWrapperAttached = true;
+	return true;
+}
+
 static void _detachAdapter(void) {
+	_detachWrapper();
 	if (!gRfuAttached) {
 		return;
 	}
@@ -255,11 +301,15 @@ JNIEXPORT void JNICALL Java_io_mgbaldn_gba_Native_setSaveDir(JNIEnv* env, jclass
 // A line in the adapter trace stamped with wall-clock time, so emulation speed on the phone can be read from the log.
 JNIEXPORT void JNICALL Java_io_mgbaldn_gba_Native_traceNote(JNIEnv* env, jclass clazz, jstring note) {
 	(void) clazz;
-	if (!gRfuAttached) {
+	if (!gRfuAttached && !gWrapperAttached) {
 		return;
 	}
 	const char* text = (*env)->GetStringUTFChars(env, note, NULL);
-	GBASIORFUTrace(&gRfu, "APP    %s", text);
+	if (gRfuAttached) {
+		GBASIORFUTrace(&gRfu, "APP    %s", text);
+	} else if (gCore) {
+		GBASIOCableTrace(&((struct GBA*) gCore->board)->sio, "APP    %s", text);
+	}
 	(*env)->ReleaseStringUTFChars(env, note, text);
 }
 
@@ -274,10 +324,15 @@ JNIEXPORT void JNICALL Java_io_mgbaldn_gba_Native_setTrace(JNIEnv* env, jclass c
 	(*env)->ReleaseStringUTFChars(env, path, text);
 }
 
-// 0 = no adapter, 1 = ESP32. Called between frames (Java takes care of that), like the desktop menu's switching.
+// 0 = nothing, 1 = wireless adapter (ESP32), 2 = cable adapter (RFU cable wrapper over the ESP32). Called between frames
+// (Java takes care of that), like the desktop menu's switching.
 JNIEXPORT jboolean JNICALL Java_io_mgbaldn_gba_Native_setAdapter(JNIEnv* env, jclass clazz, jint mode) {
 	(void) env;
 	(void) clazz;
+	if (mode == 2) {
+		_detachAdapter();
+		return _attachWrapper("esp32") ? JNI_TRUE : JNI_FALSE;
+	}
 	return _attachAdapter(mode == 1 ? "esp32" : NULL) ? JNI_TRUE : JNI_FALSE;
 }
 
