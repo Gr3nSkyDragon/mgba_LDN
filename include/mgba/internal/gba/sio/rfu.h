@@ -225,6 +225,9 @@ void GBASIORFUConnectRequested(struct GBASIORFU*, uint16_t clientId);
 // The client slot the next joiner would get, 0xFF when the host is full or closed. Call on the emulation thread.
 unsigned GBASIORFUHostNextSlot(const struct GBASIORFU*);
 
+// Take the oldest pending backend event (for a consumer that is not the SIO driver, e.g. the cable wrapper).
+bool GBASIORFUPopEvent(struct GBASIORFU*, struct GBASIORFUEvent* out);
+
 // Write a line to the protocol trace (if one is open). Emulation thread only.
 void GBASIORFUTrace(struct GBASIORFU*, const char* format, ...);
 

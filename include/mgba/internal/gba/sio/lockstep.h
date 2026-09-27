@@ -90,6 +90,11 @@ size_t GBASIOLockstepCoordinatorAttached(struct GBASIOLockstepCoordinator*);
 
 void GBASIOLockstepDriverCreate(struct GBASIOLockstepDriver*, struct mLockstepUser*);
 
+// Process-wide, reference-counted trace file of the cable traffic (used by the RFU Cable Wrapper log).
+bool GBASIOLockstepTraceAcquire(const char* path);
+void GBASIOLockstepTraceRelease(void);
+void GBASIOCableTrace(struct GBASIO* sio, const char* format, ...);
+
 CXX_GUARD_END
 
 #endif

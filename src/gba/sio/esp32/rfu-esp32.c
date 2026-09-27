@@ -93,6 +93,7 @@ static void _threadJoin(EspThread* thread) {
  */
 
 enum {
+	kBridgeRestartMs = 2500,
 	kOutSlots = 64,
 	kOutBytes = 128,
 	kBootWaitMs = 4500,
@@ -143,6 +144,12 @@ struct GBASIORFUESP32 {
 	const char* awaitPrefix; // while set, a response or event frame whose text starts with it sets awaitMatched
 	bool awaitMatched;
 	char lastText[64];
+	// The board joins the first room it sees, once per LDN_BRIDGE_START, and stops after a failed or ended join. The
+	// I/O thread starts it again a moment later, so a join that timed out (radio, a busy channel, the Switch not ready
+	// yet) is retried instead of leaving the emulator searching an idle board for good.
+	bool bridgeRestart;
+	uint32_t bridgeRestartAt;
+	unsigned bridgeRestarts;
 	unsigned bytesRead;
 	unsigned beacons;
 	uint8_t rx[256]; // RFU1 stream reassembly (see _handleFrame)
@@ -237,6 +244,11 @@ static void _handleFrame(struct GBASIORFUESP32* esp, const struct Esp32WireFrame
 		           (!strncmp(text, "LDN_ROOM", 8) || !strncmp(text, "LDN_LINK", 8) || !strncmp(text, "LDN_BRIDGE", 10) ||
 		            !strncmp(text, "LDN_NET_LOST", 12))) {
 			GBASIORFUTrace(esp->rfu, "ESP32  event: %s", text);
+			if (!esp->stop && (!strncmp(text, "LDN_BRIDGE stopped", 18) || !strncmp(text, "LDN_BRIDGE join timed out", 25) ||
+			                   !strncmp(text, "LDN_NET_LOST", 12))) {
+				esp->bridgeRestart = true;
+				esp->bridgeRestartAt = _ticks() + kBridgeRestartMs;
+			}
 		}
 		return;
 	}
@@ -452,6 +464,12 @@ static void _run(struct GBASIORFUESP32* esp) {
 		if ((int32_t) (now - nextPing) >= 0) {
 			_command(esp, "LDN_PING");
 			nextPing = now + kPingMs;
+		}
+		if (esp->bridgeRestart && (int32_t) (now - esp->bridgeRestartAt) >= 0) {
+			esp->bridgeRestart = false;
+			++esp->bridgeRestarts;
+			GBASIORFUTrace(esp->rfu, "ESP32  the board's bridge stopped: starting it again (attempt %u)", esp->bridgeRestarts);
+			_command(esp, "LDN_BRIDGE_START");
 		}
 
 		// Anything the emulation thread queued, and the connect timeout.

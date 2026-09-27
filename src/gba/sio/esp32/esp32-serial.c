@@ -89,27 +89,51 @@ static bool _platformWrite(struct Esp32Serial* port, const void* data, size_t le
 	return true;
 }
 
-static bool _platformFindEspressif(char* out, size_t capacity) {
-	// The COM port name is at HKLM\SYSTEM\CurrentControlSet\Enum\USB\VID_303A&PID_1001&MI_00\<instance>\Device
-	// Parameters\PortName (the composite device's interface 0 is the CDC serial function); a plain, non-composite
-	// enumeration without the MI_ suffix is checked too.
-	static const char* const kKeys[] = {
-		"SYSTEM\\CurrentControlSet\\Enum\\USB\\VID_303A&PID_1001&MI_00",
-		"SYSTEM\\CurrentControlSet\\Enum\\USB\\VID_303A&PID_1001",
-	};
-	for (size_t k = 0; k < sizeof(kKeys) / sizeof(kKeys[0]); ++k) {
-		HKEY root;
-		if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, kKeys[k], 0, KEY_READ, &root) != ERROR_SUCCESS) {
+// Whether a COM port of that name exists right now. The registry keeps entries for unplugged devices.
+static bool _portPresent(const char* name) {
+	char device[80];
+	snprintf(device, sizeof(device), "\\\\.\\%s", name);
+	HANDLE probe = CreateFileA(device, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+	bool present = probe != INVALID_HANDLE_VALUE || GetLastError() == ERROR_ACCESS_DENIED;
+	if (probe != INVALID_HANDLE_VALUE) {
+		CloseHandle(probe);
+	}
+	return present;
+}
+
+// The COM port of a present USB device whose enumeration name (HKLM\SYSTEM\CurrentControlSet\Enum\USB\<name>) starts with
+// `prefix`. A composite device appears as VID_xxxx&PID_yyyy&MI_00 (its interface 0 is the serial function), a plain one
+// without the MI_ suffix; both start with the vendor id. Each has one key per physical instance, whose Device Parameters
+// hold the PortName.
+static bool _findPortForVendor(const char* prefix, char* out, size_t capacity) {
+	HKEY usb;
+	if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Enum\\USB", 0, KEY_READ, &usb) != ERROR_SUCCESS) {
+		return false;
+	}
+	bool found = false;
+	char device[256];
+	for (DWORD d = 0; !found; ++d) {
+		DWORD length = sizeof(device);
+		if (RegEnumKeyExA(usb, d, device, &length, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) {
+			break;
+		}
+		if (_strnicmp(device, prefix, strlen(prefix)) != 0) {
+			continue;
+		}
+		char devicePath[400];
+		snprintf(devicePath, sizeof(devicePath), "SYSTEM\\CurrentControlSet\\Enum\\USB\\%s", device);
+		HKEY deviceKey;
+		if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, devicePath, 0, KEY_READ, &deviceKey) != ERROR_SUCCESS) {
 			continue;
 		}
 		char instance[256];
-		for (DWORD i = 0;; ++i) {
-			DWORD length = sizeof(instance);
-			if (RegEnumKeyExA(root, i, instance, &length, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) {
+		for (DWORD i = 0; !found; ++i) {
+			DWORD instanceLength = sizeof(instance);
+			if (RegEnumKeyExA(deviceKey, i, instance, &instanceLength, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) {
 				break;
 			}
-			char path[600];
-			snprintf(path, sizeof(path), "%s\\%s\\Device Parameters", kKeys[k], instance);
+			char path[700];
+			snprintf(path, sizeof(path), "%s\\%s\\Device Parameters", devicePath, instance);
 			HKEY params;
 			if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, path, 0, KEY_READ, &params) != ERROR_SUCCESS) {
 				continue;
@@ -117,26 +141,34 @@ static bool _platformFindEspressif(char* out, size_t capacity) {
 			char name[64];
 			DWORD size = sizeof(name);
 			DWORD type = 0;
-			bool found = RegQueryValueExA(params, "PortName", NULL, &type, (LPBYTE) name, &size) == ERROR_SUCCESS && type == REG_SZ;
+			bool have = RegQueryValueExA(params, "PortName", NULL, &type, (LPBYTE) name, &size) == ERROR_SUCCESS && type == REG_SZ;
 			RegCloseKey(params);
-			if (!found || strlen(name) >= capacity) {
-				continue;
-			}
-			// The registry keeps entries for unplugged devices; only offer a port that exists right now.
-			char device[80];
-			snprintf(device, sizeof(device), "\\\\.\\%s", name);
-			HANDLE probe = CreateFileA(device, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
-			bool present = probe != INVALID_HANDLE_VALUE || GetLastError() == ERROR_ACCESS_DENIED;
-			if (probe != INVALID_HANDLE_VALUE) {
-				CloseHandle(probe);
-			}
-			if (present) {
+			if (have && strlen(name) < capacity && _portPresent(name)) {
 				strcpy(out, name);
-				RegCloseKey(root);
-				return true;
+				found = true;
 			}
 		}
-		RegCloseKey(root);
+		RegCloseKey(deviceKey);
+	}
+	RegCloseKey(usb);
+	return found;
+}
+
+static bool _platformFindEspressif(char* out, size_t capacity) {
+	// Boards with a native USB port (the S3/C3/C6 "USB" connector) enumerate as Espressif's own device, which goes first.
+	// Boards with only a UART bridge (a single-connector ESP32, or the "UART" connector of a two-port S3 board) show up
+	// as whichever bridge chip they carry, so those vendors are tried next. When several are plugged in the order above
+	// decides; MGBA_RFU_ESP32_PORT names one explicitly.
+	static const char* const kVendors[] = {
+		"VID_303A", // Espressif (native USB Serial/JTAG)
+		"VID_10C4", // Silicon Labs CP210x
+		"VID_1A86", // WCH CH340 / CH9102
+		"VID_0403", // FTDI
+	};
+	for (size_t i = 0; i < sizeof(kVendors) / sizeof(kVendors[0]); ++i) {
+		if (_findPortForVendor(kVendors[i], out, capacity)) {
+			return true;
+		}
 	}
 	return false;
 }

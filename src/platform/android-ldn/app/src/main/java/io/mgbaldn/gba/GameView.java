@@ -4,6 +4,8 @@ import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.ColorMatrix;
+import android.graphics.ColorMatrixColorFilter;
 import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.RectF;
@@ -58,8 +60,15 @@ final class GameView extends SurfaceView implements SurfaceHolder.Callback, Emul
     private volatile boolean controlsVisible = true;
     private volatile int controlsOpacity = 35; // percent, of an unpressed button
     private volatile boolean scanlines;
-    private volatile int scanlineStrength = 35; // percent
+    private volatile int scanlineStrength = 35; // percent (horizontal lines)
+    private volatile boolean vScanlines;
+    private volatile int vScanlineStrength = 35;
+    private volatile int pixelMode = 0;
     private volatile int[] colors = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
+    private volatile boolean showFrameCounter;
+    private volatile int frameCounterInset; // pixels kept free at the top right for the menu button
+    private final Paint counterText = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint counterBox = new Paint();
     private final Object decorLock = new Object();
     private Bitmap backgroundSource; // as chosen by the user
     private volatile Bitmap backgroundScaled; // cropped to the area under the game (portrait only)
@@ -71,7 +80,92 @@ final class GameView extends SurfaceView implements SurfaceHolder.Callback, Emul
         getHolder().addCallback(this);
         picture.setFilterBitmap(false);
         text.setTextAlign(Paint.Align.CENTER);
+        counterText.setColor(Color.WHITE);
+        counterText.setTextAlign(Paint.Align.RIGHT);
+        counterText.setTextSize(12 * getResources().getDisplayMetrics().scaledDensity);
+        counterBox.setColor(0x66000000);
         setFocusable(true);
+    }
+
+    // ---- colour modes ----
+    //
+    // GBA IPS kits (the V5 "OSD" screens) offer several colour modes and a desaturation setting; the picture is drawn through
+    // a colour matrix to do the same. Each mode is a matrix on 0-255 channel values; the desaturation percentage
+    // (100 = as emulated, 0 = black and white) is applied first.
+    static final int MODE_ORIGINAL = 0;
+    static final int MODE_MUTED = 1;
+    static final int MODE_VIVID = 2;
+    static final int MODE_BLACK_WHITE = 3;
+
+    static final int MODE_DMG = 4;
+    static final String[] MODE_NAMES = {"Original", "Muted", "Vivid", "Black and white", "DMG"};
+
+    void setColorMode(int mode, int saturationPercent) {
+        ColorMatrix matrix = new ColorMatrix();
+        matrix.setSaturation(Math.max(0, Math.min(100, saturationPercent)) / 100f);
+        ColorMatrix extra = null;
+        switch (mode) {
+            case MODE_MUTED: {
+                // Less saturated with a little less contrast, the washed-out look of the original GBA panel.
+                extra = new ColorMatrix();
+                extra.setSaturation(0.72f);
+                ColorMatrix contrast = new ColorMatrix(new float[] {
+                    0.92f, 0, 0, 0, 10, 0, 0.92f, 0, 0, 10, 0, 0, 0.92f, 0, 10, 0, 0, 0, 1, 0});
+                extra.postConcat(contrast);
+                break;
+            }
+            case MODE_VIVID:
+                extra = new ColorMatrix();
+                extra.setSaturation(1.3f);
+                extra.postConcat(new ColorMatrix(new float[] {
+                    1.08f, 0, 0, 0, -10, 0, 1.08f, 0, 0, -10, 0, 0, 1.08f, 0, -10, 0, 0, 0, 1, 0}));
+                break;
+            case MODE_BLACK_WHITE:
+                extra = new ColorMatrix();
+                extra.setSaturation(0);
+                break;
+            case MODE_DMG: {
+                // The black and white picture tinted onto the Game Boy green ramp, softened a little from the LCD's own 0F380F..9BBC0F (163316 darkest, 9CB33A lightest): each
+                // output channel is dark + brightness * (light - dark) / 255, with the brightness taken from the input.
+                final float wr = 0.299f, wg = 0.587f, wb = 0.114f;
+                final float[] dark = {0x16, 0x33, 0x16};
+                final float[] light = {0x9C, 0xB3, 0x3A};
+                float[] m = new float[20];
+                for (int i = 0; i < 3; ++i) {
+                    float scale = (light[i] - dark[i]) / 255f;
+                    m[i * 5] = wr * scale;
+                    m[i * 5 + 1] = wg * scale;
+                    m[i * 5 + 2] = wb * scale;
+                    m[i * 5 + 4] = dark[i];
+                }
+                m[18] = 1;
+                extra = new ColorMatrix(m);
+                matrix.setSaturation(1); // the matrix already takes the brightness of the picture as it is
+                break;
+            }
+            default:
+                break;
+        }
+        if (extra != null) {
+            matrix.postConcat(extra);
+        }
+        picture.setColorFilter(mode == MODE_ORIGINAL && saturationPercent >= 100 ? null : new ColorMatrixColorFilter(matrix));
+    }
+
+    void setFrameCounter(boolean enabled, int menuInsetPixels) {
+        showFrameCounter = enabled;
+        frameCounterInset = menuInsetPixels;
+    }
+
+    private void drawFrameCounter(Canvas canvas, int frame) {
+        String label = "Frame " + frame;
+        float pad = counterText.getTextSize() * 0.4f;
+        float right = getWidth() - frameCounterInset - 12;
+        float width = counterText.measureText(label);
+        float top = 6;
+        float bottom = top + counterText.getTextSize() + pad * 2;
+        canvas.drawRect(right - width - pad * 2, top, right, bottom, counterBox);
+        canvas.drawText(label, right - pad, top + pad + counterText.getTextSize() * 0.85f, counterText);
     }
 
     // ---- appearance ----
@@ -182,13 +276,16 @@ final class GameView extends SurfaceView implements SurfaceHolder.Callback, Emul
         float gh = height * scale;
         float x = (w - gw) / 2;
         float y = h >= w ? 0 : (h - gh) / 2;
-        target.set(x, y, x + gw, y + gh);
+        // A whole number of pixels, so the overlay effects can line up exactly with the picture's game pixels.
+        float left = Math.round(x);
+        float top = Math.round(y);
+        target.set(left, top, left + Math.round(gw), top + Math.round(gh));
     }
 
     // ---- drawing (called from the emulator thread) ----
 
     @Override
-    public void onFrame(Bitmap bitmap, int width, int height) {
+    public void onFrame(Bitmap bitmap, int width, int height, int frame) {
         if (!surfaceReady) {
             return;
         }
@@ -218,36 +315,133 @@ final class GameView extends SurfaceView implements SurfaceHolder.Callback, Emul
             }
             source.set(0, 0, width, height);
             canvas.drawBitmap(bitmap, source, target, picture);
-            if (scanlines) {
-                drawScanlines(canvas, height);
+            if (scanlines || vScanlines || pixelMode != PIXEL_OFF) {
+                drawOverlay(canvas, width, height);
             }
             if (controlsVisible) {
                 drawControls(canvas);
+            }
+            if (showFrameCounter) {
+                drawFrameCounter(canvas, frame);
             }
         } finally {
             holder.unlockCanvasAndPost(canvas);
         }
     }
 
-    // Dark lines across the picture, one per game pixel row (like the scanline option of a GBA IPS screen). The lines are
-    // drawn into a bitmap once per size and strength, then that bitmap is laid over the picture each frame.
-    private void drawScanlines(Canvas canvas, int gameHeight) {
+    // Everything laid over the picture (scanlines, pixel effect) is drawn into one bitmap the size of the picture, once per
+    // combination of size and settings; that bitmap is then laid over the picture each frame.
+    static final int PIXEL_OFF = 0;
+    static final int PIXEL_GRID = 1;
+    static final int PIXEL_ROUND = 2;
+    static final int PIXEL_RGB = 3;
+    static final String[] PIXEL_NAMES = {"Off", "Pixel grid", "Round pixels", "RGB subpixels"};
+
+    void setVerticalScanlines(boolean enabled, int strengthPercent) {
+        vScanlines = enabled;
+        vScanlineStrength = Math.max(5, Math.min(100, strengthPercent));
+    }
+
+    void setPixelMode(int mode) {
+        pixelMode = mode;
+    }
+
+    // One game pixel drawn 16x16 for the pixel effects; it is scaled onto every cell of the picture.
+    private Bitmap pixelTile(int mode) {
+        Bitmap tile = Bitmap.createBitmap(16, 16, Bitmap.Config.ARGB_8888);
+        Canvas c = new Canvas(tile);
+        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        switch (mode) {
+            case PIXEL_ROUND: {
+                // The cell darkened except for a rounded square in the middle, so every pixel looks like a lit dot.
+                android.graphics.Path frame = new android.graphics.Path();
+                frame.setFillType(android.graphics.Path.FillType.EVEN_ODD);
+                frame.addRect(0, 0, 16, 16, android.graphics.Path.Direction.CW);
+                frame.addRoundRect(new RectF(1, 1, 15, 15), 5, 5, android.graphics.Path.Direction.CW);
+                p.setColor(0x8C000000);
+                c.drawPath(frame, p);
+                break;
+            }
+            case PIXEL_RGB: {
+                // Red, green and blue stripes: each stripe is tinted with its complement, which dims the other two colours.
+                p.setColor(0x66007878);
+                c.drawRect(0, 0, 5.33f, 16, p);
+                p.setColor(0x66780078);
+                c.drawRect(5.33f, 0, 10.67f, 16, p);
+                p.setColor(0x66787800);
+                c.drawRect(10.67f, 0, 16, 16, p);
+                break;
+            }
+            default:
+                break;
+        }
+        return tile;
+    }
+
+    private void drawOverlay(Canvas canvas, int gameWidth, int gameHeight) {
         int w = Math.max(1, Math.round(target.width()));
         int h = Math.max(1, Math.round(target.height()));
-        int strength = scanlineStrength;
-        int key = ((w * 31 + h) * 31 + gameHeight) * 31 + strength;
+        boolean horizontal = scanlines;
+        boolean vertical = vScanlines;
+        int hStrength = scanlineStrength;
+        int vStrength = vScanlineStrength;
+        int pixels = pixelMode;
+        int key = ((((((w * 31 + h) * 31 + gameWidth) * 31 + gameHeight) * 31 + (horizontal ? hStrength : 0)) * 31
+                + (vertical ? vStrength : 0)) * 31 + pixels);
         if (scanlineOverlay == null || key != overlayKey) {
             if (scanlineOverlay != null) {
                 scanlineOverlay.recycle();
             }
             scanlineOverlay = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
             Canvas c = new Canvas(scanlineOverlay);
+            // The picture is scaled with nearest-neighbour sampling, so at a non-integer scale (4.5x, say) game pixels are
+            // alternately 4 and 5 screen pixels wide. Every effect below is laid out on those same whole-pixel cell edges
+            // (the target rectangle is a whole number of pixels, see computeTarget), so lines always fall exactly between game
+            // pixels and keep the same width instead of shimmering.
+            int[] ex = new int[gameWidth + 1];
+            int[] ey = new int[gameHeight + 1];
+            for (int i = 0; i <= gameWidth; ++i) {
+                ex[i] = Math.round((float) i * w / gameWidth);
+            }
+            for (int i = 0; i <= gameHeight; ++i) {
+                ey[i] = Math.round((float) i * h / gameHeight);
+            }
+            if (pixels == PIXEL_GRID) {
+                // One-pixel dark lines along the right and bottom edge of every game pixel (thicker only on big screens).
+                int thick = Math.max(1, Math.round(Math.min((float) w / gameWidth, (float) h / gameHeight) * 0.18f));
+                Paint grid = new Paint();
+                grid.setColor(0x80000000);
+                for (int i = 1; i <= gameWidth; ++i) {
+                    c.drawRect(ex[i] - thick, 0, ex[i], h, grid);
+                }
+                for (int i = 1; i <= gameHeight; ++i) {
+                    c.drawRect(0, ey[i] - thick, w, ey[i], grid);
+                }
+            } else if (pixels != PIXEL_OFF) {
+                Bitmap tile = pixelTile(pixels);
+                Paint tilePaint = new Paint();
+                tilePaint.setFilterBitmap(pixels == PIXEL_ROUND);
+                Rect cell = new Rect();
+                for (int y = 0; y < gameHeight; ++y) {
+                    for (int x = 0; x < gameWidth; ++x) {
+                        cell.set(ex[x], ey[y], ex[x + 1], ey[y + 1]);
+                        c.drawBitmap(tile, null, cell, tilePaint);
+                    }
+                }
+                tile.recycle();
+            }
             Paint line = new Paint();
-            line.setColor(Color.argb(Math.round(strength * 2.55f), 0, 0, 0));
-            float rowHeight = (float) h / gameHeight;
-            for (int i = 0; i < gameHeight; ++i) {
-                float y = i * rowHeight;
-                c.drawRect(0, y + rowHeight * 0.55f, w, y + rowHeight, line);
+            if (horizontal) {
+                line.setColor(Color.argb(Math.round(hStrength * 2.55f), 0, 0, 0));
+                for (int i = 0; i < gameHeight; ++i) {
+                    c.drawRect(0, ey[i] + Math.round((ey[i + 1] - ey[i]) * 0.55f), w, ey[i + 1], line);
+                }
+            }
+            if (vertical) {
+                line.setColor(Color.argb(Math.round(vStrength * 2.55f), 0, 0, 0));
+                for (int i = 0; i < gameWidth; ++i) {
+                    c.drawRect(ex[i] + Math.round((ex[i + 1] - ex[i]) * 0.55f), 0, ex[i + 1], h, line);
+                }
             }
             overlayKey = key;
         }

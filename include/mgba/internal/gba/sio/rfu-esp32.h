@@ -20,7 +20,7 @@ CXX_GUARD_START
  * broadcast frames, accepts an RFU1 connect request, and relays the game's child slots and the Switch's parent
  * slots. Only the board's documented serial protocol is used (no firmware code); see src/gba/sio/esp32/.
  *
- * The board's COM port is found automatically (Espressif native USB Serial/JTAG) unless one is named.
+ * The board's COM port is found automatically (Espressif native USB Serial/JTAG, else a CP210x/CH340/FTDI UART bridge) unless one is named.
  */
 
 struct GBASIORFUBackend* GBASIORFUESP32Create(void);

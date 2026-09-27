@@ -169,6 +169,12 @@ private slots:
 	void delayedCleanup();
 
 private:
+	// Wireless adapter / RFU Cable Wrapper choices of this window only.
+	QString m_rfuBackend = QStringLiteral("off");
+	QString m_rfuWrapBackend = QStringLiteral("off");
+	bool m_rfuLog = false;
+	bool m_rfuWrapLog = false;
+
 	static const int FPS_TIMER_INTERVAL = 2000;
 	static const int MUST_RESTART_TIMEOUT = 10000;
 

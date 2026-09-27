@@ -11,7 +11,7 @@ import java.nio.ByteOrder;
 /** Owns the game thread: runs frames, plays their audio (which also paces emulation) and hands pictures to the view. */
 final class Emulator {
     interface FrameListener {
-        void onFrame(Bitmap bitmap, int width, int height);
+        void onFrame(Bitmap bitmap, int width, int height, int frame);
     }
 
     interface StatsListener {
@@ -139,6 +139,7 @@ final class Emulator {
             int frames;
             int width;
             int height;
+            int frame;
             synchronized (lock) {
                 if (!loaded) {
                     break;
@@ -146,10 +147,11 @@ final class Emulator {
                 frames = Native.runFrame(audio);
                 width = Native.width();
                 height = Native.height();
+                frame = Native.frameCounter();
             }
             video.rewind();
             bitmap.copyPixelsFromBuffer(video);
-            listener.onFrame(bitmap, width, height);
+            listener.onFrame(bitmap, width, height, frame);
             ++windowFrames;
             long now = System.nanoTime();
             if (now - windowStart >= 1_000_000_000L) {
