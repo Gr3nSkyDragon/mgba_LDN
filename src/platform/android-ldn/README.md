@@ -2,7 +2,8 @@
 
 An Android app around the same mGBA core (with the Wireless Adapter driver and the ESP32 backend) as the desktop build. It
 trades Generation 3 games with a Nintendo Switch through an ESP32 running the GB-Link Switch LDN firmware, connected to the
-phone by USB (OTG). It joins only; the Switch must host.
+phone by USB (OTG). With firmware 2.1 or later of the board, either side can lead the group (the phone hosts a room the
+Switch joins, or joins the Switch's); the Cable adapter (Ruby/Sapphire) only joins, so the Switch must host.
 
 The core is built from the sources in this repository (`src/gba/sio/esp32`, `src/gba/sio/rfu*.c`); the app adds only the
 Android front end (`app/src/main/java`, video, audio, touch controls, USB) and a small JNI layer (`app/src/main/cpp/core_jni.c`).

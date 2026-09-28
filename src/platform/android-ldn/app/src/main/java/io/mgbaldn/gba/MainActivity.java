@@ -942,7 +942,9 @@ public class MainActivity extends Activity implements UsbLink.Logger {
         AlertDialog.Builder builder = new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
                 .setTitle("mGBA LDN for Android")
                 .setMessage("mGBA with Wireless Adapter support, for trading Generation 3 games with a Nintendo Switch through "
-                        + "an ESP32 using GB-Link Switch LDN firmware.\n\nThe Switch must host the trade (Wireless Club > Direct Corner); do not use "
+                        + "an ESP32 using GB-Link Switch LDN firmware.\n\nWireless adapter (FireRed/LeafGreen, Emerald): with board "
+                        + "firmware 2.1 or later either side can lead the group in the Wireless Club > Direct Corner; earlier firmware needs "
+                        + "the Switch to host.\nCable adapter (Ruby/Sapphire): the Switch must host.\n\nDo not use "
                         + "fast-forward. Not affiliated with or endorsed by mGBA.\n\nROMs and saves are kept in:\n"
                         + baseDir.getAbsolutePath() + "\n(ROMs and Saves folders)" + game)
                 .setPositiveButton("OK", null);

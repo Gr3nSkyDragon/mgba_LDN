@@ -733,21 +733,13 @@ static void _childQueuePush(struct Air* air, const uint8_t* data, unsigned size,
 // The LinkPlayer we give the leader: the game's own record, version included, with link type 0, which is what an FRLG
 // wireless link uses. The leader only checks the two "GameFreak inc." magics, and it draws the other player from the
 // version: FireRed/LeafGreen get the FRLG avatar, anything else the Hoenn (RS Brendan/May) one, so Ruby's real version
-// gives Ruby's trainer its own sprite. The version also decides how the leader reads the trainer card and applies its
-// trade-progress rules (trade.c / cable_club.c in pokefirered), and it used to be forced to 0x4005 (LeafGreen).
-// MGBA_RFU_WRAPPER_LP_VERSION (hex, e.g. 4005 for LeafGreen or 4003 for Emerald) presents another version for testing.
+// gives Ruby's trainer its own sprite. (It used to be forced to 0x4005, LeafGreen. Presenting the real version was tested
+// against FireRed and a Switch and does not get in the way of trading or leaving the room.)
 static void _buildLinkPlayerForHost(struct Air* air, uint8_t* out) {
 	memset(out, 0, LP_BUFFER_SIZE);
 	memcpy(out, air->rubyLP, LINK_PLAYER_BLOCK_SIZE);
-	const char* override = getenv("MGBA_RFU_WRAPPER_LP_VERSION");
-	if (override && override[0]) {
-		unsigned long version = strtoul(override, NULL, 16);
-		if (version) {
-			_put16(&out[LP_VERSION_OFFSET], (uint16_t) version);
-		}
-	}
 	memset(&out[LP_LINK_TYPE_OFFSET], 0, 4);
-	AIRLOG(air, "LinkPlayer for the leader: version %04X%s", _le16(&out[LP_VERSION_OFFSET]), override && override[0] ? " (from MGBA_RFU_WRAPPER_LP_VERSION)" : "");
+	AIRLOG(air, "LinkPlayer for the leader: version %04X", _le16(&out[LP_VERSION_OFFSET]));
 }
 
 // The leader's LinkPlayer as the game expects to find it: the same record with the game's own link type, because the
