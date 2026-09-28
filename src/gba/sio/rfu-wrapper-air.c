@@ -252,6 +252,9 @@ struct Air {
 	bool exitKeySeen;    // either side pressed EXIT_ROOM since the room was entered
 	bool hostClosedSeen; // the leader already sent READY_CLOSE_LINK
 	unsigned exitLinger; // frames since the game left the room for good: the wireless link stays up until the leader has taken our close
+	bool exitKeyQueued; // the game's EXIT_ROOM key is in the key queue and has not gone to the leader yet
+	bool exitCloseDeferred; // the game's close after EXIT_ROOM is waiting for that key to go first
+	unsigned exitDeferFrames;
 	bool roomClosed;     // held keys only exist in the room; after the first close they must never be sent again
 	bool pendingPurposeStandby;
 	unsigned standbyRoundsSeen;
@@ -1008,6 +1011,14 @@ static void _flushPendingStandby(struct Air* air) {
 
 static void _gameClose(struct Air* air) {
 	if (air->exitKeySeen && !air->cancelPending && !air->roomClosed) {
+		if (air->exitKeyQueued && air->keysActive) {
+			// The leader leaves the room only once every player's EXIT_ROOM has reached it, so ours goes first; the keys stop
+			// being sent when the close starts.
+			AIRLOG(air, "game close (5FFF) after EXIT_ROOM: the game's exit key has not reached the leader yet, sending it first");
+			air->exitCloseDeferred = true;
+			air->exitDeferFrames = 0;
+			return;
+		}
 		// Leaving the room: the leader does not standby, it closes. Answer with a real READY_CLOSE_LINK and end the link.
 		AIRLOG(air, "game close (5FFF) after EXIT_ROOM: closing the wireless link");
 		air->keysActive = false;
@@ -1020,6 +1031,7 @@ static void _gameClose(struct Air* air) {
 		return;
 	}
 	AIRLOG(air, "game close (5FFF) #%u: wireless standby rounds, then the cable link is answered", air->closeCount + 1);
+	air->exitKeyQueued = false;
 	air->keysActive = false;
 	air->roomClosed = true;
 	air->purpose = PURPOSE_GAME_CLOSE;
@@ -1154,6 +1166,9 @@ static void _airResetLink(struct Air* air) {
 	memset(&air->rubyKeys, 0, sizeof(air->rubyKeys));
 	memset(&air->hostKeys, 0, sizeof(air->hostKeys));
 	air->lastHostKeyCount = -1;
+	air->exitKeyQueued = false;
+	air->exitCloseDeferred = false;
+	air->exitDeferFrames = 0;
 	air->purpose = PURPOSE_NONE;
 	air->hostFrames = 0;
 	air->childFrames = 0;
@@ -1277,8 +1292,18 @@ static void _chooseSlot(struct Air* air, uint16_t words[7]) {
 		}
 	}
 	if (air->keysActive) {
+		uint8_t code = _keyPop(&air->rubyKeys);
 		words[0] = RFUCMD_SEND_HELD_KEYS;
-		words[1] = (air->keyCount++ << 8) | _keyPop(&air->rubyKeys);
+		words[1] = (air->keyCount++ << 8) | code;
+		if (code == LINK_KEY_CODE_EXIT_ROOM) {
+			AIRLOG(air, "the game's EXIT_ROOM key sent to the leader");
+			air->exitKeyQueued = false;
+			if (air->exitCloseDeferred) {
+				// The game closed its link while this key was still waiting; the close can go now.
+				air->exitCloseDeferred = false;
+				_gameClose(air);
+			}
+		}
 	}
 }
 
@@ -1444,6 +1469,12 @@ static void _airFrame(void* context) {
 		_startSearch(air);
 	}
 	_drainEvents(air);
+	if (air->exitCloseDeferred && ++air->exitDeferFrames > 120) {
+		AIRLOG(air, "the game's exit key never got out: closing the link anyway");
+		air->exitCloseDeferred = false;
+		air->exitKeyQueued = false;
+		_gameClose(air);
+	}
 	if (air->exitLinger && air->exitLinger % 60 == 0) {
 		air->bar.burstN = 0; // say our close again: the leader reads one client frame per frame, in order
 	}
@@ -1514,9 +1545,16 @@ static void _peerGameCommand(void* context, const uint16_t command[CMD_WORDS]) {
 		}
 		break;
 	case LINKCMD_SEND_HELD_KEYS:
-		_keyPush(&air->rubyKeys, command[1] & 0xFF);
+		// Only real keys are queued. The game reports "no key" with every cable packet, and queuing those as well made a
+		// standing backlog (one entry in, one out per frame, and none out while the wire carried a block or a barrier):
+		// an EXIT_ROOM behind it went out up to a second late, or was stranded when the game closed the link first. With
+		// nothing queued the leader gets "no key" anyway.
+		if ((command[1] & 0xFF) != LINK_KEY_CODE_EMPTY) {
+			_keyPush(&air->rubyKeys, command[1] & 0xFF);
+		}
 		if ((command[1] & 0xFF) == LINK_KEY_CODE_EXIT_ROOM) {
 			air->exitKeySeen = true;
+			air->exitKeyQueued = true;
 		}
 		break;
 	case LINKCMD_READY_EXIT_STANDBY:
