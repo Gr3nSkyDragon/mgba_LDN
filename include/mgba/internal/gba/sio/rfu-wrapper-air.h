@@ -12,13 +12,15 @@ CXX_GUARD_START
 
 #include <mgba/internal/gba/sio/rfu-wrapper.h>
 
+struct GBASIORFUBackend;
+
 /*
  * The wireless side of the RFU Cable Wrapper: the translator between the game on the cable (Ruby/Sapphire, player 1 of
  * a cable link whose master is the wrapper) and an FRLG game that is the leader (host) of a wireless Direct Corner
  * trade.
  *
  * Toward the wireless side it behaves like the FRLG joiner: it opens a headless wireless-adapter backend (the same
- * "local"/"broadcast"/... backends a real adapter uses), finds the leader, joins it, runs the librfu link layer of a
+ * "local"/"ldnd"/... backends a real adapter uses), finds the leader, joins it, runs the librfu link layer of a
  * child (NI handshake, one 16-byte UNI frame per host frame with a rolling command tag, block send/receive, standby and
  * close barriers, held keys) and answers the leader's pulls.
  *
@@ -32,11 +34,19 @@ CXX_GUARD_START
  * behaviour is checked against frlg-ldn-trade's frlgsim (reference only) and a real FireRed/LeafGreen joiner capture.
  */
 
-// Attach the wireless side to the wrapper using the named backend ("local", "broadcast", "esp32"). Returns false for a
+// Attach the wireless side to the wrapper using the named backend ("local", "ldnd", "esp32"). Returns false for a
 // backend that does not exist (the wrapper then keeps its stub peer). tracePath (optional) receives the backend's own
 // protocol trace (Wi-Fi/serial/LDN details); the wrapper's translator lines go to the wrapper trace. The "broadcast"
 // backend needs a separately running ldnd, which holds the prod.keys itself.
 bool GBASIORFUWrapperAttachAir(struct GBASIORFUWrapper* wrapper, const char* backend, const char* tracePath);
+
+// The same with a backend the caller already created (and configured, e.g. the ESP32 board's port). The wrapper takes
+// ownership of it, and destroys it itself when this fails.
+bool GBASIORFUWrapperAttachAirBackend(struct GBASIORFUWrapper* wrapper, struct GBASIORFUBackend* backend,
+                                      const char* name, const char* tracePath);
+
+// The backend the wireless side was attached with (for its status), or NULL when the wrapper has none.
+struct GBASIORFUBackend* GBASIORFUWrapperAirBackend(struct GBASIORFUWrapper* wrapper);
 
 CXX_GUARD_END
 

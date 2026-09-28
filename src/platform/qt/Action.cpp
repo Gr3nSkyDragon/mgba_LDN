@@ -102,6 +102,14 @@ void Action::setActive(bool a) {
 	emit activated(a);
 }
 
+void Action::setVisibleName(const QString& name) {
+	if (m_visibleName == name) {
+		return;
+	}
+	m_visibleName = name;
+	emit visibleNameChanged(name);
+}
+
 Action& Action::operator=(const Action& other) {
 	setParent(other.parent());
 	m_enabled = other.m_enabled;

@@ -50,8 +50,8 @@ static void _loadState(struct mCoreThread* thread) {
 
 #ifdef M_CORE_GBA
 // The wireless adapter, attached the way the Qt frontend's Emulation > Wireless Adapter menu attaches it. rfu.backend
-// (e.g. `-C rfu.backend=broadcast`, or the MGBA_RFU_BACKEND environment variable, which wins) names what carries its
-// "air": "local" (other mGBA processes on this computer), "broadcast" (a Switch through ldnd; LDN_DAEMON names ldnd's
+// (e.g. `-C rfu.backend=ldnd`, or the MGBA_RFU_BACKEND environment variable, which wins) names what carries its
+// "air": "local" (other mGBA processes on this computer), "ldnd" (a Switch through ldnd; LDN_DAEMON names ldnd's
 // pipe if it is not the default one), "esp32", or "none" (an adapter with nobody in range). The adapter writes
 // rfu-trace.log in the working directory by default; rfu.trace (or MGBA_RFU_TRACE) can override its path.
 static struct GBASIORFU _rfu;
@@ -76,7 +76,7 @@ static bool _createRFU(struct mCore* core) {
 	if (strcmp(backend, "none")) {
 		_rfuBackend = GBASIORFUBackendCreate(backend);
 		if (!_rfuBackend) {
-			printf("Unknown wireless adapter backend \"%s\": use local, broadcast, esp32 or none.\n", backend);
+			printf("Unknown wireless adapter backend \"%s\": use local, ldnd, esp32 or none.\n", backend);
 			return false;
 		}
 	}

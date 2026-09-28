@@ -47,14 +47,14 @@ set(SIO_FILES
 	sio/esp32/esp32-wire.c
 	sio/esp32/rfu-esp32.c)
 
-if(USE_LDN_BROADCAST)
+if(USE_LDND)
 	list(APPEND SIO_FILES
 		sio/ldn/ldnd.c
 		sio/ldn/ldn.c
 		sio/ldn/ldn-pia.c
 		sio/ldn/ldn-pia-reliable.c
 		sio/ldn/ldn-pia-connect.c
-		sio/ldn/rfu-broadcast.c
+		sio/ldn/rfu-ldnd.c
 		sio/ldn/trade-shim.c
 		../third-party/zstd/zstdlib.c)
 endif()

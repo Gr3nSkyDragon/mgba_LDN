@@ -171,9 +171,16 @@ private slots:
 private:
 	// Wireless adapter / RFU Cable Wrapper choices of this window only.
 	QString m_rfuBackend = QStringLiteral("off");
-	QString m_rfuWrapBackend = QStringLiteral("off");
+	bool m_rfuCableWrapper = false;
 	bool m_rfuLog = false;
-	bool m_rfuWrapLog = false;
+	QString m_rfuEsp32Port; // empty: auto-detect
+	bool m_rfuEsp32Primary = false; // this window saves its board choice (see the menu setup)
+	QList<QPair<std::shared_ptr<Action>, QString>> m_rfuEsp32Actions;
+	// Emulation > Wireless Adapter > Status: its lines, relabelled by the timer (see updateRFUStatus).
+	QList<std::shared_ptr<Action>> m_rfuStatusLines;
+	QTimer m_rfuStatusTimer;
+
+	static const int RFU_STATUS_INTERVAL = 1000;
 
 	static const int FPS_TIMER_INTERVAL = 2000;
 	static const int MUST_RESTART_TIMEOUT = 10000;
@@ -188,6 +195,10 @@ private:
 	void appendMRU(const QString& fname);
 	void clearMRU();
 	void updateMRU();
+
+	void updateRFUESP32Boards(bool rebuild = true);
+	void setRFUESP32Port(const QString& port);
+	void updateRFUStatus();
 
 	void ensureScripting();
 	void recalculateFrameSize(const QSize&);

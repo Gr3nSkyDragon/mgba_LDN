@@ -27,6 +27,14 @@ bool Esp32SerialWrite(struct Esp32Serial*, const void* data, size_t length);
 // the other boards use (Silicon Labs CP210x 10C4, WCH CH340/CH9102 1A86, FTDI 0403). Returns false if none is present.
 bool Esp32SerialFindEspressif(char* out, size_t capacity);
 
+// Every such board present right now, in the order Esp32SerialFindEspressif would pick them. Returns how many were
+// written (at most `max`). `description` names the USB interface ("Espressif USB", "CP210x", ...) and may be empty.
+struct Esp32SerialPortInfo {
+	char name[32];
+	char description[32];
+};
+size_t Esp32SerialListEspressif(struct Esp32SerialPortInfo* out, size_t max);
+
 // The five operations above, as a table a host application can supply. `struct Esp32Serial` is opaque: an implementation
 // defines it however it likes (a Win32 handle, a JNI reference to an Android USB connection, ...). `find` is the
 // auto-detection hook; where the host application has already been handed a specific device it can simply report that

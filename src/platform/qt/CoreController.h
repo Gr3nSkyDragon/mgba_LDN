@@ -209,10 +209,17 @@ public slots:
 	void detachBattleChipGate();
 	void setRFUBackend(const QString&);
 	void setRFULogging(bool enabled);
+	void setRFUESP32Port(const QString& port);
 	bool rfuEnabled() const;
-	void setRFUWrapperBackend(const QString&);
+	// The chosen backend drives the RFU Cable Wrapper instead of the wireless adapter.
+	void setRFUCableWrapper(bool enabled);
 	void setRFUWrapperLogging(bool enabled);
 	bool rfuWrapperEnabled() const;
+	// The connection of the attached wireless adapter's backend, or else the RFU Cable Wrapper's wireless side, for the
+	// status menu. False when neither is attached. `backend` gets its name, `wrapper` whether it is the wrapper's.
+	bool rfuStatus(GBASIORFUBackendStatus* out, QString* backend, bool* wrapper) const;
+	// "Check now": asks that backend to contact its device if it is idle.
+	void probeRFU();
 	void setBattleChipId(uint16_t id);
 	void setBattleChipFlavor(int flavor);
 
@@ -271,6 +278,7 @@ private:
 	void stopRFUWrapper();
 	bool startRFU(const QString& backend);
 	void stopRFU();
+	void applyRFU();
 #endif
 
 	mCoreThread m_threadContext{};
@@ -372,6 +380,7 @@ private:
 	bool m_rfuAttached = false;
 	QString m_rfuBackendName;
 	QString m_rfuRequestedBackend = QStringLiteral("off"); // what the menu asked for, whether or not it is attached
+	QString m_rfuEsp32Port; // the "ESP32" backend's serial port (e.g. "COM4"); empty auto-detects
 	bool m_rfuLogEnabled = false; // "Save adapter log": write <config dir>/rfu-trace.log while an adapter is attached
 	bool m_rfuTraceOn = false; // this controller currently holds a trace file
 	MultiplayerController* m_rfuSavedMultiplayer = nullptr;
@@ -379,7 +388,7 @@ private:
 	bool m_rfuWrapperAttached = false;
 	QString m_rfuWrapperConnection; // the connection the attached wrapper was started with
 	QByteArray m_rfuWrapperConnectionName;
-	QString m_rfuWrapperBackend = QStringLiteral("off"); // RFU Cable Wrapper: connections are stubs for now
+	bool m_rfuCableWrapper = false; // the menu's "Cable wrapper": m_rfuRequestedBackend drives the wrapper
 	bool m_rfuWrapperLogEnabled = false; // "Save adapter log" of the wrapper: <config dir>/rfu-wrapper-trace.log
 	bool m_rfuWrapperTraceHeld = false; // this controller holds a reference on the cable trace file
 	QByteArray m_eReaderData;

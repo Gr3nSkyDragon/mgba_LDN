@@ -5,7 +5,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 /*
- * ldnd-probe: checks a running ldnd from C, through the same client the Broadcast backend uses.
+ * ldnd-probe: checks a running ldnd from C, through the same client the ldnd backend uses.
  *
  *   ldnd-probe [--pipe <path>] [--scan] [--join] [--seconds N]
  *

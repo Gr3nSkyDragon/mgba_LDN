@@ -118,7 +118,7 @@ bool LdnPiaDecompress(const uint8_t* data, size_t length, uint8_t* out, size_t* 
 	}
 	// `data` is a Pia MESSAGE payload, not a lone zstd file: the real datagram appends a plaintext footer and/or
 	// 0xFF padding (out to a 16-byte boundary) after the zstd frame itself (see LdnPiaHeader.footer and this
-	// project's own send-side padding in rfu-broadcast.c's _piaSendRaw). ZSTD_decompress rejects trailing bytes that
+	// project's own send-side padding in rfu-ldnd.c's _piaSendRaw). ZSTD_decompress rejects trailing bytes that
 	// don't parse as a further valid frame, so the exact compressed-frame length must be found first and only
 	// that many bytes handed to it - passing the whole padded blob (live-confirmed) fails every time.
 	size_t frameSize = ZSTD_findFrameCompressedSize(data, length);

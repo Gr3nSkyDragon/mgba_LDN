@@ -26,6 +26,7 @@
 #include <mgba/internal/gba/gba.h>
 #include <mgba/internal/gba/renderers/cache-set.h>
 #include <mgba/internal/gba/sharkport.h>
+#include <mgba/internal/gba/sio/rfu-esp32.h>
 #endif
 #ifdef M_CORE_GB
 #include <mgba/internal/gb/gb.h>
@@ -1122,7 +1123,7 @@ void CoreController::endPrint() {
 // The wireless adapter is chosen with the Emulation > "Wireless adapter" submenu (saved as rfu.backend in the config):
 //   off        no adapter on the link port
 //   local      the adapter's "air" is UDP on this computer: other mGBA processes with the adapter on are in range
-//   broadcast  a real Switch over LDN, through a separately-running ldnd
+//   ldnd       a real Switch over LDN, through a separately-running ldnd
 //   esp32      a real Switch through GB-Link's ESP32 LDN bridge board on a USB serial port
 // For development the MGBA_RFU_BACKEND environment variable takes the same names (plus "none": an adapter with nobody
 // in range) and overrides the menu. MGBA_RFU_TRACE=<file> (or rfu.trace) writes the adapter's protocol trace.
@@ -1186,6 +1187,11 @@ bool CoreController::startRFU(const QString& backend) {
 		if (!m_rfuBackend) {
 			qWarning() << "Unknown wireless adapter backend" << backend;
 			return false;
+		}
+		// The board picked under Wireless Adapter > ESP32 board; MGBA_RFU_ESP32_PORT still overrides it for development.
+		const char* envPort = getenv("MGBA_RFU_ESP32_PORT");
+		if (backend == QLatin1String("esp32") && !m_rfuEsp32Port.isEmpty() && (!envPort || !envPort[0])) {
+			GBASIORFUESP32SetPort(m_rfuBackend, m_rfuEsp32Port.toUtf8().constData());
 		}
 	}
 	GBASIORFUCreate(&m_rfu, m_rfuBackend);
@@ -1254,9 +1260,9 @@ void CoreController::detachRFU() {
 	}
 }
 
-// Emulation > "RFU Cable Wrapper": presents a cable-linked game (Ruby/Sapphire) with a second player it can talk to. Its
-// "Local", "ESP32" and "Broadcast" connections join an FRLG leader (another mGBA process, or a real Switch through the ESP32
-// board, or over Wi-Fi through ldnd; rfu-wrapper-air.c). Its "Save adapter log" writes
+// Emulation > Wireless Adapter > "Cable wrapper": presents a cable-linked game (Ruby/Sapphire) with a second player it
+// can talk to, over the adapter's chosen backend. "Local", "ESP32" and "ldnd" join an FRLG leader (another mGBA process,
+// or a real Switch through the ESP32 board, or over Wi-Fi through ldnd; rfu-wrapper-air.c). "Save adapter log" also writes
 // rfu-wrapper-trace.log next to the wireless adapter's rfu-trace.log: the wrapper's own cable/peer trace while it is
 // attached, and otherwise the real cable (lockstep) traffic between games in mGBA's own multiplayer, which is the capture
 // the wrapper is built from. The log does not depend on the chosen connection.
@@ -1279,16 +1285,24 @@ bool CoreController::startRFUWrapper(const QString& connection) {
 	stopRFU();
 	m_rfuWrapperConnectionName = connection.toUtf8();
 	GBASIORFUWrapperCreate(&m_rfuWrapper, m_rfuWrapperConnectionName.constData());
-	if (connection == QLatin1String("local") || connection == QLatin1String("esp32") || connection == QLatin1String("broadcast")) {
+	if (connection == QLatin1String("local") || connection == QLatin1String("esp32") || connection == QLatin1String("ldnd") ||
+	    connection == QLatin1String("broadcast")) {
 		// The wireless side: "local" joins an FRLG leader in another mGBA whose Wireless Adapter is also "Local";
-		// "esp32" joins a real Switch's FRLG room through GB-Link's ESP32 board (the port is auto-detected, or named
-		// with MGBA_RFU_ESP32_PORT); "broadcast" joins one over the PC's own Wi-Fi through a separately running ldnd
-		// (which holds the prod.keys). The backend's own protocol trace goes next to the wrapper trace.
+		// "esp32" joins a real Switch's FRLG room through GB-Link's ESP32 board (the one picked under Wireless Adapter >
+		// ESP32 board, else auto-detected; MGBA_RFU_ESP32_PORT still overrides it); "ldnd" joins one over the PC's own
+		// Wi-Fi through a separately running ldnd (which holds the prod.keys). The backend's own protocol trace goes next
+		// to the wrapper trace.
 		QByteArray backendTrace;
 		if (m_rfuWrapperLogEnabled) {
 			backendTrace = QDir(ConfigController::configDir()).filePath("rfu-wrapper-backend.log").toUtf8();
 		}
-		if (!GBASIORFUWrapperAttachAir(&m_rfuWrapper, connection.toUtf8().constData(), backendTrace.constData())) {
+		GBASIORFUBackend* air = GBASIORFUBackendCreate(connection.toUtf8().constData());
+		const char* envPort = getenv("MGBA_RFU_ESP32_PORT");
+		if (air && connection == QLatin1String("esp32") && !m_rfuEsp32Port.isEmpty() && (!envPort || !envPort[0])) {
+			GBASIORFUESP32SetPort(air, m_rfuEsp32Port.toUtf8().constData());
+		}
+		if (!GBASIORFUWrapperAttachAirBackend(&m_rfuWrapper, air, connection.toUtf8().constData(),
+		                                      backendTrace.constData())) {
 			qWarning() << "RFU cable wrapper: could not open the wireless side" << connection;
 		}
 	}
@@ -1308,40 +1322,10 @@ void CoreController::stopRFUWrapper() {
 	m_rfuWrapperAttached = false;
 }
 
-void CoreController::setRFUWrapperBackend(const QString& requested) {
-	m_rfuWrapperBackend = rfuNormalizeBackend(requested);
-	if (platform() != mPLATFORM_GBA) {
-		return;
-	}
-	if (m_rfuWrapperBackend == QLatin1String("off")) {
-		if (!m_rfuWrapperAttached) {
-			return;
-		}
-		{
-			Interrupter interrupter(this);
-			stopRFUWrapper();
-		}
-		// The wrapper had taken the link port from the wireless adapter; give it back if the adapter is still wanted.
-		if (m_rfuRequestedBackend != QLatin1String("off") && !m_rfuAttached) {
-			setRFUBackend(m_rfuRequestedBackend);
-		} else if (m_rfuSavedMultiplayer && !m_rfuAttached) {
-			MultiplayerController* multiplayer = m_rfuSavedMultiplayer;
-			m_rfuSavedMultiplayer = nullptr;
-			setMultiplayerController(multiplayer);
-		}
-		return;
-	}
-	if (rfuWrapperEnabled() && m_rfuWrapperConnection == m_rfuWrapperBackend) {
-		return;
-	}
-	Interrupter interrupter(this);
-	if (m_multiplayer) {
-		m_rfuSavedMultiplayer = m_multiplayer;
-		clearMultiplayerController();
-	}
-	if (startRFUWrapper(m_rfuWrapperBackend)) {
-		m_rfuWrapperConnection = m_rfuWrapperBackend;
-	}
+// Wireless Adapter > "Cable wrapper": the chosen backend is used by the wrapper instead of the adapter.
+void CoreController::setRFUCableWrapper(bool enabled) {
+	m_rfuCableWrapper = enabled;
+	applyRFU();
 }
 
 void CoreController::setRFUWrapperLogging(bool enabled) {
@@ -1391,17 +1375,25 @@ void CoreController::setRFULogging(bool enabled) {
 // the adapter, which the game sees as the adapter being unplugged and plugged back in.
 void CoreController::setRFUBackend(const QString& requested) {
 	m_rfuRequestedBackend = rfuNormalizeBackend(requested);
-	if (platform() != mPLATFORM_GBA || rfuEnvironmentOverride()) {
+	applyRFU();
+}
+
+// Puts on the link port what the menu asks for: nothing, the adapter, or the cable wrapper, on the chosen backend
+// (MGBA_RFU_BACKEND overrides the backend, not the wrapper checkbox).
+void CoreController::applyRFU() {
+	if (platform() != mPLATFORM_GBA) {
 		return;
 	}
-	QString name = rfuNormalizeBackend(requested);
+	QString name = m_rfuRequestedBackend;
+	rfuEnvironmentOverride(&name);
 	if (name == QLatin1String("off")) {
-		if (!m_rfuAttached) {
+		if (!m_rfuAttached && !m_rfuWrapperAttached) {
 			return;
 		}
 		{
 			Interrupter interrupter(this);
 			stopRFU();
+			stopRFUWrapper();
 		}
 		if (m_rfuSavedMultiplayer) {
 			MultiplayerController* multiplayer = m_rfuSavedMultiplayer;
@@ -1410,7 +1402,8 @@ void CoreController::setRFUBackend(const QString& requested) {
 		}
 		return;
 	}
-	if (rfuEnabled() && m_rfuBackendName == name) {
+	if (m_rfuCableWrapper ? (rfuWrapperEnabled() && m_rfuWrapperConnection == name)
+	                      : (rfuEnabled() && m_rfuBackendName == name)) {
 		return;
 	}
 	Interrupter interrupter(this);
@@ -1418,7 +1411,56 @@ void CoreController::setRFUBackend(const QString& requested) {
 		m_rfuSavedMultiplayer = m_multiplayer;
 		clearMultiplayerController();
 	}
-	startRFU(name);
+	// Each start releases the other's hold on the link port.
+	if (!m_rfuCableWrapper) {
+		startRFU(name);
+	} else if (startRFUWrapper(name)) {
+		m_rfuWrapperConnection = name;
+	}
+}
+
+// Which ESP32 board the "esp32" backend opens (empty: auto-detect). An attached ESP32 adapter is restarted on the new port.
+void CoreController::setRFUESP32Port(const QString& port) {
+	if (m_rfuEsp32Port == port) {
+		return;
+	}
+	m_rfuEsp32Port = port;
+	if (rfuEnabled() && m_rfuBackendName == QLatin1String("esp32")) {
+		Interrupter interrupter(this);
+		stopRFU();
+		startRFU(QStringLiteral("esp32"));
+	} else if (rfuWrapperEnabled() && m_rfuWrapperConnection == QLatin1String("esp32")) {
+		Interrupter interrupter(this);
+		startRFUWrapper(QStringLiteral("esp32")); // replaces the attached wrapper
+	}
+}
+
+// Only while the driver is still on the link port: one replaced behind our back has already deinitialised its backend.
+bool CoreController::rfuStatus(GBASIORFUBackendStatus* out, QString* backend, bool* wrapper) const {
+	if (rfuEnabled()) {
+		*backend = m_rfuBackendName;
+		*wrapper = false;
+		GBASIORFUBackendGetStatus(m_rfuBackend, out);
+		return true;
+	}
+	if (rfuWrapperEnabled()) {
+		GBASIORFUBackend* air = GBASIORFUWrapperAirBackend(const_cast<GBASIORFUWrapper*>(&m_rfuWrapper));
+		if (air) {
+			*backend = QString::fromUtf8(m_rfuWrapperConnectionName);
+			*wrapper = true;
+			GBASIORFUBackendGetStatus(air, out);
+			return true;
+		}
+	}
+	return false;
+}
+
+void CoreController::probeRFU() {
+	if (rfuEnabled()) {
+		GBASIORFUBackendProbe(m_rfuBackend);
+	} else if (rfuWrapperEnabled()) {
+		GBASIORFUBackendProbe(GBASIORFUWrapperAirBackend(&m_rfuWrapper));
+	}
 }
 
 void CoreController::attachBattleChipGate() {

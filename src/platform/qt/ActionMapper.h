@@ -11,6 +11,7 @@
 #include <QKeySequence>
 #include <QMenu>
 #include <QObject>
+#include <QPointer>
 #include <QSet>
 
 #include <functional>
@@ -31,7 +32,11 @@ public:
 	void addMenu(const QString& visibleName, const QString& name, const QString& parent = {});
 	void addHiddenMenu(const QString& visibleName, const QString& name, const QString& parent = {});
 	void clearMenu(const QString& name);
+	// Shows or hides a submenu in the menu bar; applies at once to a menu already built.
+	void setMenuVisible(const QString& name, bool visible);
 	void rebuildMenu(QMenuBar*, QWidget* context, const ShortcutController&);
+	// Refills one already-built submenu in place (it can stay open). False if that menu has not been built.
+	bool rebuildSubmenu(const QString& menu, QWidget* context, const ShortcutController&);
 
 	void addSeparator(const QString& menu);
 
@@ -58,6 +63,9 @@ public:
 
 	void exec(const QPoint& pos);
 
+protected:
+	bool eventFilter(QObject*, QEvent*) override;
+
 signals:
 	void actionAdded(const QString& name);
 	void menuCleared(const QString& name);
@@ -73,6 +81,8 @@ private:
 	QHash<QString, QKeySequence> m_defaultShortcuts;
 	QSet<QString> m_hiddenActions;
 	QSet<QString> m_heldActions;
+	QSet<QString> m_invisibleMenus;
+	QHash<QString, QPointer<QMenu>> m_qmenus;
 	QMenu m_menu;
 };
 

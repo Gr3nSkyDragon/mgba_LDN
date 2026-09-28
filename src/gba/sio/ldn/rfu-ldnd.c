@@ -3,7 +3,7 @@
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
-#include <mgba/internal/gba/sio/rfu-broadcast.h>
+#include <mgba/internal/gba/sio/rfu-ldnd.h>
 
 #include "ldn-pia-connect.h"
 #include "ldn-pia-reliable.h"
@@ -63,6 +63,9 @@ enum {
 
 	kPiaQueueDepth = 32,
 
+	// A room heard within this long counts as in range for the status display.
+	kRoomFreshMs = 4000,
+
 	// The largest single tiled message this backend ever sends: a Reliable(10) frame wrapping up to
 	// LDN_PIA_RELIABLE_MAX_PAYLOAD bytes of inner payload (8-byte sub-header + payload), plus the message-tiling
 	// layer's own 5-byte header, a 2-byte footer and up to 15 bytes of 0xFF padding.
@@ -121,7 +124,7 @@ struct PiaDatagram {
  * (_workerProc), started by the first search or connect and stopped by deinit. A join in particular can take a minute.
  * The emulation thread and ldnd's reader thread (the callbacks) only post to the worker, under `lock`, and wake it.
  */
-struct GBASIORFUBroadcast {
+struct GBASIORFULdnd {
 	struct GBASIORFUBackend d;
 	struct GBASIORFU* rfu;
 
@@ -148,6 +151,14 @@ struct GBASIORFUBroadcast {
 	size_t queueHead;
 	size_t queueCount;
 	bool piaActive; // see below
+	bool probeWanted; // the frontend asked whether ldnd is there (_probe)
+	bool openFailed; // the last attempt to reach ldnd failed
+	// For the status display (_status).
+	char daemonVersion[64]; // of the ldnd `conn` is open to
+	uint32_t protocolVersion;
+	uint8_t radioState; // an LdndRadioState, while `conn` is open
+	char lastError[RFU_BACKEND_STATUS_TEXT];
+	bool lastErrorFromScan; // cleared again by a scan that works
 
 	// The worker's own.
 	unsigned scanIndex;
@@ -214,49 +225,67 @@ static const char* _radioStateName(unsigned state) {
 	return state < sizeof(names) / sizeof(names[0]) ? names[state] : "unknown";
 }
 
-static void _wakeWorker(struct GBASIORFUBroadcast* broadcast) {
-	SetEvent(broadcast->wake);
+// Keeps the most recent problem for the status display.
+static void _setError(struct GBASIORFULdnd* ldnd, bool fromScan, const char* what, const struct LdndResult* result, int code) {
+	EnterCriticalSection(&ldnd->lock);
+	snprintf(ldnd->lastError, sizeof(ldnd->lastError), "%s: %s%s%s", what, LdndStatusName(code), result && result->message[0] ? ": " : "",
+	         result ? result->message : "");
+	ldnd->lastErrorFromScan = fromScan;
+	LeaveCriticalSection(&ldnd->lock);
+}
+
+static void _clearError(struct GBASIORFULdnd* ldnd, bool scanOnly) {
+	EnterCriticalSection(&ldnd->lock);
+	if (!scanOnly || ldnd->lastErrorFromScan) {
+		ldnd->lastError[0] = 0;
+		ldnd->lastErrorFromScan = false;
+	}
+	LeaveCriticalSection(&ldnd->lock);
+}
+
+static void _wakeWorker(struct GBASIORFULdnd* ldnd) {
+	SetEvent(ldnd->wake);
 }
 
 // Sleeps up to `ms`, or until the worker is woken.
-static void _nap(struct GBASIORFUBroadcast* broadcast, DWORD ms) {
-	WaitForSingleObject(broadcast->wake, ms);
+static void _nap(struct GBASIORFULdnd* ldnd, DWORD ms) {
+	WaitForSingleObject(ldnd->wake, ms);
 }
 
 // ---- Traffic on the joined network --------------------------------------------------------------------------------
 
-static int _sendDatagram(struct GBASIORFUBroadcast* broadcast, const uint8_t peer[4], const uint8_t* data, size_t length) {
+static int _sendDatagram(struct GBASIORFULdnd* ldnd, const uint8_t peer[4], const uint8_t* data, size_t length) {
 	int code = LDND_ERR_PIPE;
-	EnterCriticalSection(&broadcast->lock);
-	if (broadcast->conn && broadcast->channel) {
-		code = LdndSendDatagram(broadcast->conn, broadcast->channel, peer, LDN_PIA_PORT, data, length);
+	EnterCriticalSection(&ldnd->lock);
+	if (ldnd->conn && ldnd->channel) {
+		code = LdndSendDatagram(ldnd->conn, ldnd->channel, peer, LDN_PIA_PORT, data, length);
 	}
-	LeaveCriticalSection(&broadcast->lock);
+	LeaveCriticalSection(&ldnd->lock);
 	return code;
 }
 
 // Dequeues one received datagram (false if there is none). `*inOutLength` is the buffer size on entry and the
 // datagram's length on return; `ip` is who sent it.
-static bool _popDatagram(struct GBASIORFUBroadcast* broadcast, uint8_t ip[4], uint8_t* payload, size_t* inOutLength) {
+static bool _popDatagram(struct GBASIORFULdnd* ldnd, uint8_t ip[4], uint8_t* payload, size_t* inOutLength) {
 	bool found = false;
-	EnterCriticalSection(&broadcast->lock);
-	if (broadcast->queueCount) {
-		struct PiaDatagram* datagram = &broadcast->queue[broadcast->queueHead];
+	EnterCriticalSection(&ldnd->lock);
+	if (ldnd->queueCount) {
+		struct PiaDatagram* datagram = &ldnd->queue[ldnd->queueHead];
 		memcpy(ip, datagram->ip, 4);
 		size_t copy = datagram->length < *inOutLength ? datagram->length : *inOutLength;
 		memcpy(payload, datagram->payload, copy);
 		*inOutLength = datagram->length;
-		broadcast->queueHead = (broadcast->queueHead + 1) % kPiaQueueDepth;
-		--broadcast->queueCount;
+		ldnd->queueHead = (ldnd->queueHead + 1) % kPiaQueueDepth;
+		--ldnd->queueCount;
 		found = true;
 	}
-	LeaveCriticalSection(&broadcast->lock);
+	LeaveCriticalSection(&ldnd->lock);
 	return found;
 }
 
 // ldnd's reader thread: a datagram arrived on the Pia channel.
 static void _onData(void* context, uint32_t channel, const uint8_t* payload, size_t length) {
-	struct GBASIORFUBroadcast* broadcast = context;
+	struct GBASIORFULdnd* ldnd = context;
 	uint8_t peer[4];
 	uint16_t port;
 	const uint8_t* data;
@@ -264,62 +293,65 @@ static void _onData(void* context, uint32_t channel, const uint8_t* payload, siz
 	if (!LdndParseDatagram(payload, length, peer, &port, &data, &dataLength)) {
 		return;
 	}
-	EnterCriticalSection(&broadcast->lock);
+	EnterCriticalSection(&ldnd->lock);
 	// The channel is only known once OpenDatagram answers, and the host may already be talking by then.
-	bool ours = broadcast->network && (!broadcast->channel || channel == broadcast->channel);
+	bool ours = ldnd->network && (!ldnd->channel || channel == ldnd->channel);
 	// A full queue drops the newest datagram: Pia's own reliable layer recovers from loss, so this queue is not the place
 	// to grow without bound.
-	if (ours && broadcast->queueCount < kPiaQueueDepth) {
-		struct PiaDatagram* datagram = &broadcast->queue[(broadcast->queueHead + broadcast->queueCount) % kPiaQueueDepth];
+	if (ours && ldnd->queueCount < kPiaQueueDepth) {
+		struct PiaDatagram* datagram = &ldnd->queue[(ldnd->queueHead + ldnd->queueCount) % kPiaQueueDepth];
 		memcpy(datagram->ip, peer, 4);
 		datagram->length = dataLength < sizeof(datagram->payload) ? dataLength : sizeof(datagram->payload);
 		memcpy(datagram->payload, data, datagram->length);
-		++broadcast->queueCount;
+		++ldnd->queueCount;
 	}
-	LeaveCriticalSection(&broadcast->lock);
+	LeaveCriticalSection(&ldnd->lock);
 }
 
 // ldnd's reader thread.
 static void _onEvent(void* context, const struct LdndEvent* event) {
-	struct GBASIORFUBroadcast* broadcast = context;
+	struct GBASIORFULdnd* ldnd = context;
 	switch (event->kind) {
 	case LDND_EVENT_DISCONNECT: {
-		EnterCriticalSection(&broadcast->lock);
-		bool ours = event->handle && event->handle == broadcast->network;
+		EnterCriticalSection(&ldnd->lock);
+		bool ours = event->handle && event->handle == ldnd->network;
 		if (ours) {
-			broadcast->hostLost = true;
+			ldnd->hostLost = true;
 		}
-		LeaveCriticalSection(&broadcast->lock);
+		LeaveCriticalSection(&ldnd->lock);
 		if (ours) {
-			GBASIORFUTrace(broadcast->rfu, "LDN    ldnd: the host's network is gone (reason %u)", event->reason);
-			_wakeWorker(broadcast);
+			GBASIORFUTrace(ldnd->rfu, "LDN    ldnd: the host's network is gone (reason %u)", event->reason);
+			_wakeWorker(ldnd);
 		}
 		break;
 	}
 	case LDND_EVENT_APP_DATA_CHANGED:
-		EnterCriticalSection(&broadcast->lock);
-		if (event->handle && event->handle == broadcast->network && event->newDataLength <= LDND_MAX_APPLICATION_DATA) {
-			memcpy(broadcast->target.applicationData, event->newData, event->newDataLength);
-			broadcast->target.applicationDataLength = (uint16_t) event->newDataLength;
+		EnterCriticalSection(&ldnd->lock);
+		if (event->handle && event->handle == ldnd->network && event->newDataLength <= LDND_MAX_APPLICATION_DATA) {
+			memcpy(ldnd->target.applicationData, event->newData, event->newDataLength);
+			ldnd->target.applicationDataLength = (uint16_t) event->newDataLength;
 		}
-		LeaveCriticalSection(&broadcast->lock);
+		LeaveCriticalSection(&ldnd->lock);
 		break;
 	case LDND_EVENT_JOIN:
 	case LDND_EVENT_LEAVE: {
 		const struct LdndParticipant* participant = event->participant;
-		GBASIORFUTrace(broadcast->rfu, "LDN    ldnd: participant %u %s: \"%.*s\" %u.%u.%u.%u", event->index,
+		GBASIORFUTrace(ldnd->rfu, "LDN    ldnd: participant %u %s: \"%.*s\" %u.%u.%u.%u", event->index,
 		               event->kind == LDND_EVENT_JOIN ? "joined" : "left", participant->nameLength, (const char*) participant->name, participant->ip[0],
 		               participant->ip[1], participant->ip[2], participant->ip[3]);
 		break;
 	}
 	case LDND_EVENT_CHANNEL_ERROR:
-		GBASIORFUTrace(broadcast->rfu, "LDN    ldnd: channel %u: %s: %s", event->handle, LdndStatusName(event->status), event->message);
+		GBASIORFUTrace(ldnd->rfu, "LDN    ldnd: channel %u: %s: %s", event->handle, LdndStatusName(event->status), event->message);
 		break;
 	case LDND_EVENT_RADIO_STATE:
-		GBASIORFUTrace(broadcast->rfu, "LDN    ldnd: radio %s%s%s", _radioStateName(event->radioState), event->message ? ": " : "",
+		EnterCriticalSection(&ldnd->lock);
+		ldnd->radioState = event->radioState;
+		LeaveCriticalSection(&ldnd->lock);
+		GBASIORFUTrace(ldnd->rfu, "LDN    ldnd: radio %s%s%s", _radioStateName(event->radioState), event->message ? ": " : "",
 		               event->message ? event->message : "");
 		// A scan that is waiting out NO_RADIO can go again.
-		_wakeWorker(broadcast);
+		_wakeWorker(ldnd);
 		break;
 	default:
 		break;
@@ -328,173 +360,185 @@ static void _onEvent(void* context, const struct LdndEvent* event) {
 
 // ---- The worker ---------------------------------------------------------------------------------------------------
 
-static struct LdndConnection* _openDaemon(struct GBASIORFUBroadcast* broadcast) {
+static struct LdndConnection* _openDaemon(struct GBASIORFULdnd* ldnd) {
 	// LDN_DAEMON names a pipe other than ldnd's default, as ldnrs's own clients do.
 	const char* pipe = getenv("LDN_DAEMON");
 	if (pipe && !pipe[0]) {
 		pipe = NULL;
 	}
-	struct LdndCallbacks callbacks = {broadcast, _onEvent, _onData};
+	struct LdndCallbacks callbacks = {ldnd, _onEvent, _onData};
 	struct LdndHello hello;
 	struct LdndResult result;
 	struct LdndConnection* conn = LdndOpen(pipe, projectName, projectVersion, &callbacks, &hello, &result);
 	if (!conn) {
 		// Once per distinct problem: the worker retries every few seconds for as long as the game keeps searching.
-		if (result.code != broadcast->lastOpenError) {
-			GBASIORFUTrace(broadcast->rfu, "LDN    could not use ldnd: %s%s%s", LdndStatusName(result.code), result.message[0] ? ": " : "",
+		if (result.code != ldnd->lastOpenError) {
+			GBASIORFUTrace(ldnd->rfu, "LDN    could not use ldnd: %s%s%s", LdndStatusName(result.code), result.message[0] ? ": " : "",
 			               result.message);
 		}
-		broadcast->lastOpenError = result.code;
+		ldnd->lastOpenError = result.code;
+		_setError(ldnd, false, "Could not reach ldnd", &result, result.code);
+		EnterCriticalSection(&ldnd->lock);
+		ldnd->openFailed = true;
+		LeaveCriticalSection(&ldnd->lock);
 		return NULL;
 	}
-	broadcast->lastOpenError = LDND_OK;
-	GBASIORFUTrace(broadcast->rfu, "LDN    connected to ldnd %s (protocol %u)%s", hello.daemonVersion, hello.protocolVersion,
+	ldnd->lastOpenError = LDND_OK;
+	_clearError(ldnd, false);
+	GBASIORFUTrace(ldnd->rfu, "LDN    connected to ldnd %s (protocol %u)%s", hello.daemonVersion, hello.protocolVersion,
 	               hello.radioReady ? "" : "; its radio is not ready yet");
-	EnterCriticalSection(&broadcast->lock);
-	broadcast->conn = conn;
-	LeaveCriticalSection(&broadcast->lock);
+	EnterCriticalSection(&ldnd->lock);
+	ldnd->conn = conn;
+	ldnd->openFailed = false;
+	snprintf(ldnd->daemonVersion, sizeof(ldnd->daemonVersion), "%s", hello.daemonVersion);
+	ldnd->protocolVersion = hello.protocolVersion;
+	ldnd->radioState = hello.radioReady ? LDND_RADIO_READY : LDND_RADIO_ATTACHING;
+	LeaveCriticalSection(&ldnd->lock);
 	return conn;
 }
 
-static struct LdndConnection* _daemon(struct GBASIORFUBroadcast* broadcast) {
-	EnterCriticalSection(&broadcast->lock);
-	struct LdndConnection* conn = broadcast->conn;
-	LeaveCriticalSection(&broadcast->lock);
-	return conn ? conn : _openDaemon(broadcast);
+static struct LdndConnection* _daemon(struct GBASIORFULdnd* ldnd) {
+	EnterCriticalSection(&ldnd->lock);
+	struct LdndConnection* conn = ldnd->conn;
+	LeaveCriticalSection(&ldnd->lock);
+	return conn ? conn : _openDaemon(ldnd);
 }
 
 // Hangs up on ldnd, which then drops whatever network it held for us.
-static void _closeDaemon(struct GBASIORFUBroadcast* broadcast) {
-	EnterCriticalSection(&broadcast->lock);
-	struct LdndConnection* conn = broadcast->conn;
-	broadcast->conn = NULL;
-	if (broadcast->network) {
-		broadcast->hostLost = true;
+static void _closeDaemon(struct GBASIORFULdnd* ldnd) {
+	EnterCriticalSection(&ldnd->lock);
+	struct LdndConnection* conn = ldnd->conn;
+	ldnd->conn = NULL;
+	ldnd->daemonVersion[0] = 0;
+	if (ldnd->network) {
+		ldnd->hostLost = true;
 	}
-	LeaveCriticalSection(&broadcast->lock);
+	LeaveCriticalSection(&ldnd->lock);
 	// Outside the lock: closing waits for ldnd's reader thread, whose callbacks take it.
 	LdndClose(conn);
 }
 
 // Closes the joined network and forgets its host. Any Pia session on it must already be over.
-static void _leaveNetwork(struct GBASIORFUBroadcast* broadcast) {
-	EnterCriticalSection(&broadcast->lock);
-	struct LdndConnection* conn = broadcast->conn;
-	uint32_t network = broadcast->network;
-	uint16_t deviceId = broadcast->targetDeviceId;
-	bool lost = broadcast->hostLost;
-	broadcast->network = 0;
-	broadcast->channel = 0;
-	broadcast->targetDeviceId = 0;
-	broadcast->hostLost = false;
-	broadcast->leaveWanted = false;
-	broadcast->queueCount = 0;
-	LeaveCriticalSection(&broadcast->lock);
+static void _leaveNetwork(struct GBASIORFULdnd* ldnd) {
+	EnterCriticalSection(&ldnd->lock);
+	struct LdndConnection* conn = ldnd->conn;
+	uint32_t network = ldnd->network;
+	uint16_t deviceId = ldnd->targetDeviceId;
+	bool lost = ldnd->hostLost;
+	ldnd->network = 0;
+	ldnd->channel = 0;
+	ldnd->targetDeviceId = 0;
+	ldnd->hostLost = false;
+	ldnd->leaveWanted = false;
+	ldnd->queueCount = 0;
+	LeaveCriticalSection(&ldnd->lock);
 	if (!network) {
 		return;
 	}
 	// Only this thread closes `conn`, so it is safe to use it outside the lock.
 	struct LdndResult result;
 	if (conn && LdndIsOpen(conn) && LdndCloseNetwork(conn, network, &result) != LDND_OK) {
-		GBASIORFUTrace(broadcast->rfu, "LDN    could not leave %04X's network: %s%s%s", deviceId, LdndStatusName(result.code),
+		GBASIORFUTrace(ldnd->rfu, "LDN    could not leave %04X's network: %s%s%s", deviceId, LdndStatusName(result.code),
 		               result.message[0] ? ": " : "", result.message);
 	}
-	GBASIORFUTrace(broadcast->rfu, "LDN    left %04X's network%s", deviceId, lost ? " (it was already gone)" : "");
+	GBASIORFUTrace(ldnd->rfu, "LDN    left %04X's network%s", deviceId, lost ? " (it was already gone)" : "");
 }
 
-static bool _joinAbandonedLocked(const struct GBASIORFUBroadcast* broadcast, uint16_t deviceId) {
-	return broadcast->stopping || broadcast->hostLost || (broadcast->connectWanted && broadcast->connectDeviceId != deviceId);
+static bool _joinAbandonedLocked(const struct GBASIORFULdnd* ldnd, uint16_t deviceId) {
+	return ldnd->stopping || ldnd->hostLost || (ldnd->connectWanted && ldnd->connectDeviceId != deviceId);
 }
 
 // A join is only given up on for deinit, a lost host, or the game wanting a different host now. A reset, or the game
 // giving up on waiting, does not stop it: see _piaHandshake.
-static bool _joinAbandoned(struct GBASIORFUBroadcast* broadcast, uint16_t deviceId) {
-	EnterCriticalSection(&broadcast->lock);
-	bool abandoned = _joinAbandonedLocked(broadcast, deviceId);
-	LeaveCriticalSection(&broadcast->lock);
+static bool _joinAbandoned(struct GBASIORFULdnd* ldnd, uint16_t deviceId) {
+	EnterCriticalSection(&ldnd->lock);
+	bool abandoned = _joinAbandonedLocked(ldnd, deviceId);
+	LeaveCriticalSection(&ldnd->lock);
 	return abandoned;
 }
 
 // Answers the game's connect - unless it has moved on to another host since. The driver applies a result to whatever
 // it is connecting to at the time, so a stale one must never reach it; hence the check and the answer under `lock`,
 // which the emulation thread holds to ask for a connect.
-static void _connectResult(struct GBASIORFUBroadcast* broadcast, uint16_t deviceId, bool ok) {
-	EnterCriticalSection(&broadcast->lock);
-	if (broadcast->connectWanted && broadcast->connectDeviceId == deviceId) {
-		broadcast->connectWanted = false;
-		GBASIORFUConnectResult(broadcast->rfu, ok, deviceId, 0);
+static void _connectResult(struct GBASIORFULdnd* ldnd, uint16_t deviceId, bool ok) {
+	EnterCriticalSection(&ldnd->lock);
+	if (ldnd->connectWanted && ldnd->connectDeviceId == deviceId) {
+		ldnd->connectWanted = false;
+		GBASIORFUConnectResult(ldnd->rfu, ok, deviceId, 0);
 	}
-	LeaveCriticalSection(&broadcast->lock);
+	LeaveCriticalSection(&ldnd->lock);
 }
 
-static void _reportRoom(struct GBASIORFUBroadcast* broadcast, const struct LdndNetworkInfo* network) {
+static void _reportRoom(struct GBASIORFULdnd* ldnd, const struct LdndNetworkInfo* network) {
 	struct LdnRfuBeacon beacon;
 	if (!LdnDecodeRfuBeacon(network->applicationData, network->applicationDataLength, &beacon)) {
-		if (broadcast->nonRoomsHeard++ % 20 == 0) {
-			GBASIORFUTrace(broadcast->rfu, "LDN    heard an LDN network (title %016llX, channel %u, app data %u bytes) that is not a Pokemon RFU room",
+		if (ldnd->nonRoomsHeard++ % 20 == 0) {
+			GBASIORFUTrace(ldnd->rfu, "LDN    heard an LDN network (title %016llX, channel %u, app data %u bytes) that is not a Pokemon RFU room",
 			               (unsigned long long) network->localCommunicationId, network->channel, network->applicationDataLength);
 		}
 		return;
 	}
 	uint32_t now = GetTickCount();
-	EnterCriticalSection(&broadcast->lock);
+	EnterCriticalSection(&ldnd->lock);
 	struct Room* room = NULL;
 	for (size_t i = 0; i < kMaxRooms; ++i) {
-		if (broadcast->rooms[i].valid && broadcast->rooms[i].trainerId == beacon.trainerId) {
-			room = &broadcast->rooms[i];
+		if (ldnd->rooms[i].valid && ldnd->rooms[i].trainerId == beacon.trainerId) {
+			room = &ldnd->rooms[i];
 			break;
 		}
-		if (!room || !broadcast->rooms[i].valid || (room->valid && now - broadcast->rooms[i].lastSeen > now - room->lastSeen)) {
-			room = &broadcast->rooms[i];
+		if (!room || !ldnd->rooms[i].valid || (room->valid && now - ldnd->rooms[i].lastSeen > now - room->lastSeen)) {
+			room = &ldnd->rooms[i];
 		}
 	}
 	room->valid = true;
 	room->trainerId = beacon.trainerId;
 	room->lastSeen = now;
 	room->network = *network;
-	LeaveCriticalSection(&broadcast->lock);
+	LeaveCriticalSection(&ldnd->lock);
 
 	uint32_t words[RFU_BROADCAST_WORDS];
 	LdnBeaconToBroadcastWords(&beacon, kAssumedCompat, kTradeActivity, words);
-	GBASIORFUTrace(broadcast->rfu, "LDN    room dev=%04X name=\"%s\" channel %u -> BCAST %08X %08X %08X %08X %08X %08X", beacon.trainerId, beacon.name,
+	GBASIORFUTrace(ldnd->rfu, "LDN    room dev=%04X name=\"%s\" channel %u -> BCAST %08X %08X %08X %08X %08X %08X", beacon.trainerId, beacon.name,
 	               network->channel, words[0], words[1], words[2], words[3], words[4], words[5]);
 	// The host's next free slot is unknown to us (the Switch is not running our RFU state machine); this project
 	// only bridges a single joiner, so 0 (a slot is free) is always correct for now.
-	GBASIORFUBroadcastReceived(broadcast->rfu, beacon.trainerId, 0, words);
+	GBASIORFUBroadcastReceived(ldnd->rfu, beacon.trainerId, 0, words);
 }
 
-static void _scanOnce(struct GBASIORFUBroadcast* broadcast, struct LdndConnection* conn) {
-	uint8_t channel = kChannels[broadcast->scanIndex++ % kChannelCount];
+static void _scanOnce(struct GBASIORFULdnd* ldnd, struct LdndConnection* conn) {
+	uint8_t channel = kChannels[ldnd->scanIndex++ % kChannelCount];
 	struct LdndScanRequest request = {&channel, 1, kScanDwellMs};
 	struct LdndNetworkInfo networks[kMaxScanResults];
 	size_t count;
 	struct LdndResult result;
 	int code = LdndScan(conn, &request, networks, kMaxScanResults, &count, &result);
 	if (code != LDND_OK) {
-		if (code != broadcast->lastScanError) {
-			GBASIORFUTrace(broadcast->rfu, "LDN    ldnd could not scan: %s%s%s", LdndStatusName(code), result.message[0] ? ": " : "", result.message);
+		if (code != ldnd->lastScanError) {
+			GBASIORFUTrace(ldnd->rfu, "LDN    ldnd could not scan: %s%s%s", LdndStatusName(code), result.message[0] ? ": " : "", result.message);
 		}
-		broadcast->lastScanError = code;
+		ldnd->lastScanError = code;
+		_setError(ldnd, true, "ldnd could not scan", &result, code);
 		if (code < 0) {
-			_closeDaemon(broadcast);
+			_closeDaemon(ldnd);
 		}
 		// NO_RADIO while the adapter comes up, for one: its RADIO_STATE event wakes this early.
-		_nap(broadcast, kRetryMs);
+		_nap(ldnd, kRetryMs);
 		return;
 	}
-	if (broadcast->lastScanError) {
-		GBASIORFUTrace(broadcast->rfu, "LDN    searching (channels 1, 6, 11)");
-		broadcast->lastScanError = LDND_OK;
+	if (ldnd->lastScanError) {
+		GBASIORFUTrace(ldnd->rfu, "LDN    searching (channels 1, 6, 11)");
+		ldnd->lastScanError = LDND_OK;
+		_clearError(ldnd, true);
 	}
 	for (size_t i = 0; i < count; ++i) {
-		_reportRoom(broadcast, &networks[i]);
+		_reportRoom(ldnd, &networks[i]);
 	}
 }
 
 // Brings the Pia connection layer (Net/Session/RTT - see ldn-pia-connect.c) up with the host ldnd just joined, then
 // hands the session to the emulation thread. Answers the game if it is still waiting; if it is not (ldnd's join
 // outlasted its patience, maybe with a reset since), the session is kept for the game's next attempt at this host.
-static bool _piaHandshake(struct GBASIORFUBroadcast* broadcast, uint16_t deviceId, const struct LdndNetworkReply* reply) {
+static bool _piaHandshake(struct GBASIORFULdnd* ldnd, uint16_t deviceId, const struct LdndNetworkReply* reply) {
 	const struct LdndNetworkInfo* network = &reply->network;
 	// Addresses straight from ldnd: we are participant `participantIndex`, and the host is always participant 0.
 	const struct LdndParticipant* us = &network->participants[reply->participantIndex];
@@ -526,16 +570,16 @@ static bool _piaHandshake(struct GBASIORFUBroadcast* broadcast, uint16_t deviceI
 	int lastState = piaConn.state;
 	static const char* const kStateNames[] = {"NET", "FINALIZE", "CONNECTED"};
 	while ((int32_t) (deadline - GetTickCount()) > 0 && !LdnPiaConnectIsConnected(&piaConn)) {
-		if (_joinAbandoned(broadcast, deviceId)) {
+		if (_joinAbandoned(ldnd, deviceId)) {
 			free(reliable);
 			return false;
 		}
 		uint8_t datagram[LDN_PIA_MAX_DATAGRAM];
 		uint8_t srcIp[4];
 		size_t datagramLength = sizeof(datagram);
-		while (_popDatagram(broadcast, srcIp, datagram, &datagramLength)) {
+		while (_popDatagram(ldnd, srcIp, datagram, &datagramLength)) {
 			++rawReceived;
-			GBASIORFUTrace(broadcast->rfu, "LDN    pia rx #%u t+%lums from %u.%u.%u.%u len=%zu", rawReceived, GetTickCount() - piaStart, srcIp[0],
+			GBASIORFUTrace(ldnd->rfu, "LDN    pia rx #%u t+%lums from %u.%u.%u.%u len=%zu", rawReceived, GetTickCount() - piaStart, srcIp[0],
 			               srcIp[1], srcIp[2], srcIp[3], datagramLength);
 			uint8_t plain[LDN_PIA_MAX_DATAGRAM];
 			size_t plainLength;
@@ -555,7 +599,7 @@ static bool _piaHandshake(struct GBASIORFUBroadcast* broadcast, uint16_t deviceI
 									snprintf(&hex[h * 2], 3, "%02X", messages[i].payload[h]);
 								}
 								hex[shown * 2] = 0;
-								GBASIORFUTrace(broadcast->rfu, "LDN    pia msg proto=%u len=%zu: %s", messages[i].proto, messages[i].payloadLength, hex);
+								GBASIORFUTrace(ldnd->rfu, "LDN    pia msg proto=%u len=%zu: %s", messages[i].proto, messages[i].payloadLength, hex);
 							}
 							LdnPiaConnectOnMessage(&piaConn, messages[i].proto, messages[i].payload, messages[i].payloadLength);
 						}
@@ -574,7 +618,7 @@ static bool _piaHandshake(struct GBASIORFUBroadcast* broadcast, uint16_t deviceI
 			hostVar = piaConn.hostVar;
 		}
 		if (piaConn.state != lastState) {
-			GBASIORFUTrace(broadcast->rfu, "LDN    Pia session with %04X: %s -> %s (raw=%u decryptFail=%u decompressFail=%u)", deviceId, kStateNames[lastState],
+			GBASIORFUTrace(ldnd->rfu, "LDN    Pia session with %04X: %s -> %s (raw=%u decryptFail=%u decompressFail=%u)", deviceId, kStateNames[lastState],
 			               kStateNames[piaConn.state], rawReceived, decryptFailed, decompressFailed);
 			lastState = piaConn.state;
 		}
@@ -617,8 +661,8 @@ static bool _piaHandshake(struct GBASIORFUBroadcast* broadcast, uint16_t deviceI
 			uint8_t outDatagram[LDN_PIA_CIPHERTEXT_OFFSET + sizeof(tiled)];
 			size_t outDatagramLength;
 			if (LdnPiaEncrypt(&crypto, tiled, tiledLength, us->ip, &header, outDatagram, &outDatagramLength)) {
-				int sendRc = _sendDatagram(broadcast, hostIp, outDatagram, outDatagramLength);
-				GBASIORFUTrace(broadcast->rfu, "LDN    pia tx t+%lums proto=%u dst=%04X len=%zu rc=%d flags=%02X nonce=%llu", GetTickCount() - piaStart,
+				int sendRc = _sendDatagram(ldnd, hostIp, outDatagram, outDatagramLength);
+				GBASIORFUTrace(ldnd->rfu, "LDN    pia tx t+%lums proto=%u dst=%04X len=%zu rc=%d flags=%02X nonce=%llu", GetTickCount() - piaStart,
 				               outMsgs[i].proto, outMsgs[i].dst, outDatagramLength, sendRc, header.flags, (unsigned long long) nonceCounter);
 			}
 		}
@@ -626,86 +670,86 @@ static bool _piaHandshake(struct GBASIORFUBroadcast* broadcast, uint16_t deviceI
 	}
 
 	if (!LdnPiaConnectIsConnected(&piaConn)) {
-		GBASIORFUTrace(broadcast->rfu,
+		GBASIORFUTrace(ldnd->rfu,
 		               "LDN    Pia session with %04X did not reach CONNECTED within %ums (stuck at %s, raw=%u decryptFail=%u decompressFail=%u)", deviceId,
 		               kPiaConnectTimeoutMs, kStateNames[piaConn.state], rawReceived, decryptFailed, decompressFailed);
 		free(reliable);
 		return false;
 	}
 
-	EnterCriticalSection(&broadcast->lock);
-	bool abandoned = _joinAbandonedLocked(broadcast, deviceId) || broadcast->piaActive;
+	EnterCriticalSection(&ldnd->lock);
+	bool abandoned = _joinAbandonedLocked(ldnd, deviceId) || ldnd->piaActive;
 	bool answered = false;
 	if (!abandoned) {
-		broadcast->piaDeviceId = deviceId;
-		broadcast->piaCrypto = crypto;
-		broadcast->piaConn = piaConn;
-		broadcast->piaReliable = reliable;
-		broadcast->piaOpenedStream = false;
-		broadcast->piaConnectId = (uint16_t) (0x1000 | (GetTickCount() & 0x0FFF)); // any nonzero value works
-		broadcast->piaConnectQueued = false;
-		broadcast->piaAccepted = false;
-		broadcast->piaHostTSeen = false;
-		broadcast->piaTs = 0x362D; // the first 'T' is 0x362E: the reference simulator's and the firmware's seed
-		broadcast->piaKSeq = 0;
-		memcpy(broadcast->piaOurIp, us->ip, 4);
-		memcpy(broadcast->piaHostIp, hostIp, 4);
-		broadcast->piaHostVar = hostVar;
-		broadcast->piaNonceCounter = nonceCounter;
-		broadcast->piaPktids = pktids;
-		broadcast->piaTick = tick;
-		LdnTradeShimReset(&broadcast->piaShim);
-		broadcast->piaOutHead = broadcast->piaOutCount = 0;
-		broadcast->piaLastQueuedLength = broadcast->piaIdleLength = 0;
-		broadcast->piaHasIdle = false;
-		broadcast->piaCredits = 0;
-		broadcast->piaActive = true;
-		if (broadcast->connectWanted && broadcast->connectDeviceId == deviceId) {
-			broadcast->connectWanted = false;
-			GBASIORFUConnectResult(broadcast->rfu, true, deviceId, 0);
+		ldnd->piaDeviceId = deviceId;
+		ldnd->piaCrypto = crypto;
+		ldnd->piaConn = piaConn;
+		ldnd->piaReliable = reliable;
+		ldnd->piaOpenedStream = false;
+		ldnd->piaConnectId = (uint16_t) (0x1000 | (GetTickCount() & 0x0FFF)); // any nonzero value works
+		ldnd->piaConnectQueued = false;
+		ldnd->piaAccepted = false;
+		ldnd->piaHostTSeen = false;
+		ldnd->piaTs = 0x362D; // the first 'T' is 0x362E: the reference simulator's and the firmware's seed
+		ldnd->piaKSeq = 0;
+		memcpy(ldnd->piaOurIp, us->ip, 4);
+		memcpy(ldnd->piaHostIp, hostIp, 4);
+		ldnd->piaHostVar = hostVar;
+		ldnd->piaNonceCounter = nonceCounter;
+		ldnd->piaPktids = pktids;
+		ldnd->piaTick = tick;
+		LdnTradeShimReset(&ldnd->piaShim);
+		ldnd->piaOutHead = ldnd->piaOutCount = 0;
+		ldnd->piaLastQueuedLength = ldnd->piaIdleLength = 0;
+		ldnd->piaHasIdle = false;
+		ldnd->piaCredits = 0;
+		ldnd->piaActive = true;
+		if (ldnd->connectWanted && ldnd->connectDeviceId == deviceId) {
+			ldnd->connectWanted = false;
+			GBASIORFUConnectResult(ldnd->rfu, true, deviceId, 0);
 			answered = true;
 		}
 	}
-	LeaveCriticalSection(&broadcast->lock);
+	LeaveCriticalSection(&ldnd->lock);
 	if (abandoned) {
 		free(reliable);
 		return false;
 	}
-	GBASIORFUTrace(broadcast->rfu, "LDN    Pia session with %04X CONNECTED%s", deviceId,
+	GBASIORFUTrace(ldnd->rfu, "LDN    Pia session with %04X CONNECTED%s", deviceId,
 	               answered ? "" : " (the game had stopped waiting for it; kept for its next attempt)");
 	return true;
 }
 
 // Joins the room the game picked: ldnd's join, the Pia channel, then Pia's own handshake. Runs to the end even if the
 // game gives up in the meantime (see _piaHandshake).
-static void _join(struct GBASIORFUBroadcast* broadcast, uint16_t deviceId) {
+static void _join(struct GBASIORFULdnd* ldnd, uint16_t deviceId) {
 	struct Room room;
 	memset(&room, 0, sizeof(room));
-	EnterCriticalSection(&broadcast->lock);
+	EnterCriticalSection(&ldnd->lock);
 	for (size_t i = 0; i < kMaxRooms; ++i) {
-		if (broadcast->rooms[i].valid && broadcast->rooms[i].trainerId == deviceId) {
-			room = broadcast->rooms[i];
+		if (ldnd->rooms[i].valid && ldnd->rooms[i].trainerId == deviceId) {
+			room = ldnd->rooms[i];
 			break;
 		}
 	}
-	LeaveCriticalSection(&broadcast->lock);
+	LeaveCriticalSection(&ldnd->lock);
 	if (!room.valid) {
 		// connect() only asks for rooms it has seen, but a reset since then forgets them.
-		GBASIORFUTrace(broadcast->rfu, "LDN    connect to %04X requested, but no room with that id is known any more", deviceId);
-		_connectResult(broadcast, deviceId, false);
+		GBASIORFUTrace(ldnd->rfu, "LDN    connect to %04X requested, but no room with that id is known any more", deviceId);
+		_connectResult(ldnd, deviceId, false);
 		return;
 	}
-	struct LdndConnection* conn = _daemon(broadcast);
+	struct LdndConnection* conn = _daemon(ldnd);
 	if (!conn) {
-		GBASIORFUTrace(broadcast->rfu, "LDN    connect to %04X requested, but ldnd is not available", deviceId);
-		_connectResult(broadcast, deviceId, false);
+		GBASIORFUTrace(ldnd->rfu, "LDN    connect to %04X requested, but ldnd is not available", deviceId);
+		_connectResult(ldnd, deviceId, false);
 		return;
 	}
 
-	EnterCriticalSection(&broadcast->lock);
-	broadcast->targetDeviceId = deviceId;
-	broadcast->target = room.network;
-	LeaveCriticalSection(&broadcast->lock);
+	EnterCriticalSection(&ldnd->lock);
+	ldnd->targetDeviceId = deviceId;
+	ldnd->target = room.network;
+	LeaveCriticalSection(&ldnd->lock);
 
 	uint64_t ldnDeviceId = 0;
 	LdnRandomBytes((uint8_t*) &ldnDeviceId, sizeof(ldnDeviceId));
@@ -722,7 +766,7 @@ static void _join(struct GBASIORFUBroadcast* broadcast, uint16_t deviceId) {
 		.deviceId = ldnDeviceId,
 		.timeoutMs = kJoinBudgetMs,
 	};
-	GBASIORFUTrace(broadcast->rfu, "LDN    joining %04X on channel %u (%u/%u participants)...", deviceId, room.network.channel, room.network.numParticipants,
+	GBASIORFUTrace(ldnd->rfu, "LDN    joining %04X on channel %u (%u/%u participants)...", deviceId, room.network.channel, room.network.numParticipants,
 	               room.network.maxParticipants);
 	struct LdndNetworkReply reply;
 	struct LdndResult result;
@@ -731,287 +775,379 @@ static void _join(struct GBASIORFUBroadcast* broadcast, uint16_t deviceId) {
 	DWORD elapsed = GetTickCount() - start;
 	if (code != LDND_OK) {
 		if (reply.haveAuthStatus) {
-			GBASIORFUTrace(broadcast->rfu, "LDN    %04X refused the join after %lums (LDN auth status %u)%s%s", deviceId, elapsed, reply.authStatus,
+			GBASIORFUTrace(ldnd->rfu, "LDN    %04X refused the join after %lums (LDN auth status %u)%s%s", deviceId, elapsed, reply.authStatus,
 			               result.message[0] ? ": " : "", result.message);
 		} else {
-			GBASIORFUTrace(broadcast->rfu, "LDN    joining %04X failed after %lums: %s%s%s", deviceId, elapsed, LdndStatusName(code),
+			GBASIORFUTrace(ldnd->rfu, "LDN    joining %04X failed after %lums: %s%s%s", deviceId, elapsed, LdndStatusName(code),
 			               result.message[0] ? ": " : "", result.message);
 		}
-		EnterCriticalSection(&broadcast->lock);
-		broadcast->targetDeviceId = 0;
-		LeaveCriticalSection(&broadcast->lock);
+		char what[48];
+		if (reply.haveAuthStatus) {
+			snprintf(what, sizeof(what), "%04X refused the join (auth status %u)", deviceId, reply.authStatus);
+		} else {
+			snprintf(what, sizeof(what), "Joining %04X failed", deviceId);
+		}
+		_setError(ldnd, false, what, &result, code);
+		EnterCriticalSection(&ldnd->lock);
+		ldnd->targetDeviceId = 0;
+		LeaveCriticalSection(&ldnd->lock);
 		if (code < 0) {
 			// Given up on, or cut off: ldnd may still be in the middle of the join, and hanging up is the only way to
 			// have it let go of whatever it ends up with.
-			_closeDaemon(broadcast);
+			_closeDaemon(ldnd);
 		}
-		_connectResult(broadcast, deviceId, false);
+		_connectResult(ldnd, deviceId, false);
 		return;
 	}
 
 	const struct LdndParticipant* us = &reply.network.participants[reply.participantIndex];
 	const struct LdndParticipant* host = &reply.network.participants[0];
-	GBASIORFUTrace(broadcast->rfu, "LDN    joined %04X after %lums: participant %u at %u.%u.%u.%u, host at %u.%u.%u.%u", deviceId, elapsed,
+	GBASIORFUTrace(ldnd->rfu, "LDN    joined %04X after %lums: participant %u at %u.%u.%u.%u, host at %u.%u.%u.%u", deviceId, elapsed,
 	               reply.participantIndex, us->ip[0], us->ip[1], us->ip[2], us->ip[3], host->ip[0], host->ip[1], host->ip[2], host->ip[3]);
-	EnterCriticalSection(&broadcast->lock);
-	broadcast->network = reply.handle;
-	broadcast->channel = 0;
-	broadcast->target = reply.network;
-	broadcast->hostLost = false;
-	broadcast->leaveWanted = false;
-	broadcast->queueCount = 0;
-	LeaveCriticalSection(&broadcast->lock);
+	EnterCriticalSection(&ldnd->lock);
+	ldnd->network = reply.handle;
+	ldnd->channel = 0;
+	ldnd->target = reply.network;
+	ldnd->hostLost = false;
+	ldnd->leaveWanted = false;
+	ldnd->queueCount = 0;
+	LeaveCriticalSection(&ldnd->lock);
 
 	uint32_t channel;
 	uint16_t port;
 	code = LdndOpenDatagram(conn, reply.handle, LDN_PIA_PORT, &channel, &port, &result);
 	if (code != LDND_OK) {
-		GBASIORFUTrace(broadcast->rfu, "LDN    could not open the Pia channel (UDP %u) on %04X's network: %s%s%s", LDN_PIA_PORT, deviceId, LdndStatusName(code),
+		GBASIORFUTrace(ldnd->rfu, "LDN    could not open the Pia channel (UDP %u) on %04X's network: %s%s%s", LDN_PIA_PORT, deviceId, LdndStatusName(code),
 		               result.message[0] ? ": " : "", result.message);
-		_leaveNetwork(broadcast);
-		_connectResult(broadcast, deviceId, false);
+		_setError(ldnd, false, "Could not open the Pia channel", &result, code);
+		_leaveNetwork(ldnd);
+		_connectResult(ldnd, deviceId, false);
 		return;
 	}
-	EnterCriticalSection(&broadcast->lock);
-	broadcast->channel = channel;
-	LeaveCriticalSection(&broadcast->lock);
+	EnterCriticalSection(&ldnd->lock);
+	ldnd->channel = channel;
+	LeaveCriticalSection(&ldnd->lock);
 
-	if (!_piaHandshake(broadcast, deviceId, &reply)) {
-		_leaveNetwork(broadcast);
-		_connectResult(broadcast, deviceId, false);
+	if (_piaHandshake(ldnd, deviceId, &reply)) {
+		_clearError(ldnd, false);
+	} else {
+		if (!_joinAbandoned(ldnd, deviceId)) {
+			EnterCriticalSection(&ldnd->lock);
+			snprintf(ldnd->lastError, sizeof(ldnd->lastError), "The Pia session with %04X did not come up", deviceId);
+			ldnd->lastErrorFromScan = false;
+			LeaveCriticalSection(&ldnd->lock);
+		}
+		_leaveNetwork(ldnd);
+		_connectResult(ldnd, deviceId, false);
 	}
 }
 
 static DWORD WINAPI _workerProc(LPVOID context) {
-	struct GBASIORFUBroadcast* broadcast = context;
+	struct GBASIORFULdnd* ldnd = context;
 	while (true) {
-		EnterCriticalSection(&broadcast->lock);
-		bool stopping = broadcast->stopping;
-		bool searching = broadcast->searching;
-		bool connectWanted = broadcast->connectWanted;
-		uint16_t deviceId = broadcast->connectDeviceId;
-		uint32_t network = broadcast->network;
-		bool piaActive = broadcast->piaActive;
-		bool leave = network && !piaActive && (broadcast->leaveWanted || broadcast->hostLost);
-		bool reuse = network && piaActive && !broadcast->hostLost && broadcast->targetDeviceId == deviceId;
-		struct LdndConnection* conn = broadcast->conn;
-		LeaveCriticalSection(&broadcast->lock);
+		EnterCriticalSection(&ldnd->lock);
+		bool stopping = ldnd->stopping;
+		bool searching = ldnd->searching;
+		bool connectWanted = ldnd->connectWanted;
+		uint16_t deviceId = ldnd->connectDeviceId;
+		uint32_t network = ldnd->network;
+		bool piaActive = ldnd->piaActive;
+		bool leave = network && !piaActive && (ldnd->leaveWanted || ldnd->hostLost);
+		bool reuse = network && piaActive && !ldnd->hostLost && ldnd->targetDeviceId == deviceId;
+		struct LdndConnection* conn = ldnd->conn;
+		bool probe = ldnd->probeWanted;
+		ldnd->probeWanted = false;
+		LeaveCriticalSection(&ldnd->lock);
 
 		if (stopping) {
 			break;
 		}
 		if (conn && !LdndIsOpen(conn)) {
-			GBASIORFUTrace(broadcast->rfu, "LDN    lost the connection to ldnd");
-			_closeDaemon(broadcast);
+			GBASIORFUTrace(ldnd->rfu, "LDN    lost the connection to ldnd");
+			_closeDaemon(ldnd);
 			continue;
 		}
 		if (leave) {
-			_leaveNetwork(broadcast);
+			_leaveNetwork(ldnd);
 			continue;
 		}
 		if (connectWanted) {
 			if (reuse) {
-				GBASIORFUTrace(broadcast->rfu, "LDN    still joined to %04X from an earlier attempt; reusing that session", deviceId);
-				_connectResult(broadcast, deviceId, true);
+				GBASIORFUTrace(ldnd->rfu, "LDN    still joined to %04X from an earlier attempt; reusing that session", deviceId);
+				_connectResult(ldnd, deviceId, true);
 			} else if (network && piaActive) {
 				// A session whose host just went away: the emulation thread is about to end it.
-				_nap(broadcast, 100);
+				_nap(ldnd, 100);
 			} else {
-				_leaveNetwork(broadcast);
-				_join(broadcast, deviceId);
+				_leaveNetwork(ldnd);
+				_join(ldnd, deviceId);
 			}
+			continue;
+		}
+		if (probe && !conn) {
+			// Opened just to see that ldnd is there; let go of again like any idle connection.
+			_openDaemon(ldnd);
 			continue;
 		}
 		if (searching && !network) {
 			if (!conn) {
-				conn = _openDaemon(broadcast);
+				conn = _openDaemon(ldnd);
 			}
 			if (conn) {
-				_scanOnce(broadcast, conn);
+				_scanOnce(ldnd, conn);
 			} else {
-				_nap(broadcast, kRetryMs);
+				_nap(ldnd, kRetryMs);
 			}
 			continue;
 		}
 		if (network || !conn) {
 			// Joined (the emulation thread drives it), or nothing going on at all; keep an eye on ldnd while it is open.
-			_nap(broadcast, conn ? 1000 : INFINITE);
-		} else if (WaitForSingleObject(broadcast->wake, kIdleReleaseMs) == WAIT_TIMEOUT) {
-			GBASIORFUTrace(broadcast->rfu, "LDN    adapter idle; letting go of ldnd");
-			_closeDaemon(broadcast);
+			_nap(ldnd, conn ? 1000 : INFINITE);
+		} else if (WaitForSingleObject(ldnd->wake, kIdleReleaseMs) == WAIT_TIMEOUT) {
+			GBASIORFUTrace(ldnd->rfu, "LDN    adapter idle; letting go of ldnd");
+			_closeDaemon(ldnd);
 		}
 	}
 	// deinit ended any Pia session before it stopped us.
-	_leaveNetwork(broadcast);
-	_closeDaemon(broadcast);
+	_leaveNetwork(ldnd);
+	_closeDaemon(ldnd);
 	return 0;
 }
 
-static void _ensureWorker(struct GBASIORFUBroadcast* broadcast) {
-	if (!broadcast->worker) {
-		broadcast->worker = CreateThread(NULL, 0, _workerProc, broadcast, 0, NULL);
-		if (!broadcast->worker) {
-			GBASIORFUTrace(broadcast->rfu, "LDN    could not start the ldnd worker thread");
-		}
+// Under `lock`: the frontend's probe may start it from another thread than the emulation thread.
+static void _ensureWorker(struct GBASIORFULdnd* ldnd) {
+	EnterCriticalSection(&ldnd->lock);
+	bool started = ldnd->stopping || ldnd->worker;
+	if (!started) {
+		ldnd->worker = CreateThread(NULL, 0, _workerProc, ldnd, 0, NULL);
+	}
+	bool failed = !started && !ldnd->worker;
+	LeaveCriticalSection(&ldnd->lock);
+	if (failed) {
+		GBASIORFUTrace(ldnd->rfu, "LDN    could not start the ldnd worker thread");
 	}
 }
 
 // Emulation thread: stops driving the Pia session, if there is one; the worker then leaves its network.
-static void _endPiaSession(struct GBASIORFUBroadcast* broadcast) {
-	EnterCriticalSection(&broadcast->lock);
-	bool active = broadcast->piaActive;
+static void _endPiaSession(struct GBASIORFULdnd* ldnd) {
+	EnterCriticalSection(&ldnd->lock);
+	bool active = ldnd->piaActive;
 	struct LdnPiaReliable* reliable = NULL;
 	if (active) {
-		broadcast->piaActive = false;
-		broadcast->leaveWanted = true;
-		reliable = broadcast->piaReliable;
-		broadcast->piaReliable = NULL;
+		ldnd->piaActive = false;
+		ldnd->leaveWanted = true;
+		reliable = ldnd->piaReliable;
+		ldnd->piaReliable = NULL;
 	}
-	LeaveCriticalSection(&broadcast->lock);
+	LeaveCriticalSection(&ldnd->lock);
 	if (!active) {
 		return;
 	}
 	free(reliable);
-	broadcast->lingerFrames = 0;
-	GBASIORFUTrace(broadcast->rfu, "LDN    Pia session with %04X ended", broadcast->piaDeviceId);
-	_wakeWorker(broadcast);
+	ldnd->lingerFrames = 0;
+	GBASIORFUTrace(ldnd->rfu, "LDN    Pia session with %04X ended", ldnd->piaDeviceId);
+	_wakeWorker(ldnd);
 }
 
 // Whether the game has connected over the Pia session (as opposed to one it gave up on before it was ready).
-static bool _sessionUsed(struct GBASIORFUBroadcast* broadcast) {
-	EnterCriticalSection(&broadcast->lock);
-	bool active = broadcast->piaActive;
-	LeaveCriticalSection(&broadcast->lock);
-	return active && broadcast->piaOpenedStream;
+static bool _sessionUsed(struct GBASIORFULdnd* ldnd) {
+	EnterCriticalSection(&ldnd->lock);
+	bool active = ldnd->piaActive;
+	LeaveCriticalSection(&ldnd->lock);
+	return active && ldnd->piaOpenedStream;
+}
+
+// ---- Status (any thread) --------------------------------------------------------------------------------------
+
+static void _status(struct GBASIORFUBackend* backend, struct GBASIORFUBackendStatus* out) {
+	struct GBASIORFULdnd* ldnd = (struct GBASIORFULdnd*) backend;
+	const char* pipe = getenv("LDN_DAEMON");
+	if (!pipe || !pipe[0]) {
+		pipe = "\\\\.\\pipe\\ldnd";
+	}
+	uint32_t now = GetTickCount();
+	EnterCriticalSection(&ldnd->lock);
+	out->hostsHeard = 0;
+	for (size_t i = 0; i < kMaxRooms; ++i) {
+		if (ldnd->rooms[i].valid && now - ldnd->rooms[i].lastSeen < kRoomFreshMs) {
+			++out->hostsHeard;
+		}
+	}
+	if (ldnd->conn) {
+		snprintf(out->device, sizeof(out->device), "ldnd %s (protocol %u)", ldnd->daemonVersion, ldnd->protocolVersion);
+	} else {
+		snprintf(out->device, sizeof(out->device), "ldnd at %s", pipe);
+	}
+	snprintf(out->lastError, sizeof(out->lastError), "%s", ldnd->lastError);
+	if (ldnd->piaActive) {
+		out->link = RFU_BACKEND_JOINED;
+		snprintf(out->detail, sizeof(out->detail), "In a session with %04X", ldnd->piaDeviceId);
+	} else if (ldnd->targetDeviceId) {
+		out->link = RFU_BACKEND_JOINING;
+		if (ldnd->network) {
+			snprintf(out->detail, sizeof(out->detail), "Joined %04X's network; starting the Pia session", ldnd->targetDeviceId);
+		} else {
+			snprintf(out->detail, sizeof(out->detail), "Joining %04X (this can take a minute)", ldnd->targetDeviceId);
+		}
+	} else if (ldnd->conn) {
+		if (ldnd->radioState != LDND_RADIO_READY) {
+			out->link = RFU_BACKEND_STARTING;
+			snprintf(out->detail, sizeof(out->detail), "Radio %s", _radioStateName(ldnd->radioState));
+		} else {
+			out->link = RFU_BACKEND_READY;
+			snprintf(out->detail, sizeof(out->detail), ldnd->searching ? "Radio ready, searching" : "Radio ready");
+		}
+	} else if (ldnd->openFailed) {
+		out->link = RFU_BACKEND_UNAVAILABLE;
+		snprintf(out->detail, sizeof(out->detail), ldnd->searching ? "Not reachable; retrying" : "Not reachable - is ldnd running?");
+	} else if (ldnd->searching || ldnd->connectWanted || ldnd->probeWanted) {
+		out->link = RFU_BACKEND_STARTING;
+		snprintf(out->detail, sizeof(out->detail), "Connecting to ldnd");
+	} else {
+		out->link = RFU_BACKEND_IDLE;
+		snprintf(out->detail, sizeof(out->detail), "Not in use; ldnd is contacted when the game searches");
+	}
+	LeaveCriticalSection(&ldnd->lock);
+}
+
+// The frontend's "Check now": opens ldnd if nothing holds it open, so the status shows whether it is there. The worker
+// lets go of it again after the usual idle time.
+static void _probe(struct GBASIORFUBackend* backend) {
+	struct GBASIORFULdnd* ldnd = (struct GBASIORFULdnd*) backend;
+	EnterCriticalSection(&ldnd->lock);
+	ldnd->probeWanted = true;
+	LeaveCriticalSection(&ldnd->lock);
+	_ensureWorker(ldnd);
+	_wakeWorker(ldnd);
 }
 #endif
 
 static bool _init(struct GBASIORFUBackend* backend, struct GBASIORFU* rfu) {
-	struct GBASIORFUBroadcast* broadcast = (struct GBASIORFUBroadcast*) backend;
-	broadcast->rfu = rfu;
-	// `lock` and `wake` are created in GBASIORFUBroadcastCreate(), not here: the SIO driver's own GBASIORFUInit() calls
+	struct GBASIORFULdnd* ldnd = (struct GBASIORFULdnd*) backend;
+	ldnd->rfu = rfu;
+	// `lock` and `wake` are created in GBASIORFULdndCreate(), not here: the SIO driver's own GBASIORFUInit() calls
 	// backend->reset() - _reset() below, which takes `lock` - BEFORE it calls backend->init() at all.
 	// EnterCriticalSection on a zeroed CRITICAL_SECTION is undefined behavior, and was crashing the process (ntdll.dll
-	// access violation) the instant a ROM loaded and the broadcast backend auto-attached.
-	GBASIORFUTrace(rfu, "LDN    Broadcast backend attached (ldnd is expected to already be running)");
+	// access violation) the instant a ROM loaded and the ldnd backend auto-attached.
+	GBASIORFUTrace(rfu, "LDN    ldnd backend attached (ldnd is expected to already be running)");
 	return true;
 }
 
 static void _deinit(struct GBASIORFUBackend* backend) {
-	struct GBASIORFUBroadcast* broadcast = (struct GBASIORFUBroadcast*) backend;
+	struct GBASIORFULdnd* ldnd = (struct GBASIORFULdnd*) backend;
 #ifdef _WIN32
-	_endPiaSession(broadcast);
-	if (broadcast->worker) {
-		EnterCriticalSection(&broadcast->lock);
-		broadcast->stopping = true;
-		if (broadcast->conn) {
+	_endPiaSession(ldnd);
+	if (ldnd->worker) {
+		EnterCriticalSection(&ldnd->lock);
+		ldnd->stopping = true;
+		if (ldnd->conn) {
 			// A join can keep the worker inside ldnd for a minute; this cuts it short.
-			LdndAbort(broadcast->conn);
+			LdndAbort(ldnd->conn);
 		}
-		LeaveCriticalSection(&broadcast->lock);
-		_wakeWorker(broadcast);
-		WaitForSingleObject(broadcast->worker, INFINITE);
-		CloseHandle(broadcast->worker);
-		broadcast->worker = NULL;
+		LeaveCriticalSection(&ldnd->lock);
+		_wakeWorker(ldnd);
+		WaitForSingleObject(ldnd->worker, INFINITE);
+		CloseHandle(ldnd->worker);
+		ldnd->worker = NULL;
 	}
-	CloseHandle(broadcast->wake);
-	broadcast->wake = NULL;
-	DeleteCriticalSection(&broadcast->lock);
+	CloseHandle(ldnd->wake);
+	ldnd->wake = NULL;
+	DeleteCriticalSection(&ldnd->lock);
 #else
-	(void) broadcast;
+	(void) ldnd;
 #endif
 }
 
 static void _reset(struct GBASIORFUBackend* backend) {
-	struct GBASIORFUBroadcast* broadcast = (struct GBASIORFUBroadcast*) backend;
+	struct GBASIORFULdnd* ldnd = (struct GBASIORFULdnd*) backend;
 #ifdef _WIN32
 	// A session the game connected over is over. One it never got to use - ldnd's join finished after the game stopped
 	// waiting - is kept for its next attempt, as is a join still in progress: the game resets the adapter before it
 	// searches again, and starting over would only run into the same wait.
-	if (_sessionUsed(broadcast)) {
-		_endPiaSession(broadcast);
+	if (_sessionUsed(ldnd)) {
+		_endPiaSession(ldnd);
 	}
-	EnterCriticalSection(&broadcast->lock);
-	broadcast->searching = false;
-	broadcast->connectWanted = false;
-	memset(broadcast->rooms, 0, sizeof(broadcast->rooms));
-	if (broadcast->conn) {
-		LdndScanCancel(broadcast->conn);
+	EnterCriticalSection(&ldnd->lock);
+	ldnd->searching = false;
+	ldnd->connectWanted = false;
+	memset(ldnd->rooms, 0, sizeof(ldnd->rooms));
+	if (ldnd->conn) {
+		LdndScanCancel(ldnd->conn);
 	}
-	LeaveCriticalSection(&broadcast->lock);
-	_wakeWorker(broadcast);
+	LeaveCriticalSection(&ldnd->lock);
+	_wakeWorker(ldnd);
 #else
-	(void) broadcast;
+	(void) ldnd;
 #endif
 }
 
 static void _searchStart(struct GBASIORFUBackend* backend) {
-	struct GBASIORFUBroadcast* broadcast = (struct GBASIORFUBroadcast*) backend;
+	struct GBASIORFULdnd* ldnd = (struct GBASIORFULdnd*) backend;
 #ifdef _WIN32
-	EnterCriticalSection(&broadcast->lock);
-	broadcast->searching = true;
-	LeaveCriticalSection(&broadcast->lock);
-	GBASIORFUTrace(broadcast->rfu, "LDN    searching (channels 1, 6, 11)");
-	_ensureWorker(broadcast);
-	_wakeWorker(broadcast);
+	EnterCriticalSection(&ldnd->lock);
+	ldnd->searching = true;
+	LeaveCriticalSection(&ldnd->lock);
+	GBASIORFUTrace(ldnd->rfu, "LDN    searching (channels 1, 6, 11)");
+	_ensureWorker(ldnd);
+	_wakeWorker(ldnd);
 #else
-	(void) broadcast;
+	(void) ldnd;
 #endif
 }
 
 static void _searchStop(struct GBASIORFUBackend* backend) {
-	struct GBASIORFUBroadcast* broadcast = (struct GBASIORFUBroadcast*) backend;
+	struct GBASIORFULdnd* ldnd = (struct GBASIORFULdnd*) backend;
 #ifdef _WIN32
-	EnterCriticalSection(&broadcast->lock);
-	broadcast->searching = false;
+	EnterCriticalSection(&ldnd->lock);
+	ldnd->searching = false;
 	// The game ends its search just before it connects; a scan still running would hold the join up.
-	if (broadcast->conn) {
-		LdndScanCancel(broadcast->conn);
+	if (ldnd->conn) {
+		LdndScanCancel(ldnd->conn);
 	}
-	LeaveCriticalSection(&broadcast->lock);
+	LeaveCriticalSection(&ldnd->lock);
 #else
-	(void) broadcast;
+	(void) ldnd;
 #endif
 }
 
 // Hands the join to the worker (ldnd's join, then the Pia connection layer); the answer comes back through
 // GBASIORFUConnectResult whenever the worker has one, as the driver requires this call to return immediately.
 static void _connect(struct GBASIORFUBackend* backend, uint16_t deviceId) {
-	struct GBASIORFUBroadcast* broadcast = (struct GBASIORFUBroadcast*) backend;
+	struct GBASIORFULdnd* ldnd = (struct GBASIORFULdnd*) backend;
 #ifdef _WIN32
-	EnterCriticalSection(&broadcast->lock);
-	bool known = broadcast->targetDeviceId == deviceId;
+	EnterCriticalSection(&ldnd->lock);
+	bool known = ldnd->targetDeviceId == deviceId;
 	for (size_t i = 0; i < kMaxRooms && !known; ++i) {
-		known = broadcast->rooms[i].valid && broadcast->rooms[i].trainerId == deviceId;
+		known = ldnd->rooms[i].valid && ldnd->rooms[i].trainerId == deviceId;
 	}
-	bool otherSession = broadcast->piaActive && broadcast->piaDeviceId != deviceId;
-	LeaveCriticalSection(&broadcast->lock);
+	bool otherSession = ldnd->piaActive && ldnd->piaDeviceId != deviceId;
+	LeaveCriticalSection(&ldnd->lock);
 	if (!known) {
-		GBASIORFUTrace(broadcast->rfu, "LDN    connect to %04X requested, but no room with that id has been seen", deviceId);
-		GBASIORFUConnectResult(broadcast->rfu, false, deviceId, 0);
+		GBASIORFUTrace(ldnd->rfu, "LDN    connect to %04X requested, but no room with that id has been seen", deviceId);
+		GBASIORFUConnectResult(ldnd->rfu, false, deviceId, 0);
 		return;
 	}
 	if (otherSession) {
 		// Still joined to a host the game gave up on earlier: ldnd holds one network at a time.
-		_endPiaSession(broadcast);
+		_endPiaSession(ldnd);
 	}
-	_ensureWorker(broadcast);
-	if (!broadcast->worker) {
-		GBASIORFUConnectResult(broadcast->rfu, false, deviceId, 0);
+	_ensureWorker(ldnd);
+	if (!ldnd->worker) {
+		GBASIORFUConnectResult(ldnd->rfu, false, deviceId, 0);
 		return;
 	}
-	EnterCriticalSection(&broadcast->lock);
-	broadcast->connectWanted = true;
-	broadcast->connectDeviceId = deviceId;
-	if (broadcast->conn) {
-		LdndScanCancel(broadcast->conn);
+	EnterCriticalSection(&ldnd->lock);
+	ldnd->connectWanted = true;
+	ldnd->connectDeviceId = deviceId;
+	if (ldnd->conn) {
+		LdndScanCancel(ldnd->conn);
 	}
-	LeaveCriticalSection(&broadcast->lock);
-	GBASIORFUTrace(broadcast->rfu, "LDN    connect to %04X", deviceId);
-	_wakeWorker(broadcast);
+	LeaveCriticalSection(&ldnd->lock);
+	GBASIORFUTrace(ldnd->rfu, "LDN    connect to %04X", deviceId);
+	_wakeWorker(ldnd);
 #else
-	GBASIORFUTrace(broadcast->rfu, "LDN    connect to %04X requested, but joining is not implemented on this platform", deviceId);
-	GBASIORFUConnectResult(broadcast->rfu, false, deviceId, 0);
+	GBASIORFUTrace(ldnd->rfu, "LDN    connect to %04X requested, but joining is not implemented on this platform", deviceId);
+	GBASIORFUConnectResult(ldnd->rfu, false, deviceId, 0);
 #endif
 }
 
@@ -1020,7 +1156,7 @@ static void _connect(struct GBASIORFUBackend* backend, uint16_t deviceId) {
 
 enum { kGbaMarker = 0x57, kGbaC = 0x43, kGbaA = 0x41, kGbaT = 0x54, kGbaK = 0x4B, kGbaD = 0x44 };
 
-static bool _piaSendRaw(struct GBASIORFUBroadcast* broadcast, uint8_t proto, uint16_t dst, uint16_t src, bool establishing, bool footer,
+static bool _piaSendRaw(struct GBASIORFULdnd* ldnd, uint8_t proto, uint16_t dst, uint16_t src, bool establishing, bool footer,
                         bool compress, bool haveMsgFlags, uint8_t msgFlags, const uint8_t* payload, size_t length);
 
 // A queued Reliable frame goes on the wire at once and is only retransmitted (LdnPiaReliablePoll) after the RTO. The
@@ -1028,39 +1164,39 @@ static bool _piaSendRaw(struct GBASIORFUBroadcast* broadcast, uint8_t proto, uin
 // request, each K ack and each 'T' slot - waited a full RTO (200 ms bootstrap, and since a "retransmit" never yields an RTT
 // sample it never shortened) before its first send. GB-Link's firmware (pia_link.c) and the reference simulator
 // (_tx_reliable) both transmit immediately.
-static void _reliableTransmit(struct GBASIORFUBroadcast* broadcast, uint16_t seq, uint8_t flagsA, const uint8_t* payload, size_t length) {
+static void _reliableTransmit(struct GBASIORFULdnd* ldnd, uint16_t seq, uint8_t flagsA, const uint8_t* payload, size_t length) {
 	uint8_t inner[8 + LDN_PIA_RELIABLE_MAX_PAYLOAD];
-	size_t innerLength = LdnPiaBuildReliableFrame(seq, LdnPiaReliableSendLow(broadcast->piaReliable), flagsA, payload, length, inner);
-	_piaSendRaw(broadcast, LDN_PIA_PROTO_RELIABLE, broadcast->piaConn.hostVar, broadcast->piaConn.ourVar, false, true, false, false, 0, inner,
+	size_t innerLength = LdnPiaBuildReliableFrame(seq, LdnPiaReliableSendLow(ldnd->piaReliable), flagsA, payload, length, inner);
+	_piaSendRaw(ldnd, LDN_PIA_PROTO_RELIABLE, ldnd->piaConn.hostVar, ldnd->piaConn.ourVar, false, true, false, false, 0, inner,
 	            innerLength);
 }
 
-static bool _reliableQueue(struct GBASIORFUBroadcast* broadcast, const uint8_t* payload, size_t length) {
+static bool _reliableQueue(struct GBASIORFULdnd* ldnd, const uint8_t* payload, size_t length) {
 	uint16_t seq = 0;
-	bool queued = LdnPiaReliableSend(broadcast->piaReliable, payload, length, GetTickCount(), &seq);
-	GBASIORFUTrace(broadcast->rfu, "PIA    queue reliable seq=%04X %zu bytes type=%c queued=%d", seq, length, length > 1 ? payload[1] : '?', queued);
+	bool queued = LdnPiaReliableSend(ldnd->piaReliable, payload, length, GetTickCount(), &seq);
+	GBASIORFUTrace(ldnd->rfu, "PIA    queue reliable seq=%04X %zu bytes type=%c queued=%d", seq, length, length > 1 ? payload[1] : '?', queued);
 	if (queued) {
-		_reliableTransmit(broadcast, seq, LDN_PIA_FLAGSA_GBA, payload, length);
+		_reliableTransmit(ldnd, seq, LDN_PIA_FLAGSA_GBA, payload, length);
 	}
 	return queued;
 }
 
-static void _gbaSendConnect(struct GBASIORFUBroadcast* broadcast) {
+static void _gbaSendConnect(struct GBASIORFULdnd* ldnd) {
 	// 57 43 02 00 <connect_id:2> - the reference writes the id as the two bytes given (e.g. 67 79).
-	uint8_t frame[6] = {kGbaMarker, kGbaC, 2, 0, (uint8_t) broadcast->piaConnectId, (uint8_t) (broadcast->piaConnectId >> 8)};
-	_reliableQueue(broadcast, frame, sizeof(frame));
-	broadcast->piaConnectQueued = true;
+	uint8_t frame[6] = {kGbaMarker, kGbaC, 2, 0, (uint8_t) ldnd->piaConnectId, (uint8_t) (ldnd->piaConnectId >> 8)};
+	_reliableQueue(ldnd, frame, sizeof(frame));
+	ldnd->piaConnectQueued = true;
 }
 
 // The game's client slot (LLSF header + payload, exactly as it would have sent to a real adapter) -> a child 'T'
 // frame: 57 54 <body_len:u16 LE> | <ts:u32 LE> 00 <slot_len:u8> 00 00 | <slot, zero-padded to a multiple of 4>.
-static void _gbaSendSlot(struct GBASIORFUBroadcast* broadcast, const uint8_t* slot, size_t length) {
+static void _gbaSendSlot(struct GBASIORFULdnd* ldnd, const uint8_t* slot, size_t length) {
 	uint8_t frame[4 + 8 + LDN_PIA_RELIABLE_MAX_PAYLOAD];
 	size_t padded = (length + 3) & ~(size_t) 3;
 	if (length > 255 || 8 + padded > LDN_PIA_RELIABLE_MAX_PAYLOAD) {
 		return;
 	}
-	uint32_t ts = ++broadcast->piaTs;
+	uint32_t ts = ++ldnd->piaTs;
 	size_t bodyLength = 8 + padded;
 	frame[0] = kGbaMarker;
 	frame[1] = kGbaT;
@@ -1076,18 +1212,18 @@ static void _gbaSendSlot(struct GBASIORFUBroadcast* broadcast, const uint8_t* sl
 	frame[11] = 0;
 	memset(&frame[12], 0, padded);
 	memcpy(&frame[12], slot, length);
-	_reliableQueue(broadcast, frame, 4 + bodyLength);
+	_reliableQueue(ldnd, frame, 4 + bodyLength);
 }
 
 // The words of a slot, for the trace: only frames that carry a command (an idle slot is all zero after its header).
-static void _traceSlot(struct GBASIORFUBroadcast* broadcast, const char* what, const uint8_t* slot, size_t length) {
+static void _traceSlot(struct GBASIORFULdnd* ldnd, const char* what, const uint8_t* slot, size_t length) {
 	char hex[3 * 16 + 1];
 	size_t shown = length < 16 ? length : 16;
 	for (size_t i = 0; i < shown; ++i) {
 		snprintf(&hex[i * 3], 4, "%02X ", slot[i]);
 	}
 	hex[shown * 3] = 0;
-	GBASIORFUTrace(broadcast->rfu, "PIA    %s %s", what, hex);
+	GBASIORFUTrace(ldnd->rfu, "PIA    %s %s", what, hex);
 }
 
 static bool _slotIdle(const uint8_t* p, size_t length) {
@@ -1120,126 +1256,126 @@ enum { PIA_OUT_SLOTS = 64, PIA_OUT_BYTES = 128, PIA_OUT_SHED_AT = 3 };
 // Every child slot bound for the host goes through here, the game's own and the shim's injected ones alike: it waits in the
 // queue (see the struct) and is stamped with the next consecutive sequence tag only when it leaves (_gbaPumpChild), so the
 // host, which drops the child after five out-of-sequence commands, sees the tags of exactly the frames it is sent.
-static void _gbaSendChildSlot(struct GBASIORFUBroadcast* broadcast, uint8_t* slot, size_t length) {
+static void _gbaSendChildSlot(struct GBASIORFULdnd* ldnd, uint8_t* slot, size_t length) {
 	if (!length || length > PIA_OUT_BYTES) {
 		return;
 	}
 	if (_slotIdle(slot, length)) {
-		memcpy(broadcast->piaIdle, slot, length);
-		broadcast->piaIdleLength = (uint16_t) length;
-		broadcast->piaHasIdle = true;
+		memcpy(ldnd->piaIdle, slot, length);
+		ldnd->piaIdleLength = (uint16_t) length;
+		ldnd->piaHasIdle = true;
 	}
 	// Only an exact repeat of the frame queued last is collapsed (an RFU-level retransmit of something the peer has not
 	// consumed); anything that differs, its tag included, is a distinct frame.
-	if (broadcast->piaLastQueuedLength == length && !memcmp(broadcast->piaLastQueued, slot, length)) {
+	if (ldnd->piaLastQueuedLength == length && !memcmp(ldnd->piaLastQueued, slot, length)) {
 		return;
 	}
-	if (broadcast->piaOutCount >= PIA_OUT_SLOTS) {
+	if (ldnd->piaOutCount >= PIA_OUT_SLOTS) {
 		// Full: an idle frame only repeats the child's empty state, so it is the one to give up.
 		if (_slotIdle(slot, length)) {
 			return;
 		}
 		int victim = -1;
-		for (int i = broadcast->piaOutCount - 1; i >= 0 && victim < 0; --i) {
-			int at = (broadcast->piaOutHead + i) % PIA_OUT_SLOTS;
-			if (_slotIdle(broadcast->piaOut[at].data, broadcast->piaOut[at].length)) {
+		for (int i = ldnd->piaOutCount - 1; i >= 0 && victim < 0; --i) {
+			int at = (ldnd->piaOutHead + i) % PIA_OUT_SLOTS;
+			if (_slotIdle(ldnd->piaOut[at].data, ldnd->piaOut[at].length)) {
 				victim = i;
 			}
 		}
 		if (victim < 0) {
-			GBASIORFUTrace(broadcast->rfu, "PIA    child queue overflow: frame of %zu bytes dropped", length);
+			GBASIORFUTrace(ldnd->rfu, "PIA    child queue overflow: frame of %zu bytes dropped", length);
 			return;
 		}
-		for (int i = victim; i < broadcast->piaOutCount - 1; ++i) {
-			broadcast->piaOut[(broadcast->piaOutHead + i) % PIA_OUT_SLOTS] =
-			    broadcast->piaOut[(broadcast->piaOutHead + i + 1) % PIA_OUT_SLOTS];
+		for (int i = victim; i < ldnd->piaOutCount - 1; ++i) {
+			ldnd->piaOut[(ldnd->piaOutHead + i) % PIA_OUT_SLOTS] =
+			    ldnd->piaOut[(ldnd->piaOutHead + i + 1) % PIA_OUT_SLOTS];
 		}
-		--broadcast->piaOutCount;
+		--ldnd->piaOutCount;
 	}
-	int at = (broadcast->piaOutHead + broadcast->piaOutCount) % PIA_OUT_SLOTS;
-	memcpy(broadcast->piaOut[at].data, slot, length);
-	broadcast->piaOut[at].length = (uint16_t) length;
-	++broadcast->piaOutCount;
+	int at = (ldnd->piaOutHead + ldnd->piaOutCount) % PIA_OUT_SLOTS;
+	memcpy(ldnd->piaOut[at].data, slot, length);
+	ldnd->piaOut[at].length = (uint16_t) length;
+	++ldnd->piaOutCount;
 	// A backlog is lag on the game's own screen, and superseded frames (idle ones, key reports) in it can be shed, oldest
 	// first and never the newest.
-	for (int i = 0; broadcast->piaOutCount > PIA_OUT_SHED_AT && i < broadcast->piaOutCount - 1;) {
-		int slotAt = (broadcast->piaOutHead + i) % PIA_OUT_SLOTS;
-		if (!_slotSheddable(broadcast->piaOut[slotAt].data, broadcast->piaOut[slotAt].length)) {
+	for (int i = 0; ldnd->piaOutCount > PIA_OUT_SHED_AT && i < ldnd->piaOutCount - 1;) {
+		int slotAt = (ldnd->piaOutHead + i) % PIA_OUT_SLOTS;
+		if (!_slotSheddable(ldnd->piaOut[slotAt].data, ldnd->piaOut[slotAt].length)) {
 			++i;
 			continue;
 		}
-		for (int j = i; j < broadcast->piaOutCount - 1; ++j) {
-			broadcast->piaOut[(broadcast->piaOutHead + j) % PIA_OUT_SLOTS] =
-			    broadcast->piaOut[(broadcast->piaOutHead + j + 1) % PIA_OUT_SLOTS];
+		for (int j = i; j < ldnd->piaOutCount - 1; ++j) {
+			ldnd->piaOut[(ldnd->piaOutHead + j) % PIA_OUT_SLOTS] =
+			    ldnd->piaOut[(ldnd->piaOutHead + j + 1) % PIA_OUT_SLOTS];
 		}
-		--broadcast->piaOutCount;
+		--ldnd->piaOutCount;
 	}
-	memcpy(broadcast->piaLastQueued, slot, length);
-	broadcast->piaLastQueuedLength = (uint16_t) length;
+	memcpy(ldnd->piaLastQueued, slot, length);
+	ldnd->piaLastQueuedLength = (uint16_t) length;
 }
 
 // Once per emulated frame (the Switch's own ~59.7 Hz cadence): the next waiting child frame, or a repeat of the last idle
 // one, goes out against one credit.
-static void _gbaPumpChild(struct GBASIORFUBroadcast* broadcast) {
-	if (broadcast->piaCredits <= 0) {
+static void _gbaPumpChild(struct GBASIORFULdnd* ldnd) {
+	if (ldnd->piaCredits <= 0) {
 		return;
 	}
 	uint8_t slot[PIA_OUT_BYTES];
 	size_t length;
-	if (broadcast->piaOutCount > 0) {
-		int at = broadcast->piaOutHead;
-		broadcast->piaOutHead = (broadcast->piaOutHead + 1) % PIA_OUT_SLOTS;
-		--broadcast->piaOutCount;
-		length = broadcast->piaOut[at].length;
-		memcpy(slot, broadcast->piaOut[at].data, length);
-		LdnTradeShimStamp(&broadcast->piaShim, slot, length);
+	if (ldnd->piaOutCount > 0) {
+		int at = ldnd->piaOutHead;
+		ldnd->piaOutHead = (ldnd->piaOutHead + 1) % PIA_OUT_SLOTS;
+		--ldnd->piaOutCount;
+		length = ldnd->piaOut[at].length;
+		memcpy(slot, ldnd->piaOut[at].data, length);
+		LdnTradeShimStamp(&ldnd->piaShim, slot, length);
 		if (length >= 4 && slot[3]) {
-			_traceSlot(broadcast, "child cmd (stamped):", slot, length);
+			_traceSlot(ldnd, "child cmd (stamped):", slot, length);
 		}
-	} else if (broadcast->piaHasIdle) {
-		length = broadcast->piaIdleLength;
-		memcpy(slot, broadcast->piaIdle, length);
+	} else if (ldnd->piaHasIdle) {
+		length = ldnd->piaIdleLength;
+		memcpy(slot, ldnd->piaIdle, length);
 	} else {
 		return;
 	}
-	--broadcast->piaCredits;
-	_gbaSendSlot(broadcast, slot, length);
+	--ldnd->piaCredits;
+	_gbaSendSlot(ldnd, slot, length);
 }
 
 // 57 4b 0c 00 <k_seq:u32><mid:u32><acked_host_ts:u32>, all LE - one per unique host 'T'.
-static void _gbaSendAck(struct GBASIORFUBroadcast* broadcast, uint32_t ackedTs) {
+static void _gbaSendAck(struct GBASIORFULdnd* ldnd, uint32_t ackedTs) {
 	uint8_t frame[16] = {kGbaMarker, kGbaK, 12, 0};
-	uint32_t kSeq = ++broadcast->piaKSeq;
+	uint32_t kSeq = ++ldnd->piaKSeq;
 	uint32_t mid = 1;
 	for (int i = 0; i < 4; ++i) {
 		frame[4 + i] = (uint8_t) (kSeq >> (8 * i));
 		frame[8 + i] = (uint8_t) (mid >> (8 * i));
 		frame[12 + i] = (uint8_t) (ackedTs >> (8 * i));
 	}
-	_reliableQueue(broadcast, frame, sizeof(frame));
+	_reliableQueue(ldnd, frame, sizeof(frame));
 }
 
 // One delivered (in-order, non-stream-open) Reliable payload: zero or more frames back to back.
-static void _gbaReceive(struct GBASIORFUBroadcast* broadcast, const uint8_t* data, size_t length) {
+static void _gbaReceive(struct GBASIORFULdnd* ldnd, const uint8_t* data, size_t length) {
 	while (length >= 4 && data[0] == kGbaMarker) {
 		uint8_t type = data[1];
 		size_t bodyLength = data[2] | ((size_t) data[3] << 8);
 		if (4 + bodyLength > length) {
-			GBASIORFUTrace(broadcast->rfu, "PIA    gba frame '%c' truncated (%zu of %zu body bytes)", type, length - 4, bodyLength);
+			GBASIORFUTrace(ldnd->rfu, "PIA    gba frame '%c' truncated (%zu of %zu body bytes)", type, length - 4, bodyLength);
 			return;
 		}
 		const uint8_t* body = &data[4];
 		if (type == kGbaA) {
-			broadcast->piaAccepted = true;
-			GBASIORFUTrace(broadcast->rfu, "PIA    host ACCEPTED our connect ('A' body %zu bytes)", bodyLength);
+			ldnd->piaAccepted = true;
+			GBASIORFUTrace(ldnd->rfu, "PIA    host ACCEPTED our connect ('A' body %zu bytes)", bodyLength);
 		} else if (type == kGbaT && bodyLength >= 8) {
 			uint32_t ts = body[0] | (body[1] << 8) | (body[2] << 16) | ((uint32_t) body[3] << 24);
 			size_t slotLength = body[4];
-			GBASIORFUTrace(broadcast->rfu, "PIA    host 'T' ts=%u slot_len=%zu", ts, slotLength);
-			broadcast->piaHostTSeen = true;
-			_gbaSendAck(broadcast, ts);
-			if (broadcast->piaCredits < 2) {
-				++broadcast->piaCredits; // one child frame may follow each host frame
+			GBASIORFUTrace(ldnd->rfu, "PIA    host 'T' ts=%u slot_len=%zu", ts, slotLength);
+			ldnd->piaHostTSeen = true;
+			_gbaSendAck(ldnd, ts);
+			if (ldnd->piaCredits < 2) {
+				++ldnd->piaCredits; // one child frame may follow each host frame
 			}
 			if (slotLength > 1 && 8 + slotLength <= bodyLength) {
 				uint8_t slot[256];
@@ -1250,19 +1386,19 @@ static void _gbaReceive(struct GBASIORFUBroadcast* broadcast, const uint8_t* dat
 					char words[64];
 					snprintf(words, sizeof(words), "%02X%02X%02X%02X%02X%02X | %02X%02X%02X%02X%02X%02X", slot[3], slot[4], slot[5], slot[6], slot[7],
 					         slot[8], slot[17], slot[18], slot[19], slot[20], slot[21], slot[22]);
-					GBASIORFUTrace(broadcast->rfu, "PIA    host cmd hdr=%02X%02X%02X %s", slot[0], slot[1], slot[2], words);
+					GBASIORFUTrace(ldnd->rfu, "PIA    host cmd hdr=%02X%02X%02X %s", slot[0], slot[1], slot[2], words);
 				}
-				size_t preLength = LdnTradeShimHost(&broadcast->piaShim, slot, slotLength, GetTickCount(), pre, sizeof(pre));
+				size_t preLength = LdnTradeShimHost(&ldnd->piaShim, slot, slotLength, GetTickCount(), pre, sizeof(pre));
 				for (size_t at = 0; at + LDN_TRADE_SHIM_HOST_FRAME <= preLength; at += LDN_TRADE_SHIM_HOST_FRAME) {
-					GBASIORFUDataReceived(broadcast->rfu, 0, &pre[at], LDN_TRADE_SHIM_HOST_FRAME);
+					GBASIORFUDataReceived(ldnd->rfu, 0, &pre[at], LDN_TRADE_SHIM_HOST_FRAME);
 				}
-				GBASIORFUDataReceived(broadcast->rfu, 0, slot, slotLength);
+				GBASIORFUDataReceived(ldnd->rfu, 0, slot, slotLength);
 			}
 		} else if (type == kGbaD) {
-			GBASIORFUTrace(broadcast->rfu, "PIA    host sent 'D' (disconnect)");
-			GBASIORFUDisconnected(broadcast->rfu, 0);
+			GBASIORFUTrace(ldnd->rfu, "PIA    host sent 'D' (disconnect)");
+			GBASIORFUDisconnected(ldnd->rfu, 0);
 		} else {
-			GBASIORFUTrace(broadcast->rfu, "PIA    host gba frame '%c' (%zu body bytes) ignored", type, bodyLength);
+			GBASIORFUTrace(ldnd->rfu, "PIA    host gba frame '%c' (%zu body bytes) ignored", type, bodyLength);
 		}
 		data += 4 + bodyLength;
 		length -= 4 + bodyLength;
@@ -1271,7 +1407,7 @@ static void _gbaReceive(struct GBASIORFUBroadcast* broadcast, const uint8_t* dat
 
 // Sends one Pia message as its own datagram (including the live-confirmed dynamic header flags byte), operating on
 // the backend's persistent session fields.
-static bool _piaSendRaw(struct GBASIORFUBroadcast* broadcast, uint8_t proto, uint16_t dst, uint16_t src, bool establishing, bool footer,
+static bool _piaSendRaw(struct GBASIORFULdnd* ldnd, uint8_t proto, uint16_t dst, uint16_t src, bool establishing, bool footer,
                         bool compress, bool haveMsgFlags, uint8_t msgFlags, const uint8_t* payload, size_t length) {
 	uint8_t tiled[kPiaMaxTiled];
 	size_t tiledLength = LdnPiaBuildMessage(proto, payload, length, haveMsgFlags, msgFlags, tiled);
@@ -1288,8 +1424,8 @@ static bool _piaSendRaw(struct GBASIORFUBroadcast* broadcast, uint8_t proto, uin
 		}
 	}
 	if (footer) {
-		tiled[tiledLength++] = (uint8_t) (broadcast->piaHostVar >> 8);
-		tiled[tiledLength++] = (uint8_t) broadcast->piaHostVar;
+		tiled[tiledLength++] = (uint8_t) (ldnd->piaHostVar >> 8);
+		tiled[tiledLength++] = (uint8_t) ldnd->piaHostVar;
 	}
 	size_t beforePad = tiledLength;
 	while (tiledLength % 16 != 0) {
@@ -1300,50 +1436,50 @@ static bool _piaSendRaw(struct GBASIORFUBroadcast* broadcast, uint8_t proto, uin
 	struct LdnPiaHeader header;
 	header.dst = dst;
 	header.src = src;
-	header.pktid = establishing ? 0 : _nextPktid(&broadcast->piaPktids, dst);
+	header.pktid = establishing ? 0 : _nextPktid(&ldnd->piaPktids, dst);
 	header.enc = 0x90;
 	header.flags = (uint8_t) ((pad << 4) | (compressed ? 1 : 0) | (establishing ? 2 : 0));
 	header.footer = footer ? 2 : 0;
-	++broadcast->piaNonceCounter;
+	++ldnd->piaNonceCounter;
 	for (int i = 0; i < 8; ++i) {
-		header.nonce8[i] = (uint8_t) (broadcast->piaNonceCounter >> (8 * (7 - i)));
+		header.nonce8[i] = (uint8_t) (ldnd->piaNonceCounter >> (8 * (7 - i)));
 	}
 
 	uint8_t datagram[LDN_PIA_CIPHERTEXT_OFFSET + sizeof(tiled)];
 	size_t datagramLength;
-	if (!LdnPiaEncrypt(&broadcast->piaCrypto, tiled, tiledLength, broadcast->piaOurIp, &header, datagram, &datagramLength)) {
+	if (!LdnPiaEncrypt(&ldnd->piaCrypto, tiled, tiledLength, ldnd->piaOurIp, &header, datagram, &datagramLength)) {
 		return false;
 	}
-	int rc = _sendDatagram(broadcast, broadcast->piaHostIp, datagram, datagramLength);
-	GBASIORFUTrace(broadcast->rfu, "PIA    tx hdr proto=%u dst=%04X src=%04X pktid=%04X flags=%02X footer=%u len=%zu rc=%d", proto, header.dst, header.src,
+	int rc = _sendDatagram(ldnd, ldnd->piaHostIp, datagram, datagramLength);
+	GBASIORFUTrace(ldnd->rfu, "PIA    tx hdr proto=%u dst=%04X src=%04X pktid=%04X flags=%02X footer=%u len=%zu rc=%d", proto, header.dst, header.src,
 	               header.pktid, header.flags, header.footer, datagramLength, rc);
 	return rc == LDND_OK;
 }
 
-static bool _piaSendMessage(struct GBASIORFUBroadcast* broadcast, const struct LdnPiaOutMessage* msg) {
-	return _piaSendRaw(broadcast, msg->proto, msg->dst, msg->src, msg->establishing, msg->footer, msg->compress, false, 0, msg->payload, msg->length);
+static bool _piaSendMessage(struct GBASIORFULdnd* ldnd, const struct LdnPiaOutMessage* msg) {
+	return _piaSendRaw(ldnd, msg->proto, msg->dst, msg->src, msg->establishing, msg->footer, msg->compress, false, 0, msg->payload, msg->length);
 }
 
 // While the game searches, the host being joined or already joined is shown from what is known of it: the worker
 // cannot scan meanwhile, since that would take the radio from the joined network.
-static void _reportTarget(struct GBASIORFUBroadcast* broadcast) {
-	if (++broadcast->targetReportFrames < kTargetReportFrames) {
+static void _reportTarget(struct GBASIORFULdnd* ldnd) {
+	if (++ldnd->targetReportFrames < kTargetReportFrames) {
 		return;
 	}
-	broadcast->targetReportFrames = 0;
+	ldnd->targetReportFrames = 0;
 	uint8_t appData[LDND_MAX_APPLICATION_DATA];
 	size_t appDataLength = 0;
-	EnterCriticalSection(&broadcast->lock);
-	if (broadcast->searching && broadcast->targetDeviceId) {
-		appDataLength = broadcast->target.applicationDataLength;
-		memcpy(appData, broadcast->target.applicationData, appDataLength);
+	EnterCriticalSection(&ldnd->lock);
+	if (ldnd->searching && ldnd->targetDeviceId) {
+		appDataLength = ldnd->target.applicationDataLength;
+		memcpy(appData, ldnd->target.applicationData, appDataLength);
 	}
-	LeaveCriticalSection(&broadcast->lock);
+	LeaveCriticalSection(&ldnd->lock);
 	struct LdnRfuBeacon beacon;
 	if (appDataLength && LdnDecodeRfuBeacon(appData, appDataLength, &beacon)) {
 		uint32_t words[RFU_BROADCAST_WORDS];
 		LdnBeaconToBroadcastWords(&beacon, kAssumedCompat, kTradeActivity, words);
-		GBASIORFUBroadcastReceived(broadcast->rfu, beacon.trainerId, 0, words);
+		GBASIORFUBroadcastReceived(ldnd->rfu, beacon.trainerId, 0, words);
 	}
 }
 #endif
@@ -1354,75 +1490,75 @@ static void _reportTarget(struct GBASIORFUBroadcast* broadcast) {
 // outbox and LdnPiaReliable's due retransmits/acks and sends them. Called once per emulated frame (~59.7 Hz, matching
 // Pia's own real-hardware-measured cadence - see the project notes) on the emulation thread.
 static void _frame(struct GBASIORFUBackend* backend) {
-	struct GBASIORFUBroadcast* broadcast = (struct GBASIORFUBroadcast*) backend;
+	struct GBASIORFULdnd* ldnd = (struct GBASIORFULdnd*) backend;
 #ifdef _WIN32
-	_reportTarget(broadcast);
-	EnterCriticalSection(&broadcast->lock);
-	bool active = broadcast->piaActive;
-	bool lost = broadcast->hostLost;
-	bool gameWaiting = broadcast->searching || broadcast->connectWanted;
-	LeaveCriticalSection(&broadcast->lock);
+	_reportTarget(ldnd);
+	EnterCriticalSection(&ldnd->lock);
+	bool active = ldnd->piaActive;
+	bool lost = ldnd->hostLost;
+	bool gameWaiting = ldnd->searching || ldnd->connectWanted;
+	LeaveCriticalSection(&ldnd->lock);
 	if (!active) {
 		return;
 	}
 	if (lost) {
-		_endPiaSession(broadcast);
-		GBASIORFUDisconnected(broadcast->rfu, 0);
+		_endPiaSession(ldnd);
+		GBASIORFUDisconnected(ldnd->rfu, 0);
 		return;
 	}
 	// The stream (and with it the emulator-level connect request) only opens once the game is connected: a session it
 	// gave up on waiting for stays idle, and is only kept for a while unless the game comes back to it. The RFU Cable
 	// Wrapper's headless adapter (no SIO attached) never enters the client state, as it drives the backend directly; it
 	// only connects when it wants this session.
-	bool gameConnected = !broadcast->rfu->d.p || broadcast->rfu->state == RFU_STATE_CLIENT;
-	if (!broadcast->piaOpenedStream) {
+	bool gameConnected = !ldnd->rfu->d.p || ldnd->rfu->state == RFU_STATE_CLIENT;
+	if (!ldnd->piaOpenedStream) {
 		if (gameConnected || gameWaiting) {
-			broadcast->lingerFrames = 0;
-		} else if (++broadcast->lingerFrames > kLingerFrames) {
-			GBASIORFUTrace(broadcast->rfu, "LDN    the game never came back for %04X", broadcast->piaDeviceId);
-			_endPiaSession(broadcast);
+			ldnd->lingerFrames = 0;
+		} else if (++ldnd->lingerFrames > kLingerFrames) {
+			GBASIORFUTrace(ldnd->rfu, "LDN    the game never came back for %04X", ldnd->piaDeviceId);
+			_endPiaSession(ldnd);
 			return;
 		}
 	}
-	struct LdnPiaConnect* conn = &broadcast->piaConn;
-	struct LdnPiaReliable* reliable = broadcast->piaReliable;
+	struct LdnPiaConnect* conn = &ldnd->piaConn;
+	struct LdnPiaReliable* reliable = ldnd->piaReliable;
 
 	uint8_t datagram[LDN_PIA_MAX_DATAGRAM];
 	uint8_t srcIp[4];
 	size_t datagramLength = sizeof(datagram);
-	while (_popDatagram(broadcast, srcIp, datagram, &datagramLength)) {
+	while (_popDatagram(ldnd, srcIp, datagram, &datagramLength)) {
 		uint8_t plain[LDN_PIA_MAX_DATAGRAM];
 		size_t plainLength;
-		GBASIORFUTrace(broadcast->rfu, "PIA    raw datagram from %u.%u.%u.%u len=%zu", srcIp[0], srcIp[1], srcIp[2], srcIp[3], datagramLength);
-		if (LdnPiaDecrypt(&broadcast->piaCrypto, datagram, datagramLength, srcIp, plain, &plainLength)) {
+		GBASIORFUTrace(ldnd->rfu, "PIA    raw datagram from %u.%u.%u.%u len=%zu", srcIp[0], srcIp[1], srcIp[2], srcIp[3], datagramLength);
+		if (LdnPiaDecrypt(&ldnd->piaCrypto, datagram, datagramLength, srcIp, plain, &plainLength)) {
 			struct LdnPiaHeader rxHeader;
 			LdnPiaHeaderUnpack(datagram, &rxHeader);
-			GBASIORFUTrace(broadcast->rfu, "PIA    rx hdr dst=%04X src=%04X pktid=%04X enc=%02X flags=%02X footer=%u len=%zu", rxHeader.dst, rxHeader.src,
+			GBASIORFUTrace(ldnd->rfu, "PIA    rx hdr dst=%04X src=%04X pktid=%04X enc=%02X flags=%02X footer=%u len=%zu", rxHeader.dst, rxHeader.src,
 			               rxHeader.pktid, rxHeader.enc, rxHeader.flags, rxHeader.footer, datagramLength);
 			uint8_t decompressed[8192];
 			size_t decompressedLength = sizeof(decompressed);
 			if (!LdnPiaDecompress(plain, plainLength, decompressed, &decompressedLength)) {
-				GBASIORFUTrace(broadcast->rfu, "PIA    DECOMPRESS FAILED (plain %zu bytes)", plainLength);
+				GBASIORFUTrace(ldnd->rfu, "PIA    DECOMPRESS FAILED (plain %zu bytes)", plainLength);
 			} else {
 				struct LdnPiaMessage messages[8];
 				size_t consumed;
 				size_t n = LdnPiaParseMessages(decompressed, decompressedLength, messages, 8, &consumed);
 				if (!n) {
-					GBASIORFUTrace(broadcast->rfu, "PIA    no tiled messages parsed (decompressed %zu bytes)", decompressedLength);
+					GBASIORFUTrace(ldnd->rfu, "PIA    no tiled messages parsed (decompressed %zu bytes)", decompressedLength);
 				}
 				for (size_t i = 0; i < n; ++i) {
-					GBASIORFUTrace(broadcast->rfu, "PIA    rx proto=%u len=%zu first=%02X", messages[i].proto, messages[i].payloadLength,
+					GBASIORFUTrace(ldnd->rfu, "PIA    rx proto=%u len=%zu first=%02X", messages[i].proto, messages[i].payloadLength,
 					               messages[i].payloadLength ? messages[i].payload[0] : 0);
 					if (messages[i].proto == LDN_PIA_PROTO_RELIABLE) {
 						struct LdnPiaReliableFrame frame;
 						if (LdnPiaParseReliableFrame(messages[i].payload, messages[i].payloadLength, &frame)) {
-							GBASIORFUTrace(broadcast->rfu, "PIA    rx reliable flagsA=%02X seq=%04X ack=%04X payload=%zu", frame.flagsA, frame.seq,
+							GBASIORFUTrace(ldnd->rfu, "PIA    rx reliable flagsA=%02X seq=%04X ack=%04X payload=%zu", frame.flagsA, frame.seq,
 							               frame.ack, frame.payloadLength);
 							if (!(frame.flagsA & LDN_PIA_FLAGSA_APP_DATA)) {
 								uint16_t ackId;
 								uint8_t mask[16];
 								if (LdnPiaParseBulkAck(frame.payload, frame.payloadLength, &ackId, mask)) {
-									GBASIORFUTrace(broadcast->rfu, "PIA    host bulk-ack: everything before %04X received; mask %02X%02X%02X%02X (our next seq %04X)", ackId,
+									GBASIORFUTrace(ldnd->rfu, "PIA    host bulk-ack: everything before %04X received; mask %02X%02X%02X%02X (our next seq %04X)", ackId,
 									               mask[0], mask[1], mask[2], mask[3], reliable->outSeq);
 								}
 							}
@@ -1430,14 +1566,14 @@ static void _frame(struct GBASIORFUBackend* backend) {
 							size_t nd = LdnPiaReliableReceive(reliable, &frame, GetTickCount(), delivered, 8);
 							for (size_t d = 0; d < nd; ++d) {
 								bool streamOpen = (delivered[d].flagsA & LDN_PIA_FLAGSA_INITIALIZED) != 0;
-								GBASIORFUTrace(broadcast->rfu, "PIA    deliver seq=%04X flagsA=%02X len=%zu%s", delivered[d].seq, delivered[d].flagsA,
+								GBASIORFUTrace(ldnd->rfu, "PIA    deliver seq=%04X flagsA=%02X len=%zu%s", delivered[d].seq, delivered[d].flagsA,
 								               delivered[d].length, streamOpen ? " (stream-open)" : "");
 								// The host's stream-open frame is NOT bare metadata: it carries the host's emulator connect accept
 								// ('A', 57 41 06 00 <host session id:2> <our connect id:2> 00 00) as its payload. Dropping it as
 								// "not real RFU data" threw away the very frame the whole join waits for. Anything that is a gba
 								// frame (marker 0x57) is delivered; the metadata frames we send ourselves start with 0x4A.
 								if (!streamOpen || (delivered[d].length && delivered[d].payload[0] == kGbaMarker)) {
-									_gbaReceive(broadcast, delivered[d].payload, delivered[d].length);
+									_gbaReceive(ldnd, delivered[d].payload, delivered[d].length);
 								}
 							}
 						}
@@ -1447,84 +1583,84 @@ static void _frame(struct GBASIORFUBackend* backend) {
 				}
 			}
 		} else {
-			GBASIORFUTrace(broadcast->rfu, "PIA    DECRYPT FAILED len=%zu", datagramLength);
+			GBASIORFUTrace(ldnd->rfu, "PIA    DECRYPT FAILED len=%zu", datagramLength);
 		}
 		datagramLength = sizeof(datagram);
 	}
 
 	if (conn->haveHostVar) {
-		broadcast->piaHostVar = conn->hostVar;
+		ldnd->piaHostVar = conn->hostVar;
 	}
-	LdnPiaConnectTick(conn, broadcast->piaTick++);
+	LdnPiaConnectTick(conn, ldnd->piaTick++);
 
-	if (LdnPiaConnectIsConnected(conn) && !broadcast->piaOpenedStream && gameConnected) {
+	if (LdnPiaConnectIsConnected(conn) && !ldnd->piaOpenedStream && gameConnected) {
 		uint16_t seq;
 		LdnPiaReliableOpen(reliable, kLdnPiaMetadataFrame, sizeof(kLdnPiaMetadataFrame), GetTickCount(), &seq);
-		broadcast->piaOpenedStream = true;
-		GBASIORFUTrace(broadcast->rfu, "PIA    opened reliable stream (metadata frame seq=%04X)", seq);
-		_reliableTransmit(broadcast, seq, LDN_PIA_FLAGSA_INIT, kLdnPiaMetadataFrame, sizeof(kLdnPiaMetadataFrame));
-	} else if (broadcast->piaOpenedStream && !broadcast->piaConnectQueued) {
+		ldnd->piaOpenedStream = true;
+		GBASIORFUTrace(ldnd->rfu, "PIA    opened reliable stream (metadata frame seq=%04X)", seq);
+		_reliableTransmit(ldnd, seq, LDN_PIA_FLAGSA_INIT, kLdnPiaMetadataFrame, sizeof(kLdnPiaMetadataFrame));
+	} else if (ldnd->piaOpenedStream && !ldnd->piaConnectQueued) {
 		// The stream opens with the metadata frame alone; the emulator connect request follows on the next frame (as the
 		// reference simulator's _drive_reliable does). The host starts ITS stream only after it sees the connect request
 		// (waiting for its 'T' first, as an earlier experiment here did, deadlocks).
-		_gbaSendConnect(broadcast);
+		_gbaSendConnect(ldnd);
 	}
 
-	if (broadcast->piaAccepted && gameConnected) {
+	if (ldnd->piaAccepted && gameConnected) {
 		DWORD now = GetTickCount();
-		LdnTradeShimPoll(&broadcast->piaShim, now);
+		LdnTradeShimPoll(&ldnd->piaShim, now);
 		uint8_t extra[LDN_TRADE_SHIM_CHILD_FRAME];
-		size_t extraLength = LdnTradeShimInject(&broadcast->piaShim, now, extra, sizeof(extra));
+		size_t extraLength = LdnTradeShimInject(&ldnd->piaShim, now, extra, sizeof(extra));
 		if (extraLength) {
-			_gbaSendChildSlot(broadcast, extra, extraLength);
+			_gbaSendChildSlot(ldnd, extra, extraLength);
 		}
 		uint8_t repeat[LDN_TRADE_SHIM_HOST_FRAME];
-		size_t repeatLength = LdnTradeShimHostInject(&broadcast->piaShim, now, repeat, sizeof(repeat));
+		size_t repeatLength = LdnTradeShimHostInject(&ldnd->piaShim, now, repeat, sizeof(repeat));
 		if (repeatLength) {
-			GBASIORFUDataReceived(broadcast->rfu, 0, repeat, repeatLength);
+			GBASIORFUDataReceived(ldnd->rfu, 0, repeat, repeatLength);
 		}
-		_gbaPumpChild(broadcast);
+		_gbaPumpChild(ldnd);
 	}
 
 	struct LdnPiaOutMessage outMsgs[4];
 	size_t nOut = LdnPiaConnectDrain(conn, outMsgs, 4);
 	for (size_t i = 0; i < nOut; ++i) {
-		_piaSendMessage(broadcast, &outMsgs[i]);
+		_piaSendMessage(ldnd, &outMsgs[i]);
 	}
 
-	if (broadcast->piaOpenedStream) {
+	if (ldnd->piaOpenedStream) {
 		struct LdnPiaReliableEntry due[8];
 		size_t nDue = LdnPiaReliablePoll(reliable, GetTickCount(), due, 8);
 		for (size_t i = 0; i < nDue; ++i) {
 			uint8_t inner[8 + LDN_PIA_RELIABLE_MAX_PAYLOAD];
 			size_t innerLength =
 			    LdnPiaBuildReliableFrame(due[i].seq, LdnPiaReliableSendLow(reliable), due[i].flagsA, due[i].payload, due[i].length, inner);
-			GBASIORFUTrace(broadcast->rfu, "PIA    tx reliable seq=%04X flagsA=%02X payload=%zu", due[i].seq, due[i].flagsA, due[i].length);
+			GBASIORFUTrace(ldnd->rfu, "PIA    tx reliable seq=%04X flagsA=%02X payload=%zu", due[i].seq, due[i].flagsA, due[i].length);
 			// A pure ack frame (flagsA 0) carries the message-level flags byte 0x40, as the firmware's does; data frames
 			// (flagsA 7/15) carry none.
-			_piaSendRaw(broadcast, LDN_PIA_PROTO_RELIABLE, conn->hostVar, conn->ourVar, false, true, false, due[i].flagsA == LDN_PIA_FLAGSA_CTRL,
+			_piaSendRaw(ldnd, LDN_PIA_PROTO_RELIABLE, conn->hostVar, conn->ourVar, false, true, false, due[i].flagsA == LDN_PIA_FLAGSA_CTRL,
 			            0x40, inner, innerLength);
 		}
 	}
 #else
-	(void) broadcast;
+	(void) ldnd;
 #endif
 }
 
 // Payload of a SendData command while connected to a host (client role - see rfu.h): queues it on the Reliable(10)
 // stream. Held back until the host has accepted our emulator-level connect.
 static void _sendData(struct GBASIORFUBackend* backend, const uint8_t* data, size_t length) {
-	struct GBASIORFUBroadcast* broadcast = (struct GBASIORFUBroadcast*) backend;
+	struct GBASIORFULdnd* ldnd = (struct GBASIORFULdnd*) backend;
 #ifdef _WIN32
-	EnterCriticalSection(&broadcast->lock);
-	bool active = broadcast->piaActive;
-	LeaveCriticalSection(&broadcast->lock);
-	if (!active || !broadcast->piaOpenedStream) {
-		GBASIORFUTrace(broadcast->rfu, "PIA    sendData %zu bytes DROPPED (active=%d opened=%d)", length, active, active && broadcast->piaOpenedStream);
+	EnterCriticalSection(&ldnd->lock);
+	bool active = ldnd->piaActive;
+	LeaveCriticalSection(&ldnd->lock);
+	if (!active || !ldnd->piaOpenedStream) {
+		GBASIORFUTrace(ldnd->rfu, "PIA    sendData %zu bytes DROPPED (active=%d opened=%d)", length, active, active && ldnd->piaOpenedStream);
 		return;
 	}
-	if (!broadcast->piaAccepted) {
-		GBASIORFUTrace(broadcast->rfu, "PIA    sendData %zu bytes held back (host has not accepted our connect yet)", length);
+	if (!ldnd->piaAccepted) {
+		GBASIORFUTrace(ldnd->rfu, "PIA    sendData %zu bytes held back (host has not accepted our connect yet)", length);
 		return;
 	}
 	uint8_t slot[RFU_PACKET_MAX];
@@ -1534,18 +1670,18 @@ static void _sendData(struct GBASIORFUBackend* backend, const uint8_t* data, siz
 	}
 	memcpy(slot, data, length);
 	bool forward;
-	size_t replyLength = LdnTradeShimChild(&broadcast->piaShim, slot, length, GetTickCount(), reply, sizeof(reply), &forward);
+	size_t replyLength = LdnTradeShimChild(&ldnd->piaShim, slot, length, GetTickCount(), reply, sizeof(reply), &forward);
 	if (forward) {
-		GBASIORFUTrace(broadcast->rfu, "PIA    sendData %zu bytes -> 'T' frame", length);
-		_gbaSendChildSlot(broadcast, slot, length);
+		GBASIORFUTrace(ldnd->rfu, "PIA    sendData %zu bytes -> 'T' frame", length);
+		_gbaSendChildSlot(ldnd, slot, length);
 	} else {
-		GBASIORFUTrace(broadcast->rfu, "PIA    sendData %zu bytes repeat the previous command frame; not sent again", length);
+		GBASIORFUTrace(ldnd->rfu, "PIA    sendData %zu bytes repeat the previous command frame; not sent again", length);
 	}
 	for (size_t at = 0; at + LDN_TRADE_SHIM_HOST_FRAME <= replyLength; at += LDN_TRADE_SHIM_HOST_FRAME) {
-		GBASIORFUDataReceived(broadcast->rfu, 0, &reply[at], LDN_TRADE_SHIM_HOST_FRAME);
+		GBASIORFUDataReceived(ldnd->rfu, 0, &reply[at], LDN_TRADE_SHIM_HOST_FRAME);
 	}
 #else
-	(void) broadcast;
+	(void) ldnd;
 	(void) data;
 	(void) length;
 #endif
@@ -1554,17 +1690,17 @@ static void _sendData(struct GBASIORFUBackend* backend, const uint8_t* data, siz
 // Client role: leave the host (slotMask is ignored - see rfu.h). A session the game has connected over ends here; a
 // join it is walking away from carries on for its next attempt (see _reset).
 static void _disconnect(struct GBASIORFUBackend* backend, unsigned slotMask) {
-	struct GBASIORFUBroadcast* broadcast = (struct GBASIORFUBroadcast*) backend;
+	struct GBASIORFULdnd* ldnd = (struct GBASIORFULdnd*) backend;
 	(void) slotMask;
 #ifdef _WIN32
-	if (_sessionUsed(broadcast)) {
-		_endPiaSession(broadcast);
+	if (_sessionUsed(ldnd)) {
+		_endPiaSession(ldnd);
 	}
-	EnterCriticalSection(&broadcast->lock);
-	broadcast->connectWanted = false;
-	LeaveCriticalSection(&broadcast->lock);
+	EnterCriticalSection(&ldnd->lock);
+	ldnd->connectWanted = false;
+	LeaveCriticalSection(&ldnd->lock);
 #else
-	(void) broadcast;
+	(void) ldnd;
 #endif
 }
 
@@ -1588,34 +1724,38 @@ static void _noopReply(struct GBASIORFUBackend* backend, uint16_t clientId, bool
 }
 
 static void _shimLog(void* user, const char* message) {
-	struct GBASIORFUBroadcast* broadcast = user;
-	GBASIORFUTrace(broadcast->rfu, "SHIM   %s", message);
+	struct GBASIORFULdnd* ldnd = user;
+	GBASIORFUTrace(ldnd->rfu, "SHIM   %s", message);
 }
 
-struct GBASIORFUBackend* GBASIORFUBroadcastCreate(void) {
-	struct GBASIORFUBroadcast* broadcast = calloc(1, sizeof(*broadcast));
-	if (!broadcast) {
+struct GBASIORFUBackend* GBASIORFULdndCreate(void) {
+	struct GBASIORFULdnd* ldnd = calloc(1, sizeof(*ldnd));
+	if (!ldnd) {
 		return NULL;
 	}
 	// Created here, not in _init(): the SIO driver's GBASIORFUInit() calls backend->reset() (_reset(), which takes
 	// `lock`) BEFORE it ever calls backend->init() - so these must be valid from the moment the backend exists.
 #ifdef _WIN32
-	broadcast->wake = CreateEventA(NULL, FALSE, FALSE, NULL);
-	InitializeCriticalSection(&broadcast->lock);
+	ldnd->wake = CreateEventA(NULL, FALSE, FALSE, NULL);
+	InitializeCriticalSection(&ldnd->lock);
 #endif
-	LdnTradeShimInit(&broadcast->piaShim, _shimLog, broadcast);
-	broadcast->d.init = _init;
-	broadcast->d.deinit = _deinit;
-	broadcast->d.reset = _reset;
-	broadcast->d.frame = _frame;
-	broadcast->d.setBroadcast = _noopBroadcast;
-	broadcast->d.hostStart = _noopDeviceId;
-	broadcast->d.hostStop = _noop;
-	broadcast->d.connectReply = _noopReply;
-	broadcast->d.searchStart = _searchStart;
-	broadcast->d.searchStop = _searchStop;
-	broadcast->d.connect = _connect;
-	broadcast->d.disconnect = _disconnect;
-	broadcast->d.sendData = _sendData;
-	return &broadcast->d;
+	LdnTradeShimInit(&ldnd->piaShim, _shimLog, ldnd);
+	ldnd->d.init = _init;
+	ldnd->d.deinit = _deinit;
+	ldnd->d.reset = _reset;
+	ldnd->d.frame = _frame;
+	ldnd->d.setBroadcast = _noopBroadcast;
+	ldnd->d.hostStart = _noopDeviceId;
+	ldnd->d.hostStop = _noop;
+	ldnd->d.connectReply = _noopReply;
+	ldnd->d.searchStart = _searchStart;
+	ldnd->d.searchStop = _searchStop;
+	ldnd->d.connect = _connect;
+	ldnd->d.disconnect = _disconnect;
+	ldnd->d.sendData = _sendData;
+#ifdef _WIN32
+	ldnd->d.status = _status;
+	ldnd->d.probe = _probe;
+#endif
+	return &ldnd->d;
 }

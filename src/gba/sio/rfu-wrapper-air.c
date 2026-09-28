@@ -1603,8 +1603,23 @@ static void _airDestroy(void* context) {
 	free(air);
 }
 
+struct GBASIORFUBackend* GBASIORFUWrapperAirBackend(struct GBASIORFUWrapper* wrapper) {
+	if (!wrapper->air || wrapper->airDestroy != _airDestroy) {
+		return NULL;
+	}
+	return ((struct Air*) wrapper->air)->backend;
+}
+
 bool GBASIORFUWrapperAttachAir(struct GBASIORFUWrapper* wrapper, const char* backend, const char* tracePath) {
 	struct GBASIORFUBackend* b = GBASIORFUBackendCreate(backend);
+	if (!b) {
+		return false;
+	}
+	return GBASIORFUWrapperAttachAirBackend(wrapper, b, backend, tracePath);
+}
+
+bool GBASIORFUWrapperAttachAirBackend(struct GBASIORFUWrapper* wrapper, struct GBASIORFUBackend* b, const char* name,
+                                      const char* tracePath) {
 	if (!b) {
 		return false;
 	}
@@ -1615,7 +1630,7 @@ bool GBASIORFUWrapperAttachAir(struct GBASIORFUWrapper* wrapper, const char* bac
 	}
 	air->w = wrapper;
 	air->backend = b;
-	snprintf(air->backendName, sizeof(air->backendName), "%s", backend);
+	snprintf(air->backendName, sizeof(air->backendName), "%s", name);
 	GBASIORFUCreate(&air->rfu, b);
 	if (tracePath && tracePath[0]) {
 		GBASIORFUSetTraceFile(&air->rfu, tracePath);
