@@ -55,6 +55,7 @@ if(USE_LDN_BROADCAST)
 		sio/ldn/ldn-pia-reliable.c
 		sio/ldn/ldn-pia-connect.c
 		sio/ldn/rfu-broadcast.c
+		sio/ldn/trade-shim.c
 		../third-party/zstd/zstdlib.c)
 endif()
 

@@ -223,6 +223,79 @@ final class GameView extends SurfaceView implements SurfaceHolder.Callback, Emul
         backgroundScaled = Bitmap.createScaledBitmap(cropped, w, areaH, true);
     }
 
+    // ---- horizontal shell (the areas left and right of the picture when the phone is held sideways) ----
+
+    static final int PANEL_LEFT = 0;
+    static final int PANEL_RIGHT = 1;
+    private final int[] panelColor = {Color.BLACK, Color.BLACK};
+    private final Bitmap[] panelSource = new Bitmap[2];
+    private final Bitmap[] panelScaled = new Bitmap[2];
+    private final int[] panelScaledKey = new int[2];
+    private final Paint panelPaint = new Paint();
+
+    void setPanelColor(int side, int color) {
+        panelColor[side] = 0xFF000000 | color;
+    }
+
+    private volatile boolean panelMirror;
+    private volatile int verticalColor = Color.BLACK; // behind the buttons when the phone is held upright
+
+    void setVerticalColor(int color) {
+        verticalColor = 0xFF000000 | color;
+    }
+
+    void setPanelImage(int side, Bitmap image) {
+        synchronized (decorLock) {
+            panelSource[side] = image;
+            panelScaled[PANEL_LEFT] = null;
+            panelScaled[PANEL_RIGHT] = null;
+        }
+    }
+
+    /** When on, the right panel shows the left panel's picture flipped, instead of a picture of its own. */
+    void setPanelMirror(boolean mirror) {
+        synchronized (decorLock) {
+            panelMirror = mirror;
+            panelScaled[PANEL_RIGHT] = null;
+        }
+    }
+
+    // Fills one side panel with its colour and, if there is one, its picture (centre-cropped to fill the panel exactly).
+    private void drawPanel(Canvas canvas, int side, int left, int right) {
+        int pw = right - left;
+        int ph = getHeight();
+        if (pw <= 0 || ph <= 0) {
+            return;
+        }
+        panelPaint.setColor(panelColor[side]);
+        canvas.drawRect(left, 0, right, ph, panelPaint);
+        Bitmap scaled;
+        synchronized (decorLock) {
+            boolean flip = side == PANEL_RIGHT && panelMirror;
+            Bitmap src = flip ? panelSource[PANEL_LEFT] : panelSource[side];
+            if (src == null) {
+                return;
+            }
+            int key = pw * 31 + ph;
+            if (panelScaled[side] == null || panelScaledKey[side] != key) {
+                float scale = Math.max((float) pw / src.getWidth(), (float) ph / src.getHeight());
+                int cropW = Math.min(src.getWidth(), Math.round(pw / scale));
+                int cropH = Math.min(src.getHeight(), Math.round(ph / scale));
+                android.graphics.Matrix flipMatrix = null;
+                if (flip) {
+                    flipMatrix = new android.graphics.Matrix();
+                    flipMatrix.postScale(-1, 1);
+                }
+                Bitmap cropped = Bitmap.createBitmap(src, (src.getWidth() - cropW) / 2, (src.getHeight() - cropH) / 2, cropW, cropH,
+                        flipMatrix, false);
+                panelScaled[side] = Bitmap.createScaledBitmap(cropped, pw, ph, true);
+                panelScaledKey[side] = key;
+            }
+            scaled = panelScaled[side];
+        }
+        canvas.drawBitmap(scaled, left, 0, null);
+    }
+
     void setOtherKeys(int keys) {
         otherKeys = keys;
         Native.setKeys(touchKeys | otherKeys);
@@ -307,8 +380,12 @@ final class GameView extends SurfaceView implements SurfaceHolder.Callback, Emul
             return;
         }
         try {
-            canvas.drawColor(Color.BLACK);
+            canvas.drawColor(getHeight() > getWidth() ? verticalColor : Color.BLACK);
             computeTarget(width, height);
+            if (getWidth() > getHeight()) {
+                drawPanel(canvas, PANEL_LEFT, 0, Math.round(target.left));
+                drawPanel(canvas, PANEL_RIGHT, Math.round(target.right), getWidth());
+            }
             Bitmap background = backgroundScaled;
             if (background != null && getHeight() > getWidth()) {
                 canvas.drawBitmap(background, 0, target.bottom, null);

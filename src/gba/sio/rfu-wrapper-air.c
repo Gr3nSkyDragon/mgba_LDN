@@ -82,6 +82,8 @@ enum {
 	INITIATE_TIMEOUT = 600,
 	IDLE_TIMEOUT = 90,
 	HOST_SILENT_FRAMES = 600,
+	// After the game has left the room, how long the wireless link is kept for the leader to read our READY_CLOSE_LINK.
+	EXIT_LINGER_FRAMES = 240,
 };
 
 enum {
@@ -246,6 +248,10 @@ struct Air {
 	uint8_t rubyCard[CARD_SIZE];
 	bool exitKeySeen;    // either side pressed EXIT_ROOM since the room was entered
 	bool hostClosedSeen; // the leader already sent READY_CLOSE_LINK
+	unsigned exitLinger; // frames since the game left the room for good: the wireless link stays up until the leader has taken our close
+	bool exitKeyQueued; // the game's EXIT_ROOM key is in the key queue and has not gone to the leader yet
+	bool exitCloseDeferred; // the game's close after EXIT_ROOM is waiting for that key to go first
+	unsigned exitDeferFrames;
 	bool roomClosed;     // held keys only exist in the room; after the first close they must never be sent again
 	bool pendingPurposeStandby;
 	unsigned standbyRoundsSeen;
@@ -721,13 +727,16 @@ static void _childQueuePush(struct Air* air, const uint8_t* data, unsigned size,
 	++air->childCount;
 }
 
-// The LinkPlayer we give the leader: the game's own record presented as a LeafGreen (the leader only checks the two
-// "GameFreak inc." magics and a valid version) with link type 0, which is what an FRLG wireless link uses.
+// The LinkPlayer we give the leader: the game's own record, version included, with link type 0, which is what an FRLG
+// wireless link uses. The leader only checks the two "GameFreak inc." magics, and it draws the other player from the
+// version: FireRed/LeafGreen get the FRLG avatar, anything else the Hoenn (RS Brendan/May) one, so Ruby's real version
+// gives Ruby's trainer its own sprite. (It used to be forced to 0x4005, LeafGreen. Presenting the real version was tested
+// against FireRed and a Switch and does not get in the way of trading or leaving the room.)
 static void _buildLinkPlayerForHost(struct Air* air, uint8_t* out) {
 	memset(out, 0, LP_BUFFER_SIZE);
 	memcpy(out, air->rubyLP, LINK_PLAYER_BLOCK_SIZE);
-	_put16(&out[LP_VERSION_OFFSET], 0x4005);
 	memset(&out[LP_LINK_TYPE_OFFSET], 0, 4);
+	AIRLOG(air, "LinkPlayer for the leader: version %04X", _le16(&out[LP_VERSION_OFFSET]));
 }
 
 // The leader's LinkPlayer as the game expects to find it: the same record with the game's own link type, because the
@@ -991,6 +1000,14 @@ static void _flushPendingStandby(struct Air* air) {
 
 static void _gameClose(struct Air* air) {
 	if (air->exitKeySeen && !air->cancelPending && !air->roomClosed) {
+		if (air->exitKeyQueued && air->keysActive) {
+			// The leader leaves the room only once every player's EXIT_ROOM has reached it, so ours goes first; the keys stop
+			// being sent when the close starts.
+			AIRLOG(air, "game close (5FFF) after EXIT_ROOM: the game's exit key has not reached the leader yet, sending it first");
+			air->exitCloseDeferred = true;
+			air->exitDeferFrames = 0;
+			return;
+		}
 		// Leaving the room: the leader does not standby, it closes. Answer with a real READY_CLOSE_LINK and end the link.
 		AIRLOG(air, "game close (5FFF) after EXIT_ROOM: closing the wireless link");
 		air->keysActive = false;
@@ -1003,6 +1020,7 @@ static void _gameClose(struct Air* air) {
 		return;
 	}
 	AIRLOG(air, "game close (5FFF) #%u: wireless standby rounds, then the cable link is answered", air->closeCount + 1);
+	air->exitKeyQueued = false;
 	air->keysActive = false;
 	air->roomClosed = true;
 	air->purpose = PURPOSE_GAME_CLOSE;
@@ -1023,12 +1041,24 @@ static void _gameClose(struct Air* air) {
 }
 
 // A round we started has passed on the wireless side.
-static void _exitClosePassed(struct Air* air) {
-	AIRLOG(air, "room exit complete: answering the game, ending the wireless link");
-	_cablePushCmd(air, LINKCMD_READY_CLOSE_LINK, 0, 0);
-	air->backend->disconnect(air->backend, 0);
+static void _exitLingerFinish(struct Air* air, const char* why, bool disconnect) {
+	AIRLOG(air, "wireless link ended: %s", why);
+	air->exitLinger = 0;
+	if (disconnect) {
+		air->backend->disconnect(air->backend, 0);
+	}
 	_airResetLink(air);
 	air->link = -1;
+}
+
+static void _exitClosePassed(struct Air* air) {
+	// The game can go now, but the wireless link cannot: the leader's game reads our client frames one per frame, in order,
+	// and a disconnect throws away whatever it has not read yet, our READY_CLOSE_LINK included. Then it waits for a ready
+	// message that never comes and never leaves its room (a black screen). So the link stays up, still answering the leader,
+	// until the leader's echo of our close shows it was read, it disconnects us, or a few seconds pass.
+	AIRLOG(air, "room exit complete: answering the game; the wireless link stays up until the leader has taken our close");
+	_cablePushCmd(air, LINKCMD_READY_CLOSE_LINK, 0, 0);
+	air->exitLinger = 1;
 	air->haveRubyLP = false; // a new cable club visit starts a new search
 	air->closeCount = 0;
 	air->roomClosed = false;
@@ -1125,6 +1155,9 @@ static void _airResetLink(struct Air* air) {
 	memset(&air->rubyKeys, 0, sizeof(air->rubyKeys));
 	memset(&air->hostKeys, 0, sizeof(air->hostKeys));
 	air->lastHostKeyCount = -1;
+	air->exitKeyQueued = false;
+	air->exitCloseDeferred = false;
+	air->exitDeferFrames = 0;
 	air->purpose = PURPOSE_NONE;
 	air->hostFrames = 0;
 	air->childFrames = 0;
@@ -1186,7 +1219,9 @@ static void _drainEvents(struct Air* air) {
 			break;
 		case RFU_EVENT_DISCONNECTED:
 			AIRLOG(air, "disconnected from the leader");
-			if (air->link == AIR_NI || air->link == AIR_UNI) {
+			if (air->exitLinger) {
+				_exitLingerFinish(air, "the leader disconnected us", false); // the game has left: no new search
+			} else if (air->link == AIR_NI || air->link == AIR_UNI) {
 				_airResetLink(air);
 				_startSearch(air);
 			}
@@ -1246,8 +1281,18 @@ static void _chooseSlot(struct Air* air, uint16_t words[7]) {
 		}
 	}
 	if (air->keysActive) {
+		uint8_t code = _keyPop(&air->rubyKeys);
 		words[0] = RFUCMD_SEND_HELD_KEYS;
-		words[1] = (air->keyCount++ << 8) | _keyPop(&air->rubyKeys);
+		words[1] = (air->keyCount++ << 8) | code;
+		if (code == LINK_KEY_CODE_EXIT_ROOM) {
+			AIRLOG(air, "the game's EXIT_ROOM key sent to the leader");
+			air->exitKeyQueued = false;
+			if (air->exitCloseDeferred) {
+				// The game closed its link while this key was still waiting; the close can go now.
+				air->exitCloseDeferred = false;
+				_gameClose(air);
+			}
+		}
 	}
 }
 
@@ -1386,6 +1431,11 @@ static void _handleHostFrame(struct Air* air, const uint8_t* data, unsigned leng
 		uint16_t words1[7];
 		_slotToWords(slot1, words1);
 		_feedRecv(&air->rx1, words1, slot1, &completed);
+		if (air->exitLinger && (words1[0] & RFUCMD_MASK) == RFUCMD_READY_CLOSE_LINK) {
+			// The leader's game has read our close (it echoes what it reads): now the link can go.
+			_exitLingerFinish(air, "the leader took our close", true);
+			return;
+		}
 	}
 	if (_barrierObserve(air, sawBarrier)) {
 		_roundPassed(air);
@@ -1408,6 +1458,18 @@ static void _airFrame(void* context) {
 		_startSearch(air);
 	}
 	_drainEvents(air);
+	if (air->exitCloseDeferred && ++air->exitDeferFrames > 120) {
+		AIRLOG(air, "the game's exit key never got out: closing the link anyway");
+		air->exitCloseDeferred = false;
+		air->exitKeyQueued = false;
+		_gameClose(air);
+	}
+	if (air->exitLinger && air->exitLinger % 60 == 0) {
+		air->bar.burstN = 0; // say our close again: the leader reads one client frame per frame, in order
+	}
+	if (air->exitLinger && ++air->exitLinger > EXIT_LINGER_FRAMES) {
+		_exitLingerFinish(air, "the leader never took our close, giving up", true);
+	}
 	// A joining child speaks first: after the connect its game sends the NI_START of its game data on its own, and the
 	// leader answers frame by frame. A leader that has nothing to send until it hears from us (a Switch behind the ESP32
 	// board sends parent slots only once it has our connect and game data) would otherwise be waited for forever, so
@@ -1472,9 +1534,16 @@ static void _peerGameCommand(void* context, const uint16_t command[CMD_WORDS]) {
 		}
 		break;
 	case LINKCMD_SEND_HELD_KEYS:
-		_keyPush(&air->rubyKeys, command[1] & 0xFF);
+		// Only real keys are queued. The game reports "no key" with every cable packet, and queuing those as well made a
+		// standing backlog (one entry in, one out per frame, and none out while the wire carried a block or a barrier):
+		// an EXIT_ROOM behind it went out up to a second late, or was stranded when the game closed the link first. With
+		// nothing queued the leader gets "no key" anyway.
+		if ((command[1] & 0xFF) != LINK_KEY_CODE_EMPTY) {
+			_keyPush(&air->rubyKeys, command[1] & 0xFF);
+		}
 		if ((command[1] & 0xFF) == LINK_KEY_CODE_EXIT_ROOM) {
 			air->exitKeySeen = true;
+			air->exitKeyQueued = true;
 		}
 		break;
 	case LINKCMD_READY_EXIT_STANDBY:

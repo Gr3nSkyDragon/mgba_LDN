@@ -40,6 +40,8 @@ public class MainActivity extends Activity implements UsbLink.Logger {
     private static final int REQUEST_SAVE = 2;
     private static final int REQUEST_EXPORT = 3;
     private static final int REQUEST_BACKGROUND = 4;
+    private static final int REQUEST_PANEL_LEFT = 5;
+    private static final int REQUEST_PANEL_RIGHT = 6;
     private static final String ACTION_PERMISSION = "io.mgbaldn.gba.USB_PERMISSION";
     private static final int[] DEFAULT_COLORS = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
     private static final int ADAPTER_OFF = 0;
@@ -172,6 +174,11 @@ public class MainActivity extends Activity implements UsbLink.Logger {
         applyPostProcess();
         applyFrameCounter();
         gameView.setColors(colors);
+        for (int side = 0; side < 2; ++side) {
+            gameView.setPanelColor(side, prefs.getInt("panelColor" + side, 0x000000));
+        }
+        gameView.setPanelMirror(prefs.getBoolean("panelMirror", false));
+        gameView.setVerticalColor(prefs.getInt("verticalColor", 0x000000));
         loadBackground();
         String last = prefs.getString("rom", null);
         if (last != null && new File(last).exists()) {
@@ -443,9 +450,9 @@ public class MainActivity extends Activity implements UsbLink.Logger {
     // ---- display settings ----
 
     private static final String[] PRESET_NAMES = {"White (default)", "Black", "GBA Indigo", "GBC Teal", "GBC Berry", "GBC Dandelion",
-            "GBC Kiwi", "GBC Grape"};
+            "GBC Kiwi", "GBC Grape", "Miku"};
     private static final int[] PRESET_COLORS = {0xFFFFFFFF, 0xFF000000, 0xFF6A4FC9, 0xFF2BB5B0, 0xFFC2417D, 0xFFF2C230, 0xFF9BD34B,
-            0xFF8A4FB3};
+            0xFF8A4FB3, 0xFF00B2A9};
 
     private int[] loadColors() {
         String saved = prefs.getString("colors", null);
@@ -511,6 +518,140 @@ public class MainActivity extends Activity implements UsbLink.Logger {
     }
 
     // The counter sits in the top right corner, to the left of the menu button (which is measured once it has been laid out).
+    // The vertical panel: the colour behind the buttons (and behind the vertical picture) when the phone is held upright.
+    private void chooseVerticalPanelColor() {
+        String[] items = new String[PRESET_NAMES.length + 1];
+        System.arraycopy(PRESET_NAMES, 0, items, 0, PRESET_NAMES.length);
+        items[0] = "White";
+        items[1] = "Black (default)";
+        items[PRESET_NAMES.length] = "Custom (hex)";
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert).setTitle("Vertical panel")
+                .setItems(items, (dialog, which) -> {
+                    if (which < PRESET_NAMES.length) {
+                        setVerticalPanelColor(PRESET_COLORS[which]);
+                        return;
+                    }
+                    android.widget.EditText input = new android.widget.EditText(this);
+                    input.setText(hex(prefs.getInt("verticalColor", 0x000000)));
+                    input.setSingleLine(true);
+                    input.setSelectAllOnFocus(true);
+                    new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                            .setTitle("Vertical panel color (hex, like #FF8800)").setView(input)
+                            .setPositiveButton("OK", (d, w) -> {
+                                String text = input.getText().toString().trim();
+                                if (text.startsWith("#")) {
+                                    text = text.substring(1);
+                                }
+                                try {
+                                    if (text.length() != 6) {
+                                        throw new NumberFormatException();
+                                    }
+                                    setVerticalPanelColor(Integer.parseInt(text, 16));
+                                } catch (NumberFormatException e) {
+                                    toast("Use six hex digits, like FF8800");
+                                }
+                            }).setNegativeButton("Cancel", null).show();
+                }).show();
+    }
+
+    private void setVerticalPanelColor(int color) {
+        prefs.edit().putInt("verticalColor", color & 0xFFFFFF).apply();
+        gameView.setVerticalColor(color);
+    }
+
+    // ---- horizontal shell: the two panels beside the picture when the phone is held sideways ----
+
+    private static final String[] PANEL_NAMES = {"Left panel", "Right panel"};
+
+    private int panelColorOf(int side) {
+        return 0xFF000000 | prefs.getInt("panelColor" + side, 0x000000);
+    }
+
+    private void setPanelColor(int side, int color) {
+        prefs.edit().putInt("panelColor" + side, color & 0xFFFFFF).apply();
+        gameView.setPanelColor(side, color);
+    }
+
+    // Presets set both panels; "Set left/right panel colors" edits each one, like the button colors.
+    private void choosePanelColors(android.widget.Button opener) {
+        String[] items = new String[PRESET_NAMES.length + 1];
+        System.arraycopy(PRESET_NAMES, 0, items, 0, PRESET_NAMES.length);
+        items[0] = "White";
+        items[1] = "Black (default)";
+        items[PRESET_NAMES.length] = "Set left/right panel colors";
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert).setTitle("Horizontal panels")
+                .setItems(items, (dialog, which) -> {
+                    if (which < PRESET_NAMES.length) {
+                        setPanelColor(GameView.PANEL_LEFT, PRESET_COLORS[which]);
+                        setPanelColor(GameView.PANEL_RIGHT, PRESET_COLORS[which]);
+                    } else {
+                        chooseEachPanel();
+                    }
+                }).show();
+    }
+
+    private void chooseEachPanel() {
+        String[] items = new String[2];
+        for (int side = 0; side < 2; ++side) {
+            items[side] = PANEL_NAMES[side] + "   " + hex(panelColorOf(side));
+        }
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert).setTitle("Choose a panel")
+                .setItems(items, (dialog, which) -> editPanelColor(which)).setNegativeButton("Back", null).show();
+    }
+
+    private void editPanelColor(int side) {
+        android.widget.EditText input = new android.widget.EditText(this);
+        input.setText(hex(panelColorOf(side)));
+        input.setSingleLine(true);
+        input.setSelectAllOnFocus(true);
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle(PANEL_NAMES[side] + " color (hex, like #FF8800)").setView(input)
+                .setPositiveButton("OK", (d, w) -> {
+                    String text = input.getText().toString().trim();
+                    if (text.startsWith("#")) {
+                        text = text.substring(1);
+                    }
+                    try {
+                        if (text.length() != 6) {
+                            throw new NumberFormatException();
+                        }
+                        setPanelColor(side, Integer.parseInt(text, 16));
+                    } catch (NumberFormatException e) {
+                        toast("Use six hex digits, like FF8800");
+                    }
+                    chooseEachPanel();
+                }).setNegativeButton("Cancel", (d, w) -> chooseEachPanel()).show();
+    }
+
+    // The picture buttons: one per panel, or just a "Default panel picture" (the left picture) when the right panel mirrors it.
+    private void fillPanelPictures(android.widget.LinearLayout container, boolean mirror) {
+        container.removeAllViews();
+        int panels = mirror ? 1 : 2;
+        for (int side = 0; side < panels; ++side) {
+            final int panel = side;
+            String label = mirror ? "Default panel picture" : PANEL_NAMES[side] + " picture";
+            android.widget.LinearLayout row = new android.widget.LinearLayout(this);
+            android.widget.Button pick = new android.widget.Button(this);
+            pick.setText(label);
+            pick.setOnClickListener(v -> {
+                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                intent.setType("image/*");
+                startActivityForResult(intent, panel == GameView.PANEL_LEFT ? REQUEST_PANEL_LEFT : REQUEST_PANEL_RIGHT);
+            });
+            android.widget.Button clear = new android.widget.Button(this);
+            clear.setText("Remove");
+            clear.setOnClickListener(v -> {
+                panelFile(panel).delete();
+                gameView.setPanelImage(panel, null);
+                toast(label + " removed");
+            });
+            row.addView(pick, new android.widget.LinearLayout.LayoutParams(0, -2, 2f));
+            row.addView(clear, new android.widget.LinearLayout.LayoutParams(0, -2, 1f));
+            container.addView(row);
+        }
+    }
+
     private void applyPostProcess() { // (only the frame blending is native now)
         Native.setFrameBlending(frameBlend);
     }
@@ -557,12 +698,12 @@ public class MainActivity extends Activity implements UsbLink.Logger {
             gameView.setColorMode(colorMode, value);
             prefs.edit().putInt("saturation", value).apply();
         });
-        column.addView(checkBox("On-screen controls", controlsShown, (v, on) -> {
+        column.addView(checkBox("On-screen buttons", controlsShown, (v, on) -> {
             controlsShown = on;
             gameView.setControlsVisible(on);
             prefs.edit().putBoolean("controls", on).apply();
         }));
-        addSlider(column, "Control opacity", 5, 100, controlsOpacity, value -> {
+        addSlider(column, "Button opacity", 5, 100, controlsOpacity, value -> {
             controlsOpacity = value;
             gameView.setControlsOpacity(value);
             prefs.edit().putInt("opacity", value).apply();
@@ -571,9 +712,13 @@ public class MainActivity extends Activity implements UsbLink.Logger {
         colorsButton.setText("Button colors");
         colorsButton.setOnClickListener(v -> chooseColors());
         column.addView(colorsButton);
+        android.widget.Button verticalPanelButton = new android.widget.Button(this);
+        verticalPanelButton.setText("Vertical panel");
+        verticalPanelButton.setOnClickListener(v -> chooseVerticalPanelColor());
+        column.addView(verticalPanelButton);
         android.widget.LinearLayout backgroundRow = new android.widget.LinearLayout(this);
         android.widget.Button pick = new android.widget.Button(this);
-        pick.setText("Background photo");
+        pick.setText("Vertical picture");
         pick.setOnClickListener(v -> {
             Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
             intent.addCategory(Intent.CATEGORY_OPENABLE);
@@ -590,10 +735,25 @@ public class MainActivity extends Activity implements UsbLink.Logger {
         backgroundRow.addView(pick, new android.widget.LinearLayout.LayoutParams(0, -2, 2f));
         backgroundRow.addView(clear, new android.widget.LinearLayout.LayoutParams(0, -2, 1f));
         column.addView(backgroundRow);
-        TextView hint = new TextView(this);
-        hint.setText("The photo fills the area behind the buttons when the phone is held upright.");
-        hint.setTextSize(12);
-        column.addView(hint);
+        TextView shell = new TextView(this);
+        shell.setText("Horizontal shell");
+        shell.setTextSize(14);
+        shell.setPadding(0, 24, 0, 0);
+        column.addView(shell);
+        android.widget.Button panelsButton = new android.widget.Button(this);
+        panelsButton.setText("Horizontal panels");
+        panelsButton.setOnClickListener(v -> choosePanelColors(panelsButton));
+        column.addView(panelsButton);
+        android.widget.LinearLayout pictures = new android.widget.LinearLayout(this);
+        pictures.setOrientation(android.widget.LinearLayout.VERTICAL);
+        boolean mirror = prefs.getBoolean("panelMirror", false);
+        column.addView(checkBox("Mirror default panel picture", mirror, (v, on) -> {
+            prefs.edit().putBoolean("panelMirror", on).apply();
+            gameView.setPanelMirror(on);
+            fillPanelPictures(pictures, on);
+        }));
+        fillPanelPictures(pictures, mirror);
+        column.addView(pictures);
         column.addView(checkBox("Frame blending", frameBlend, (v, on) -> {
             frameBlend = on;
             prefs.edit().putBoolean("frameBlend", on).apply();
@@ -693,6 +853,19 @@ public class MainActivity extends Activity implements UsbLink.Logger {
     // The background photo is downsized and kept in the app's own storage (background.png), so it survives the original
     // being moved or deleted.
     private void importBackground(Uri uri) {
+        importPicture(uri, "background.png", "Background set", gameView::setBackgroundImage);
+    }
+
+    private void importPanel(int side, Uri uri) {
+        importPicture(uri, panelFile(side).getName(), (side == GameView.PANEL_LEFT ? "Left" : "Right") + " panel picture set",
+                image -> gameView.setPanelImage(side, image));
+    }
+
+    private File panelFile(int side) {
+        return new File(getFilesDir(), side == GameView.PANEL_LEFT ? "panel-left.png" : "panel-right.png");
+    }
+
+    private void importPicture(Uri uri, String fileName, String doneMessage, java.util.function.Consumer<Bitmap> apply) {
         new Thread(() -> {
             try {
                 BitmapFactory.Options bounds = new BitmapFactory.Options();
@@ -714,29 +887,36 @@ public class MainActivity extends Activity implements UsbLink.Logger {
                     toast("Couldn't read that picture");
                     return;
                 }
-                try (OutputStream out = new FileOutputStream(new File(getFilesDir(), "background.png"))) {
+                try (OutputStream out = new FileOutputStream(new File(getFilesDir(), fileName))) {
                     image.compress(Bitmap.CompressFormat.PNG, 100, out);
                 }
                 Bitmap chosen = image;
-                runOnUiThread(() -> gameView.setBackgroundImage(chosen));
-                toast("Background set");
+                runOnUiThread(() -> apply.accept(chosen));
+                toast(doneMessage);
             } catch (Exception e) {
                 toast("Couldn't use that picture: " + e.getMessage());
             }
-        }, "background").start();
+        }, "picture-import").start();
     }
 
     private void loadBackground() {
-        File file = new File(getFilesDir(), "background.png");
+        loadPicture(new File(getFilesDir(), "background.png"), gameView::setBackgroundImage);
+        for (int side = 0; side < 2; ++side) {
+            final int panel = side;
+            loadPicture(panelFile(panel), image -> gameView.setPanelImage(panel, image));
+        }
+    }
+
+    private void loadPicture(File file, java.util.function.Consumer<Bitmap> apply) {
         if (!file.exists()) {
             return;
         }
         new Thread(() -> {
             Bitmap image = BitmapFactory.decodeFile(file.getAbsolutePath());
             if (image != null) {
-                runOnUiThread(() -> gameView.setBackgroundImage(image));
+                runOnUiThread(() -> apply.accept(image));
             }
-        }, "background-load").start();
+        }, "picture-load").start();
     }
 
     private void chooseAdapter() {
@@ -762,7 +942,9 @@ public class MainActivity extends Activity implements UsbLink.Logger {
         AlertDialog.Builder builder = new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
                 .setTitle("mGBA LDN for Android")
                 .setMessage("mGBA with Wireless Adapter support, for trading Generation 3 games with a Nintendo Switch through "
-                        + "an ESP32 using GB-Link Switch LDN firmware.\n\nThe Switch must host the trade (Wireless Club > Direct Corner); do not use "
+                        + "an ESP32 using GB-Link Switch LDN firmware.\n\nWireless adapter (FireRed/LeafGreen, Emerald): with board "
+                        + "firmware 2.1 or later either side can lead the group in the Wireless Club > Direct Corner; earlier firmware needs "
+                        + "the Switch to host.\nCable adapter (Ruby/Sapphire): the Switch must host.\n\nDo not use "
                         + "fast-forward. Not affiliated with or endorsed by mGBA.\n\nROMs and saves are kept in:\n"
                         + baseDir.getAbsolutePath() + "\n(ROMs and Saves folders)" + game)
                 .setPositiveButton("OK", null);
@@ -804,6 +986,8 @@ public class MainActivity extends Activity implements UsbLink.Logger {
             writeSaveTo(data.getData());
         } else if (requestCode == REQUEST_BACKGROUND && data.getData() != null) {
             importBackground(data.getData());
+        } else if ((requestCode == REQUEST_PANEL_LEFT || requestCode == REQUEST_PANEL_RIGHT) && data.getData() != null) {
+            importPanel(requestCode == REQUEST_PANEL_LEFT ? GameView.PANEL_LEFT : GameView.PANEL_RIGHT, data.getData());
         }
     }
 

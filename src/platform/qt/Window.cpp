@@ -1675,7 +1675,7 @@ void Window::setupMenu(QMenuBar* menubar) {
 	rfuLog->setValue(QVariant(savedOr("rfu.log", "0").toInt() != 0));
 
 	// RFU Cable Wrapper: lets a cable-only game (Ruby/Sapphire) talk to an FRLG leader. Local joins a leader in another
-	// mGBA; Broadcast and ESP32 are still stubs. Its log is the wrapper's own trace (or, with the wrapper off, the
+	// mGBA, ESP32 a real Switch through the board, Broadcast one over Wi-Fi through ldnd. Its log is the wrapper's own trace (or, with the wrapper off, the
 	// cable traffic between games in mGBA's multiplayer).
 	m_actions.addMenu(tr("RFU Cable Wrapper"), "rfuwrap", "emu");
 	ConfigOption* wrapBackend = localOption("rfuwrap.backend");
