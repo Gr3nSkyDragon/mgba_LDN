@@ -8,6 +8,9 @@
 #include <mgba/internal/gba/gba.h>
 #include <mgba/internal/gba/sio/lockstep.h>
 #include <mgba/internal/gba/sio/rfu.h>
+#ifdef USE_LDN_BROADCAST
+#include <mgba/internal/gba/sio/rfu-broadcast.h>
+#endif
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -1534,7 +1537,7 @@ static void _airDestroy(void* context) {
 	free(air);
 }
 
-bool GBASIORFUWrapperAttachAir(struct GBASIORFUWrapper* wrapper, const char* backend, const char* tracePath) {
+bool GBASIORFUWrapperAttachAir(struct GBASIORFUWrapper* wrapper, const char* backend, const char* tracePath, const char* ldnKeysPath) {
 	struct GBASIORFUBackend* b = GBASIORFUBackendCreate(backend);
 	if (!b) {
 		return false;
@@ -1547,6 +1550,16 @@ bool GBASIORFUWrapperAttachAir(struct GBASIORFUWrapper* wrapper, const char* bac
 	air->w = wrapper;
 	air->backend = b;
 	snprintf(air->backendName, sizeof(air->backendName), "%s", backend);
+#ifdef USE_LDN_BROADCAST
+	if (!strcmp(backend, "broadcast")) {
+		// Before the backend is initialised, like the wireless adapter's own set-up: without prod.keys it can hop the
+		// channels but not decrypt what it captures. The wrapper never starts ldnd either; it joins whatever ldnd the
+		// user already has running.
+		GBASIORFUBroadcastSetKeysPath(b, ldnKeysPath && ldnKeysPath[0] ? ldnKeysPath : NULL);
+	}
+#else
+	(void) ldnKeysPath;
+#endif
 	GBASIORFUCreate(&air->rfu, b);
 	if (tracePath && tracePath[0]) {
 		GBASIORFUSetTraceFile(&air->rfu, tracePath);

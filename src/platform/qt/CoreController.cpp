@@ -1281,8 +1281,8 @@ void CoreController::detachRFU() {
 }
 
 // Emulation > "RFU Cable Wrapper": presents a cable-linked game (Ruby/Sapphire) with a second player it can talk to. Its
-// "Local" and "ESP32" connections join an FRLG leader (another mGBA process, or a real Switch through the ESP32
-// board; rfu-wrapper-air.c); Broadcast is still a stub that attach the built-in stub peer (a FireRed at the far end of the cable) and go nowhere. Its "Save adapter log" writes
+// "Local", "ESP32" and "Broadcast" connections join an FRLG leader (another mGBA process, or a real Switch through the ESP32
+// board, or over Wi-Fi through ldnd; rfu-wrapper-air.c). Its "Save adapter log" writes
 // rfu-wrapper-trace.log next to the wireless adapter's rfu-trace.log: the wrapper's own cable/peer trace while it is
 // attached, and otherwise the real cable (lockstep) traffic between games in mGBA's own multiplayer, which is the capture
 // the wrapper is built from. The log does not depend on the chosen connection.
@@ -1305,15 +1305,22 @@ bool CoreController::startRFUWrapper(const QString& connection) {
 	stopRFU();
 	m_rfuWrapperConnectionName = connection.toUtf8();
 	GBASIORFUWrapperCreate(&m_rfuWrapper, m_rfuWrapperConnectionName.constData());
-	if (connection == QLatin1String("local") || connection == QLatin1String("esp32")) {
+	if (connection == QLatin1String("local") || connection == QLatin1String("esp32") || connection == QLatin1String("broadcast")) {
 		// The wireless side: "local" joins an FRLG leader in another mGBA whose Wireless Adapter is also "Local";
 		// "esp32" joins a real Switch's FRLG room through GB-Link's ESP32 board (the port is auto-detected, or named
-		// with MGBA_RFU_ESP32_PORT). The backend's own protocol trace goes next to the wrapper trace.
+		// with MGBA_RFU_ESP32_PORT); "broadcast" joins one over the PC's own Wi-Fi through a separately running ldnd
+		// (prod.keys as for the Wireless Adapter: Tools > Settings > BIOS, or MGBA_RFU_LDN_KEYS). The backend's own
+		// protocol trace goes next to the wrapper trace.
 		QByteArray backendTrace;
 		if (m_rfuWrapperLogEnabled) {
 			backendTrace = QDir(ConfigController::configDir()).filePath("rfu-wrapper-backend.log").toUtf8();
 		}
-		if (!GBASIORFUWrapperAttachAir(&m_rfuWrapper, connection.toUtf8().constData(), backendTrace.constData())) {
+		QByteArray keysPath;
+#ifdef USE_LDN_BROADCAST
+		const char* envKeys = getenv("MGBA_RFU_LDN_KEYS");
+		keysPath = envKeys && envKeys[0] ? QByteArray(envKeys) : m_rfuLdnKeysPath.toUtf8();
+#endif
+		if (!GBASIORFUWrapperAttachAir(&m_rfuWrapper, connection.toUtf8().constData(), backendTrace.constData(), keysPath.constData())) {
 			qWarning() << "RFU cable wrapper: could not open the wireless side" << connection;
 		}
 	}
@@ -1370,8 +1377,16 @@ void CoreController::setRFUWrapperBackend(const QString& requested) {
 }
 
 void CoreController::setRFUWrapperLogging(bool enabled) {
+	bool changed = m_rfuWrapperLogEnabled != enabled;
 	m_rfuWrapperLogEnabled = enabled;
 	updateRFUWrapperTrace();
+	if (changed && rfuWrapperEnabled()) {
+		// The wireless side opens its backend trace when it attaches, so an already attached wrapper starts over to
+		// begin (or stop) writing it, like the Wireless Adapter does when its log is switched.
+		const QString connection = m_rfuWrapperConnection;
+		Interrupter interrupter(this);
+		startRFUWrapper(connection);
+	}
 }
 
 void CoreController::updateRFUWrapperTrace() {

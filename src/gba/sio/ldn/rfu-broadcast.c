@@ -12,6 +12,7 @@
 #include "ldn-pia.h"
 #include "ldn-station.h"
 #include "ldn.h"
+#include "trade-shim.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -160,6 +161,29 @@ struct GBASIORFUBroadcast {
 	bool piaAccepted; // the host's 'A' arrived - only then do the game's slots go out as 'T' frames
 	uint32_t piaTs; // per-NEW-frame 'T' counter
 	uint32_t piaKSeq; // joiner-global 'K' counter (+1 from 1)
+
+	// Sits between the game's slots and the Switch's: a retail cartridge runs one post-trade standby round fewer than
+	// the Switch release, which deadlocks both at "Communication standby" (see trade-shim.h). Serves the Wireless
+	// Adapter and the RFU Cable Wrapper alike (the wrapper's wireless side is a retail-like child). Reset for each
+	// session, and owned by the emulation thread like the rest of the session.
+	struct LdnTradeShim piaShim;
+
+	// Child frames waiting for the Switch. The Switch's game takes about one child frame per datagram it sends and validates
+	// a mod-8 sequence tag on every command, so a burst (the wrapper answers a backlog of host frames all at once) or a
+	// dropped frame desyncs it. Frames therefore wait here and leave one per emulated frame, each against a credit earned by
+	// one host 'T' (at most two saved up), stamped as they leave; when nothing is waiting the last idle frame is repeated.
+	// This is what GB-Link's ESP32 firmware does (pia_link.c) and what its trade shim's tag stamping presumes.
+	struct {
+		uint8_t data[128];
+		uint16_t length;
+	} piaOut[64];
+	int piaOutHead, piaOutCount;
+	uint8_t piaLastQueued[128];
+	uint16_t piaLastQueuedLength;
+	uint8_t piaIdle[128];
+	uint16_t piaIdleLength;
+	bool piaHasIdle;
+	int piaCredits;
 };
 
 void GBASIORFUBroadcastSetKeysPath(struct GBASIORFUBackend* backend, const char* prodKeysPath) {
@@ -765,6 +789,11 @@ static DWORD WINAPI _connectThreadProc(LPVOID arg) {
 		broadcast->piaHostTSeen = false;
 		broadcast->piaTs = 0x362D; // the first 'T' is 0x362E: the reference simulator's and the firmware's seed
 		broadcast->piaKSeq = 0;
+		LdnTradeShimReset(&broadcast->piaShim);
+		broadcast->piaOutHead = broadcast->piaOutCount = 0;
+		broadcast->piaLastQueuedLength = broadcast->piaIdleLength = 0;
+		broadcast->piaHasIdle = false;
+		broadcast->piaCredits = 0;
 		memcpy(broadcast->piaOurMac, ourMac, 6);
 		memcpy(broadcast->piaHostMac, hostMac, 6);
 		memcpy(broadcast->piaOurIp, ourIp, 4);
@@ -921,6 +950,133 @@ static void _gbaSendSlot(struct GBASIORFUBroadcast* broadcast, const uint8_t* sl
 	_reliableQueue(broadcast, frame, 4 + bodyLength);
 }
 
+// The words of a slot, for the trace: only frames that carry a command (an idle slot is all zero after its header).
+static void _traceSlot(struct GBASIORFUBroadcast* broadcast, const char* what, const uint8_t* slot, size_t length) {
+	char hex[3 * 16 + 1];
+	size_t shown = length < 16 ? length : 16;
+	for (size_t i = 0; i < shown; ++i) {
+		snprintf(&hex[i * 3], 4, "%02X ", slot[i]);
+	}
+	hex[shown * 3] = 0;
+	GBASIORFUTrace(broadcast->rfu, "PIA    %s %s", what, hex);
+}
+
+static bool _slotIdle(const uint8_t* p, size_t length) {
+	for (size_t i = 2; i < length; ++i) {
+		if (p[i]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Whether a queued child frame is superseded by the ones behind it, so the Switch can go without it: an idle slot, or a
+// held-keys report of nothing or of a direction (the next report says the same or newer). A button report (A, READY,
+// EXIT_ROOM) happens once and must arrive.
+static bool _slotSheddable(const uint8_t* p, size_t length) {
+	if (length < 6 || (((p[0] | (p[1] << 8)) >> 10) & 15) != 4) {
+		return false;
+	}
+	if (p[3] == 0) {
+		return true;
+	}
+	if (p[3] != 0xBE) {
+		return false;
+	}
+	return p[4] == 0 || (p[4] >= 0x11 && p[4] <= 0x15);
+}
+
+enum { PIA_OUT_SLOTS = 64, PIA_OUT_BYTES = 128, PIA_OUT_SHED_AT = 3 };
+
+// Every child slot bound for the host goes through here, the game's own and the shim's injected ones alike: it waits in the
+// queue (see the struct) and is stamped with the next consecutive sequence tag only when it leaves (_gbaPumpChild), so the
+// host, which drops the child after five out-of-sequence commands, sees the tags of exactly the frames it is sent.
+static void _gbaSendChildSlot(struct GBASIORFUBroadcast* broadcast, uint8_t* slot, size_t length) {
+	if (!length || length > PIA_OUT_BYTES) {
+		return;
+	}
+	if (_slotIdle(slot, length)) {
+		memcpy(broadcast->piaIdle, slot, length);
+		broadcast->piaIdleLength = (uint16_t) length;
+		broadcast->piaHasIdle = true;
+	}
+	// Only an exact repeat of the frame queued last is collapsed (an RFU-level retransmit of something the peer has not
+	// consumed); anything that differs, its tag included, is a distinct frame.
+	if (broadcast->piaLastQueuedLength == length && !memcmp(broadcast->piaLastQueued, slot, length)) {
+		return;
+	}
+	if (broadcast->piaOutCount >= PIA_OUT_SLOTS) {
+		// Full: an idle frame only repeats the child's empty state, so it is the one to give up.
+		if (_slotIdle(slot, length)) {
+			return;
+		}
+		int victim = -1;
+		for (int i = broadcast->piaOutCount - 1; i >= 0 && victim < 0; --i) {
+			int at = (broadcast->piaOutHead + i) % PIA_OUT_SLOTS;
+			if (_slotIdle(broadcast->piaOut[at].data, broadcast->piaOut[at].length)) {
+				victim = i;
+			}
+		}
+		if (victim < 0) {
+			GBASIORFUTrace(broadcast->rfu, "PIA    child queue overflow: frame of %zu bytes dropped", length);
+			return;
+		}
+		for (int i = victim; i < broadcast->piaOutCount - 1; ++i) {
+			broadcast->piaOut[(broadcast->piaOutHead + i) % PIA_OUT_SLOTS] =
+			    broadcast->piaOut[(broadcast->piaOutHead + i + 1) % PIA_OUT_SLOTS];
+		}
+		--broadcast->piaOutCount;
+	}
+	int at = (broadcast->piaOutHead + broadcast->piaOutCount) % PIA_OUT_SLOTS;
+	memcpy(broadcast->piaOut[at].data, slot, length);
+	broadcast->piaOut[at].length = (uint16_t) length;
+	++broadcast->piaOutCount;
+	// A backlog is lag on the game's own screen, and superseded frames (idle ones, key reports) in it can be shed, oldest
+	// first and never the newest.
+	for (int i = 0; broadcast->piaOutCount > PIA_OUT_SHED_AT && i < broadcast->piaOutCount - 1;) {
+		int slotAt = (broadcast->piaOutHead + i) % PIA_OUT_SLOTS;
+		if (!_slotSheddable(broadcast->piaOut[slotAt].data, broadcast->piaOut[slotAt].length)) {
+			++i;
+			continue;
+		}
+		for (int j = i; j < broadcast->piaOutCount - 1; ++j) {
+			broadcast->piaOut[(broadcast->piaOutHead + j) % PIA_OUT_SLOTS] =
+			    broadcast->piaOut[(broadcast->piaOutHead + j + 1) % PIA_OUT_SLOTS];
+		}
+		--broadcast->piaOutCount;
+	}
+	memcpy(broadcast->piaLastQueued, slot, length);
+	broadcast->piaLastQueuedLength = (uint16_t) length;
+}
+
+// Once per emulated frame (the Switch's own ~59.7 Hz cadence): the next waiting child frame, or a repeat of the last idle
+// one, goes out against one credit.
+static void _gbaPumpChild(struct GBASIORFUBroadcast* broadcast) {
+	if (broadcast->piaCredits <= 0) {
+		return;
+	}
+	uint8_t slot[PIA_OUT_BYTES];
+	size_t length;
+	if (broadcast->piaOutCount > 0) {
+		int at = broadcast->piaOutHead;
+		broadcast->piaOutHead = (broadcast->piaOutHead + 1) % PIA_OUT_SLOTS;
+		--broadcast->piaOutCount;
+		length = broadcast->piaOut[at].length;
+		memcpy(slot, broadcast->piaOut[at].data, length);
+		LdnTradeShimStamp(&broadcast->piaShim, slot, length);
+		if (length >= 4 && slot[3]) {
+			_traceSlot(broadcast, "child cmd (stamped):", slot, length);
+		}
+	} else if (broadcast->piaHasIdle) {
+		length = broadcast->piaIdleLength;
+		memcpy(slot, broadcast->piaIdle, length);
+	} else {
+		return;
+	}
+	--broadcast->piaCredits;
+	_gbaSendSlot(broadcast, slot, length);
+}
+
 // 57 4b 0c 00 <k_seq:u32><mid:u32><acked_host_ts:u32>, all LE - one per unique host 'T'.
 static void _gbaSendAck(struct GBASIORFUBroadcast* broadcast, uint32_t ackedTs) {
 	uint8_t frame[16] = {kGbaMarker, kGbaK, 12, 0};
@@ -953,8 +1109,25 @@ static void _gbaReceive(struct GBASIORFUBroadcast* broadcast, const uint8_t* dat
 			GBASIORFUTrace(broadcast->rfu, "PIA    host 'T' ts=%u slot_len=%zu", ts, slotLength);
 			broadcast->piaHostTSeen = true;
 			_gbaSendAck(broadcast, ts);
+			if (broadcast->piaCredits < 2) {
+				++broadcast->piaCredits; // one child frame may follow each host frame
+			}
 			if (slotLength > 1 && 8 + slotLength <= bodyLength) {
-				GBASIORFUDataReceived(broadcast->rfu, 0, &body[8], slotLength);
+				uint8_t slot[256];
+				uint8_t pre[4 * LDN_TRADE_SHIM_HOST_FRAME];
+				memcpy(slot, &body[8], slotLength);
+				if (slotLength >= 31 && (slot[3] | slot[4] | slot[17] | slot[18])) {
+					// slot 0 (the host) and slot 1 (its echo of us), first 6 bytes of each
+					char words[64];
+					snprintf(words, sizeof(words), "%02X%02X%02X%02X%02X%02X | %02X%02X%02X%02X%02X%02X", slot[3], slot[4], slot[5], slot[6], slot[7],
+					         slot[8], slot[17], slot[18], slot[19], slot[20], slot[21], slot[22]);
+					GBASIORFUTrace(broadcast->rfu, "PIA    host cmd hdr=%02X%02X%02X %s", slot[0], slot[1], slot[2], words);
+				}
+				size_t preLength = LdnTradeShimHost(&broadcast->piaShim, slot, slotLength, GetTickCount(), pre, sizeof(pre));
+				for (size_t at = 0; at + LDN_TRADE_SHIM_HOST_FRAME <= preLength; at += LDN_TRADE_SHIM_HOST_FRAME) {
+					GBASIORFUDataReceived(broadcast->rfu, 0, &pre[at], LDN_TRADE_SHIM_HOST_FRAME);
+				}
+				GBASIORFUDataReceived(broadcast->rfu, 0, slot, slotLength);
 			}
 		} else if (type == kGbaD) {
 			GBASIORFUTrace(broadcast->rfu, "PIA    host sent 'D' (disconnect)");
@@ -1127,6 +1300,24 @@ static void _frame(struct GBASIORFUBackend* backend) {
 		_gbaSendConnect(broadcast);
 	}
 
+	// Accepted by the host is the whole condition: the game (or the wrapper, whose headless adapter never enters the RFU
+	// client state because it drives the backend directly) only connects when it wants this session.
+	if (broadcast->piaAccepted) {
+		DWORD now = GetTickCount();
+		LdnTradeShimPoll(&broadcast->piaShim, now);
+		uint8_t extra[LDN_TRADE_SHIM_CHILD_FRAME];
+		size_t extraLength = LdnTradeShimInject(&broadcast->piaShim, now, extra, sizeof(extra));
+		if (extraLength) {
+			_gbaSendChildSlot(broadcast, extra, extraLength);
+		}
+		uint8_t repeat[LDN_TRADE_SHIM_HOST_FRAME];
+		size_t repeatLength = LdnTradeShimHostInject(&broadcast->piaShim, now, repeat, sizeof(repeat));
+		if (repeatLength) {
+			GBASIORFUDataReceived(broadcast->rfu, 0, repeat, repeatLength);
+		}
+		_gbaPumpChild(broadcast);
+	}
+
 	struct LdnPiaOutMessage outMsgs[4];
 	size_t nOut = LdnPiaConnectDrain(conn, outMsgs, 4);
 	for (size_t i = 0; i < nOut; ++i) {
@@ -1167,8 +1358,23 @@ static void _sendData(struct GBASIORFUBackend* backend, const uint8_t* data, siz
 		GBASIORFUTrace(broadcast->rfu, "PIA    sendData %zu bytes held back (host has not accepted our connect yet)", length);
 		return;
 	}
-	GBASIORFUTrace(broadcast->rfu, "PIA    sendData %zu bytes -> 'T' frame", length);
-	_gbaSendSlot(broadcast, data, length);
+	uint8_t slot[RFU_PACKET_MAX];
+	uint8_t reply[2 * LDN_TRADE_SHIM_HOST_FRAME];
+	if (length > sizeof(slot)) {
+		length = sizeof(slot);
+	}
+	memcpy(slot, data, length);
+	bool forward;
+	size_t replyLength = LdnTradeShimChild(&broadcast->piaShim, slot, length, GetTickCount(), reply, sizeof(reply), &forward);
+	if (forward) {
+		GBASIORFUTrace(broadcast->rfu, "PIA    sendData %zu bytes -> 'T' frame", length);
+		_gbaSendChildSlot(broadcast, slot, length);
+	} else {
+		GBASIORFUTrace(broadcast->rfu, "PIA    sendData %zu bytes repeat the previous command frame; not sent again", length);
+	}
+	for (size_t at = 0; at + LDN_TRADE_SHIM_HOST_FRAME <= replyLength; at += LDN_TRADE_SHIM_HOST_FRAME) {
+		GBASIORFUDataReceived(broadcast->rfu, 0, &reply[at], LDN_TRADE_SHIM_HOST_FRAME);
+	}
 #else
 	(void) broadcast;
 	(void) data;
@@ -1201,11 +1407,17 @@ static void _noopReply(struct GBASIORFUBackend* backend, uint16_t clientId, bool
 	(void) slot;
 }
 
+static void _shimLog(void* user, const char* message) {
+	struct GBASIORFUBroadcast* broadcast = user;
+	GBASIORFUTrace(broadcast->rfu, "SHIM   %s", message);
+}
+
 struct GBASIORFUBackend* GBASIORFUBroadcastCreate(void) {
 	struct GBASIORFUBroadcast* broadcast = calloc(1, sizeof(*broadcast));
 	if (!broadcast) {
 		return NULL;
 	}
+	LdnTradeShimInit(&broadcast->piaShim, _shimLog, broadcast);
 	// Created here, not in _init(): the SIO driver's GBASIORFUInit() calls backend->reset() (_reset(), which tears
 	// down any Pia session via piaLock) BEFORE it ever calls backend->init() - so these must be valid from the
 	// moment the backend exists, not from whenever _init() happens to run relative to the first reset.

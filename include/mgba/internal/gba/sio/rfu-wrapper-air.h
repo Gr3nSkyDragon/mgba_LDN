@@ -35,7 +35,9 @@ CXX_GUARD_START
 // Attach the wireless side to the wrapper using the named backend ("local", "broadcast", "esp32"). Returns false for a
 // backend that does not exist (the wrapper then keeps its stub peer). tracePath (optional) receives the backend's own
 // protocol trace (Wi-Fi/serial/LDN details); the wrapper's translator lines go to the wrapper trace.
-bool GBASIORFUWrapperAttachAir(struct GBASIORFUWrapper* wrapper, const char* backend, const char* tracePath);
+// ldnKeysPath (optional) is the prod.keys file the "broadcast" backend decrypts the Switch's LDN traffic with; it is used
+// only by that backend, which also needs a separately running ldnd.
+bool GBASIORFUWrapperAttachAir(struct GBASIORFUWrapper* wrapper, const char* backend, const char* tracePath, const char* ldnKeysPath);
 
 CXX_GUARD_END
 
