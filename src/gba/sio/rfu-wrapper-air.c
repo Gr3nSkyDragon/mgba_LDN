@@ -85,6 +85,8 @@ enum {
 	INITIATE_TIMEOUT = 600,
 	IDLE_TIMEOUT = 90,
 	HOST_SILENT_FRAMES = 600,
+	// After the game has left the room, how long the wireless link is kept for the leader to read our READY_CLOSE_LINK.
+	EXIT_LINGER_FRAMES = 240,
 };
 
 enum {
@@ -249,6 +251,7 @@ struct Air {
 	uint8_t rubyCard[CARD_SIZE];
 	bool exitKeySeen;    // either side pressed EXIT_ROOM since the room was entered
 	bool hostClosedSeen; // the leader already sent READY_CLOSE_LINK
+	unsigned exitLinger; // frames since the game left the room for good: the wireless link stays up until the leader has taken our close
 	bool roomClosed;     // held keys only exist in the room; after the first close they must never be sent again
 	bool pendingPurposeStandby;
 	unsigned standbyRoundsSeen;
@@ -724,13 +727,24 @@ static void _childQueuePush(struct Air* air, const uint8_t* data, unsigned size,
 	++air->childCount;
 }
 
-// The LinkPlayer we give the leader: the game's own record presented as a LeafGreen (the leader only checks the two
-// "GameFreak inc." magics and a valid version) with link type 0, which is what an FRLG wireless link uses.
+// The LinkPlayer we give the leader: the game's own record, version included, with link type 0, which is what an FRLG
+// wireless link uses. The leader only checks the two "GameFreak inc." magics, and it draws the other player from the
+// version: FireRed/LeafGreen get the FRLG avatar, anything else the Hoenn (RS Brendan/May) one, so Ruby's real version
+// gives Ruby's trainer its own sprite. The version also decides how the leader reads the trainer card and applies its
+// trade-progress rules (trade.c / cable_club.c in pokefirered), and it used to be forced to 0x4005 (LeafGreen).
+// MGBA_RFU_WRAPPER_LP_VERSION (hex, e.g. 4005 for LeafGreen or 4003 for Emerald) presents another version for testing.
 static void _buildLinkPlayerForHost(struct Air* air, uint8_t* out) {
 	memset(out, 0, LP_BUFFER_SIZE);
 	memcpy(out, air->rubyLP, LINK_PLAYER_BLOCK_SIZE);
-	_put16(&out[LP_VERSION_OFFSET], 0x4005);
+	const char* override = getenv("MGBA_RFU_WRAPPER_LP_VERSION");
+	if (override && override[0]) {
+		unsigned long version = strtoul(override, NULL, 16);
+		if (version) {
+			_put16(&out[LP_VERSION_OFFSET], (uint16_t) version);
+		}
+	}
 	memset(&out[LP_LINK_TYPE_OFFSET], 0, 4);
+	AIRLOG(air, "LinkPlayer for the leader: version %04X%s", _le16(&out[LP_VERSION_OFFSET]), override && override[0] ? " (from MGBA_RFU_WRAPPER_LP_VERSION)" : "");
 }
 
 // The leader's LinkPlayer as the game expects to find it: the same record with the game's own link type, because the
@@ -1026,12 +1040,24 @@ static void _gameClose(struct Air* air) {
 }
 
 // A round we started has passed on the wireless side.
-static void _exitClosePassed(struct Air* air) {
-	AIRLOG(air, "room exit complete: answering the game, ending the wireless link");
-	_cablePushCmd(air, LINKCMD_READY_CLOSE_LINK, 0, 0);
-	air->backend->disconnect(air->backend, 0);
+static void _exitLingerFinish(struct Air* air, const char* why, bool disconnect) {
+	AIRLOG(air, "wireless link ended: %s", why);
+	air->exitLinger = 0;
+	if (disconnect) {
+		air->backend->disconnect(air->backend, 0);
+	}
 	_airResetLink(air);
 	air->link = -1;
+}
+
+static void _exitClosePassed(struct Air* air) {
+	// The game can go now, but the wireless link cannot: the leader's game reads our client frames one per frame, in order,
+	// and a disconnect throws away whatever it has not read yet, our READY_CLOSE_LINK included. Then it waits for a ready
+	// message that never comes and never leaves its room (a black screen). So the link stays up, still answering the leader,
+	// until the leader's echo of our close shows it was read, it disconnects us, or a few seconds pass.
+	AIRLOG(air, "room exit complete: answering the game; the wireless link stays up until the leader has taken our close");
+	_cablePushCmd(air, LINKCMD_READY_CLOSE_LINK, 0, 0);
+	air->exitLinger = 1;
 	air->haveRubyLP = false; // a new cable club visit starts a new search
 	air->closeCount = 0;
 	air->roomClosed = false;
@@ -1189,7 +1215,9 @@ static void _drainEvents(struct Air* air) {
 			break;
 		case RFU_EVENT_DISCONNECTED:
 			AIRLOG(air, "disconnected from the leader");
-			if (air->link == AIR_NI || air->link == AIR_UNI) {
+			if (air->exitLinger) {
+				_exitLingerFinish(air, "the leader disconnected us", false); // the game has left: no new search
+			} else if (air->link == AIR_NI || air->link == AIR_UNI) {
 				_airResetLink(air);
 				_startSearch(air);
 			}
@@ -1389,6 +1417,11 @@ static void _handleHostFrame(struct Air* air, const uint8_t* data, unsigned leng
 		uint16_t words1[7];
 		_slotToWords(slot1, words1);
 		_feedRecv(&air->rx1, words1, slot1, &completed);
+		if (air->exitLinger && (words1[0] & RFUCMD_MASK) == RFUCMD_READY_CLOSE_LINK) {
+			// The leader's game has read our close (it echoes what it reads): now the link can go.
+			_exitLingerFinish(air, "the leader took our close", true);
+			return;
+		}
 	}
 	if (_barrierObserve(air, sawBarrier)) {
 		_roundPassed(air);
@@ -1411,6 +1444,12 @@ static void _airFrame(void* context) {
 		_startSearch(air);
 	}
 	_drainEvents(air);
+	if (air->exitLinger && air->exitLinger % 60 == 0) {
+		air->bar.burstN = 0; // say our close again: the leader reads one client frame per frame, in order
+	}
+	if (air->exitLinger && ++air->exitLinger > EXIT_LINGER_FRAMES) {
+		_exitLingerFinish(air, "the leader never took our close, giving up", true);
+	}
 	// A joining child speaks first: after the connect its game sends the NI_START of its game data on its own, and the
 	// leader answers frame by frame. A leader that has nothing to send until it hears from us (a Switch behind the ESP32
 	// board sends parent slots only once it has our connect and game data) would otherwise be waited for forever, so

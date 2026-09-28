@@ -87,6 +87,13 @@ static void _threadJoin(EspThread* thread) {
  *   3. The board scans for the Switch's FRLG room, joins it, and from then on sends RFU1 frames (message type 6, GB
  *      channel 1): BROADCAST for each of three groups (trade, single battle, double battle) every 500ms, CONNECT_ACK
  *      and HOST_SEND. We send CONNECT_REQ, CLIENT_SEND and DISCONNECT the same way inside message type 7.
+ *   4. Hosting (firmware 2.1 and later, when the game in the emulator leads a group): while the board is still scanning,
+ *      the RFU1 BROADCAST frames WE send - the leader's own device id and the six words of its game data, every 500ms,
+ *      until a client is in - make it host a room that looks like a Switch's (pia_bridge.c BR_HOST). When the Switch
+ *      joins, the board sends ONE CONNECT_REQ (header: our device id); the answer is CONNECT_ACK, whose header carries
+ *      the client's id (ours to choose) and slot, or CONNECT_NACK. From then on we send one HOST_SEND per host frame
+ *      (header: its length), and the Switch's frames arrive as CLIENT_SEND (header: id | slot << 16 | length << 24), with
+ *      CLIENT_ACK keep-alives every 500ms and DISCONNECT (header: id | slot << 16) either way.
  *
  * RFU1 = "RFU1" + type:u32 BE + header:u32 BE + body. The 24-byte BROADCAST body is six big-endian words that are
  * exactly the words the game reads back in a broadcast record.
@@ -101,13 +108,16 @@ enum {
 	kPingMs = 1000,
 	kConnectTimeoutMs = 8000,
 	kRetryMs = 2500,
+	kBeaconMs = 500,
 
 	RFU1_BROADCAST = 0,
 	RFU1_CONNECT_REQ = 1,
 	RFU1_CONNECT_ACK = 2,
+	RFU1_CONNECT_NACK = 3,
 	RFU1_DISCONNECT = 4,
 	RFU1_HOST_SEND = 5,
 	RFU1_CLIENT_SEND = 6,
+	RFU1_CLIENT_ACK = 7,
 
 	kMaxPayload = 92,
 };
@@ -136,6 +146,18 @@ struct GBASIORFUESP32 {
 	uint16_t connectDevice;
 	uint32_t connectDeadline;
 
+	// Host role (the game in the emulator leads a group, see 4. above). Also under `lock`: the emulation thread sets it, the
+	// I/O thread advertises it and reports the board's join request.
+	bool hosting; // hostStart .. hostStop: advertising while no client is in
+	uint16_t hostDeviceId;
+	uint32_t broadcastWords[RFU_BROADCAST_WORDS];
+	bool haveBroadcast;
+	bool hostClient; // the Switch was accepted and is in the room
+	uint16_t hostClientId;
+	uint8_t hostClientSlot;
+	uint16_t pendingClientId; // a CONNECT_REQ the driver has not answered yet
+	uint32_t nextBeacon;
+
 	// I/O thread only.
 	struct Esp32Serial* port;
 	struct Esp32WireParser parser;
@@ -152,6 +174,7 @@ struct GBASIORFUESP32 {
 	unsigned bridgeRestarts;
 	unsigned bytesRead;
 	unsigned beacons;
+	unsigned beaconsSent;
 	uint8_t rx[256]; // RFU1 stream reassembly (see _handleFrame)
 	size_t rxUsed;
 	char portName[32];
@@ -324,6 +347,52 @@ static void _handleRfu1(struct GBASIORFUESP32* esp, const uint8_t* rfu1, size_t 
 		if (esp->connected && available >= 12 + length) {
 			GBASIORFUDataReceived(esp->rfu, 0, &rfu1[12], length);
 		}
+	} else if (type == RFU1_CONNECT_REQ) {
+		// Hosting: the Switch asked to join the room. The driver (the game's own host state) decides, and answers through
+		// connectReply(); the id it is given here stands for the Switch from now on.
+		_lockEnter(&esp->lock);
+		bool hosting = esp->hosting && !esp->hostClient;
+		uint16_t clientId = 0;
+		if (hosting) {
+			clientId = (uint16_t) ((_ticks() & 0x7FFF) | 0x8000);
+			if (clientId == esp->hostDeviceId) {
+				clientId ^= 0x0101;
+			}
+			esp->pendingClientId = clientId;
+		}
+		_lockLeave(&esp->lock);
+		if (hosting) {
+			GBASIORFUTrace(esp->rfu, "ESP32  the Switch asks to join the group (header %08X): asking the game, client id %04X", header, clientId);
+			GBASIORFUConnectRequested(esp->rfu, clientId);
+		} else {
+			GBASIORFUTrace(esp->rfu, "ESP32  join request from the board, but we are not advertising a group (or already have a client): refused");
+			_sendRfu1(esp, RFU1_CONNECT_NACK, header & 0xFFFF, NULL, 0, 16);
+		}
+	} else if (type == RFU1_CLIENT_SEND) {
+		size_t length = (header >> 24) & 0x7F;
+		if (length > kMaxPayload) {
+			length = kMaxPayload;
+		}
+		_lockEnter(&esp->lock);
+		bool inRoom = esp->hostClient;
+		unsigned slot = esp->hostClientSlot;
+		_lockLeave(&esp->lock);
+		if (inRoom && available >= 12 + length) {
+			GBASIORFUDataReceived(esp->rfu, slot, &rfu1[12], length);
+		}
+	} else if (type == RFU1_DISCONNECT) {
+		_lockEnter(&esp->lock);
+		bool inRoom = esp->hostClient;
+		unsigned slot = esp->hostClientSlot;
+		esp->hostClient = false;
+		esp->pendingClientId = 0;
+		_lockLeave(&esp->lock);
+		if (inRoom) {
+			GBASIORFUTrace(esp->rfu, "ESP32  the Switch left the group");
+			GBASIORFUDisconnected(esp->rfu, (int) slot);
+		}
+	} else if (type == RFU1_CLIENT_ACK) {
+		// The board's keep-alive for the client's slot; nothing to do.
 	}
 }
 
@@ -452,6 +521,7 @@ static void _picoReport(struct GBASIORFUESP32* esp) {
 static void _run(struct GBASIORFUESP32* esp) {
 	uint32_t nextReport = _ticks();
 	uint32_t nextPing = _ticks() + kPingMs;
+	esp->nextBeacon = _ticks();
 	bool failed = false;
 	while (!esp->stop && !failed) {
 		_pumpOnce(esp, &failed);
@@ -464,6 +534,27 @@ static void _run(struct GBASIORFUESP32* esp) {
 		if ((int32_t) (now - nextPing) >= 0) {
 			_command(esp, "LDN_PING");
 			nextPing = now + kPingMs;
+		}
+		if ((int32_t) (now - esp->nextBeacon) >= 0) {
+			// Hosting: the game's group, until a client is in. This is what makes the board open a room for the Switch.
+			esp->nextBeacon = now + kBeaconMs;
+			_lockEnter(&esp->lock);
+			bool advertise = esp->hosting && esp->haveBroadcast && !esp->hostClient;
+			uint16_t deviceId = esp->hostDeviceId;
+			uint32_t words[RFU_BROADCAST_WORDS];
+			memcpy(words, esp->broadcastWords, sizeof(words));
+			_lockLeave(&esp->lock);
+			if (advertise) {
+				uint8_t body[4 * RFU_BROADCAST_WORDS];
+				for (int i = 0; i < RFU_BROADCAST_WORDS; ++i) {
+					_putBe32(&body[i * 4], words[i]);
+				}
+				if (esp->beaconsSent++ == 0) {
+					GBASIORFUTrace(esp->rfu, "ESP32  advertising the game's group: device %04X, words %08X %08X %08X %08X %08X %08X", deviceId, words[0],
+					               words[1], words[2], words[3], words[4], words[5]);
+				}
+				_sendRfu1(esp, RFU1_BROADCAST, deviceId, body, sizeof(body), 36);
+			}
 		}
 		if (esp->bridgeRestart && (int32_t) (now - esp->bridgeRestartAt) >= 0) {
 			esp->bridgeRestart = false;
@@ -512,6 +603,17 @@ ESP_THREAD_FUNC(_thread) {
 			_flagSet(&esp->ready, 1);
 			_run(esp);
 			_flagSet(&esp->ready, 0);
+			// The board went away (or was restarted) with the game still leading a group: the client it had is gone too.
+			_lockEnter(&esp->lock);
+			bool hadClient = esp->hostClient;
+			unsigned clientSlot = esp->hostClientSlot;
+			esp->hostClient = false;
+			esp->pendingClientId = 0;
+			_lockLeave(&esp->lock);
+			if (hadClient) {
+				GBASIORFUTrace(esp->rfu, "ESP32  the board went away: the Switch's session with the game is over");
+				GBASIORFUDisconnected(esp->rfu, (int) clientSlot);
+			}
 			if (esp->port) {
 				// Hand the board back to its standalone GBA-cable mode.
 				_command(esp, "LDN_ADAPTER uart");
@@ -551,37 +653,94 @@ static void _deinit(struct GBASIORFUBackend* backend) {
 	_lockDelete(&esp->lock);
 }
 
+// Tells the board its client left (host role); the id and slot are the ones the board was given in CONNECT_ACK.
+static void _dropHostClient(struct GBASIORFUESP32* esp) {
+	_lockEnter(&esp->lock);
+	bool hadClient = esp->hostClient;
+	uint32_t header = (uint32_t) esp->hostClientId | ((uint32_t) esp->hostClientSlot << 16);
+	esp->hostClient = false;
+	esp->pendingClientId = 0;
+	_lockLeave(&esp->lock);
+	if (hadClient) {
+		_sendRfu1(esp, RFU1_DISCONNECT, header, NULL, 0, 16);
+	}
+}
+
 static void _reset(struct GBASIORFUBackend* backend) {
 	struct GBASIORFUESP32* esp = (struct GBASIORFUESP32*) backend;
 	_lockEnter(&esp->lock);
 	bool wasConnected = esp->connected;
 	esp->connected = false;
 	esp->connectPending = false;
+	esp->hosting = false;
+	esp->haveBroadcast = false;
 	_lockLeave(&esp->lock);
 	if (wasConnected) {
 		_sendRfu1(esp, RFU1_DISCONNECT, 0, NULL, 0, 16);
+	}
+	_dropHostClient(esp);
+}
+
+// ---- host role ----
+
+// The 24 bytes of game data the leader advertises (sent to the board as they change and every 500ms).
+static void _setBroadcast(struct GBASIORFUBackend* backend, const uint32_t data[RFU_BROADCAST_WORDS]) {
+	struct GBASIORFUESP32* esp = (struct GBASIORFUESP32*) backend;
+	_lockEnter(&esp->lock);
+	memcpy(esp->broadcastWords, data, sizeof(esp->broadcastWords));
+	esp->haveBroadcast = true;
+	_lockLeave(&esp->lock);
+}
+
+static void _hostStart(struct GBASIORFUBackend* backend, uint16_t deviceId) {
+	struct GBASIORFUESP32* esp = (struct GBASIORFUESP32*) backend;
+	_lockEnter(&esp->lock);
+	esp->hosting = true;
+	esp->hostDeviceId = deviceId;
+	esp->hostClient = false;
+	esp->beaconsSent = 0;
+	_lockLeave(&esp->lock);
+	GBASIORFUTrace(esp->rfu, "ESP32  the game leads a group as device %04X (%s)", deviceId,
+	               esp->ready ? "advertising it to the board" : "the board is not ready yet");
+}
+
+// Advertising stops; a client that is already in stays (the driver keeps the slot too).
+static void _hostStop(struct GBASIORFUBackend* backend) {
+	struct GBASIORFUESP32* esp = (struct GBASIORFUESP32*) backend;
+	_lockEnter(&esp->lock);
+	esp->hosting = false;
+	_lockLeave(&esp->lock);
+	GBASIORFUTrace(esp->rfu, "ESP32  the game stopped advertising its group");
+}
+
+// The driver's answer to the board's join request.
+static void _connectReply(struct GBASIORFUBackend* backend, uint16_t clientId, bool accepted, unsigned slot) {
+	struct GBASIORFUESP32* esp = (struct GBASIORFUESP32*) backend;
+	_lockEnter(&esp->lock);
+	bool current = esp->pendingClientId == clientId;
+	if (current) {
+		esp->pendingClientId = 0;
+		if (accepted) {
+			esp->hostClient = true;
+			esp->hostClientId = clientId;
+			esp->hostClientSlot = (uint8_t) (slot & 3);
+		}
+	}
+	_lockLeave(&esp->lock);
+	if (!current) {
+		return;
+	}
+	if (accepted) {
+		GBASIORFUTrace(esp->rfu, "ESP32  the game accepted the Switch as client %u (id %04X)", slot & 3, clientId);
+		_sendRfu1(esp, RFU1_CONNECT_ACK, (uint32_t) clientId | ((uint32_t) (slot & 3) << 16), NULL, 0, 16);
+	} else {
+		GBASIORFUTrace(esp->rfu, "ESP32  the game refused the Switch");
+		_sendRfu1(esp, RFU1_CONNECT_NACK, clientId, NULL, 0, 16);
 	}
 }
 
 static void _noop(struct GBASIORFUBackend* backend) {
 	(void) backend;
-}
-
-static void _noopBroadcast(struct GBASIORFUBackend* backend, const uint32_t data[RFU_BROADCAST_WORDS]) {
-	(void) backend;
-	(void) data;
-}
-
-static void _noopDeviceId(struct GBASIORFUBackend* backend, uint16_t deviceId) {
-	(void) backend;
-	(void) deviceId;
-}
-
-static void _noopReply(struct GBASIORFUBackend* backend, uint16_t clientId, bool accepted, unsigned slot) {
-	(void) backend;
-	(void) clientId;
-	(void) accepted;
-	(void) slot;
 }
 
 static void _connect(struct GBASIORFUBackend* backend, uint16_t deviceId) {
@@ -601,31 +760,43 @@ static void _connect(struct GBASIORFUBackend* backend, uint16_t deviceId) {
 	_sendRfu1(esp, RFU1_CONNECT_REQ, deviceId, NULL, 0, 16);
 }
 
+// Client role: leave the host. Host role: bit N of slotMask drops client slot N (the board keeps its room while it tears
+// the Switch's session down).
 static void _disconnect(struct GBASIORFUBackend* backend, unsigned slotMask) {
-	(void) slotMask;
 	struct GBASIORFUESP32* esp = (struct GBASIORFUESP32*) backend;
 	_lockEnter(&esp->lock);
+	bool hostSlotDropped = esp->hostClient && (slotMask & (1u << esp->hostClientSlot));
 	bool wasConnected = esp->connected || esp->connectPending;
 	esp->connected = false;
 	esp->connectPending = false;
 	_lockLeave(&esp->lock);
+	if (hostSlotDropped) {
+		GBASIORFUTrace(esp->rfu, "ESP32  the game dropped the Switch");
+		_dropHostClient(esp);
+	}
 	if (wasConnected) {
 		GBASIORFUTrace(esp->rfu, "ESP32  disconnect");
 		_sendRfu1(esp, RFU1_DISCONNECT, 0, NULL, 0, 16);
 	}
 }
 
-// The game's client slot (LLSF header + payload, as it would have handed a real adapter): RFU1 CLIENT_SEND carries
-// the length in the header's top byte and up to 92 payload bytes.
+// Client role: the game's client slot (LLSF header + payload, as it would have handed a real adapter): RFU1 CLIENT_SEND
+// carries the length in the header's top byte and up to 92 payload bytes. Host role: the leader's frame for its client
+// goes as HOST_SEND, the length in the header's low bits.
 static void _sendData(struct GBASIORFUBackend* backend, const uint8_t* data, size_t length) {
 	struct GBASIORFUESP32* esp = (struct GBASIORFUESP32*) backend;
-	if (!esp->connected) {
-		return;
-	}
+	_lockEnter(&esp->lock);
+	bool hostClient = esp->hostClient;
+	bool connected = esp->connected;
+	_lockLeave(&esp->lock);
 	if (length > kMaxPayload) {
 		length = kMaxPayload;
 	}
-	_sendRfu1(esp, RFU1_CLIENT_SEND, (uint32_t) length << 24, data, length, 104);
+	if (hostClient) {
+		_sendRfu1(esp, RFU1_HOST_SEND, (uint32_t) (length & 0x7F), data, length, 104);
+	} else if (connected) {
+		_sendRfu1(esp, RFU1_CLIENT_SEND, (uint32_t) length << 24, data, length, 104);
+	}
 }
 
 struct GBASIORFUBackend* GBASIORFUESP32Create(void) {
@@ -637,10 +808,10 @@ struct GBASIORFUBackend* GBASIORFUESP32Create(void) {
 	esp->d.init = _init;
 	esp->d.deinit = _deinit;
 	esp->d.reset = _reset;
-	esp->d.setBroadcast = _noopBroadcast;
-	esp->d.hostStart = _noopDeviceId;
-	esp->d.hostStop = _noop;
-	esp->d.connectReply = _noopReply;
+	esp->d.setBroadcast = _setBroadcast;
+	esp->d.hostStart = _hostStart;
+	esp->d.hostStop = _hostStop;
+	esp->d.connectReply = _connectReply;
 	esp->d.searchStart = _noop;
 	esp->d.searchStop = _noop;
 	esp->d.connect = _connect;
