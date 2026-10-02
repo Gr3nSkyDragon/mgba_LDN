@@ -321,6 +321,21 @@ static void _handleRfu1(struct GBASIORFUESP32* esp, const uint8_t* rfu1, size_t 
 			words[i] = _be32(&rfu1[12 + i * 4]);
 		}
 		bool occupied = (header >> 16) & 1;
+		// The Switch room record can arrive with "can link nationally" (compat bit 7) clear even for a finished game
+		// (national dex bit 8 + game clear bit 9 set); Emerald then refuses the trade as "not ready yet" when the
+		// trainer is picked. Experimental: treat a finished save as able to link nationally and fix the checksum
+		// (byte 15) the game validates. MGBA_RFU_NO_NATIONAL_FIX=1 disables it.
+		uint32_t compat = words[0] >> 16;
+		if ((compat & 0x0300) == 0x0300 && !(compat & 0x0080) && !getenv("MGBA_RFU_NO_NATIONAL_FIX")) {
+			words[0] |= 0x0080u << 16;
+			uint32_t sum = ((words[0] >> 16) & 0xFF) + ((words[0] >> 24) & 0xFF) + (words[1] & 0xFF) + ((words[1] >> 8) & 0xFF) +
+			               ((words[1] >> 16) & 0xFF) + ((words[1] >> 24) & 0xFF) + (words[2] & 0xFF) + ((words[2] >> 8) & 0xFF);
+			for (int i = 0; i < 4; ++i) {
+				sum += (words[4] >> (i * 8)) & 0xFF;
+				sum += (words[5] >> (i * 8)) & 0xFF;
+			}
+			words[3] = (words[3] & 0x00FFFFFFu) | ((~sum & 0xFFu) << 24);
+		}
 		if (esp->beacons++ == 0) {
 			GBASIORFUTrace(esp->rfu, "ESP32  first room beacon: device %04X, words %08X %08X %08X %08X %08X %08X", header & 0xFFFF, words[0], words[1],
 			               words[2], words[3], words[4], words[5]);
