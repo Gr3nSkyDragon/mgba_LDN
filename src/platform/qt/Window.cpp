@@ -85,6 +85,7 @@
 #ifdef M_CORE_GBA
 #include <mgba/gba/interface.h>
 #include <mgba/internal/gba/gba.h>
+#include <mgba/internal/gba/sio/rfu-esp32.h>
 #endif
 #include <mgba/feature/commandline.h>
 #include <mgba/internal/gba/input.h>
@@ -183,6 +184,11 @@ Window::Window(CoreManager* manager, ConfigController* config, int playerId, QWi
 	m_mustRestart.setSingleShot(true);
 	m_mustReset.setInterval(MUST_RESTART_TIMEOUT);
 	m_mustReset.setSingleShot(true);
+#ifdef M_CORE_GBA
+	connect(&m_rfuStatusTimer, &QTimer::timeout, this, &Window::updateRFUStatus);
+	m_rfuStatusTimer.setInterval(RFU_STATUS_INTERVAL);
+	m_rfuStatusTimer.start();
+#endif
 
 #ifdef BUILD_SDL
 	m_inputController.addInputDriver(std::make_shared<SDLInputDriver>(&m_inputController));
@@ -929,11 +935,12 @@ void Window::gameStarted() {
 #ifdef M_CORE_GBA
 	// Applies the saved wireless adapter choice to the newly started game.
 	// This window's own choices (the options are per window, see the menu setup).
+	// The log first: the adapter and the wrapper's wireless side open their traces when they start.
 	m_controller->setRFULogging(m_rfuLog);
+	m_controller->setRFUWrapperLogging(m_rfuLog);
+	m_controller->setRFUESP32Port(m_rfuEsp32Port);
+	m_controller->setRFUCableWrapper(m_rfuCableWrapper);
 	m_controller->setRFUBackend(m_rfuBackend);
-	// The log first: the wrapper's wireless side opens its backend trace when it starts, and only if logging is already on.
-	m_controller->setRFUWrapperLogging(m_rfuWrapLog);
-	m_controller->setRFUWrapperBackend(m_rfuWrapBackend);
 #endif
 	attachWidget(m_display.get());
 	setFocus();
@@ -985,6 +992,9 @@ void Window::gameStarted() {
 	}
 	interrupter.resume();
 
+#ifdef M_CORE_GBA
+	updateRFUESP32Boards(false); // a board may have been plugged in since the list was made
+#endif
 	m_actions.rebuildMenu(menuBar(), this, *m_shortcutController);
 
 #ifdef M_CORE_GBA
@@ -1615,7 +1625,7 @@ void Window::setupMenu(QMenuBar* menubar) {
 	auto bcGate = addGameAction(tr("BattleChip Gate..."), "bcGate", openControllerTView<BattleChipView>(this), "emu");
 	m_platformActions.insert(mPLATFORM_GBA, bcGate);
 
-	// Wireless adapter (RFU) and RFU Cable Wrapper: per window. These options are deliberately NOT registered with the
+	// Wireless adapter (RFU), with its RFU Cable Wrapper mode: per window. These options are deliberately NOT registered with the
 	// shared ConfigController (addOption), whose values are broadcast to every window: two windows in a multiplayer setup
 	// need different settings (one with the adapter, one without). Each window owns its options; the last choice is only
 	// saved as the default for the next launch.
@@ -1641,13 +1651,50 @@ void Window::setupMenu(QMenuBar* menubar) {
 	// Wireless adapter (RFU): off, or which backend carries its "air" (see CoreController::setRFUBackend).
 	m_actions.addMenu(tr("Wireless Adapter"), "rfu", "emu");
 	ConfigOption* rfuBackend = localOption("rfu.backend");
-	rfuBackend->addValue(tr("Off"), "off", &m_actions, "rfu");
+	// Choosing one leaves the menu open, so the ESP32 board (or the log) can be set in the same visit.
+	rfuBackend->addValue(tr("Off"), "off", &m_actions, "rfu")->setKeepsMenuOpen();
 	m_actions.addSeparator("rfu");
-	rfuBackend->addValue(tr("Local"), "local", &m_actions, "rfu");
-	rfuBackend->addValue(tr("Broadcast"), "broadcast", &m_actions, "rfu");
-	rfuBackend->addValue(tr("ESP32"), "esp32", &m_actions, "rfu");
+	rfuBackend->addValue(tr("Local"), "local", &m_actions, "rfu")->setKeepsMenuOpen();
+	rfuBackend->addValue(tr("ldnd"), "ldnd", &m_actions, "rfu")->setKeepsMenuOpen();
+	rfuBackend->addValue(tr("ESP32"), "esp32", &m_actions, "rfu")->setKeepsMenuOpen();
+	// RFU Cable Wrapper: the chosen backend drives a virtual cable partner instead of an adapter, so a cable-only game
+	// (Ruby/Sapphire) can trade with an FRLG leader. Local and ESP32 join one; ldnd is still a stub.
+	m_actions.addSeparator("rfu");
+	ConfigOption* cableWrapper = localOption("rfu.cableWrapper");
+	cableWrapper->addBoolean(tr("Cable wrapper (Ruby/Sapphire)"), &m_actions, "rfu");
+	cableWrapper->connect([this](const QVariant& value) {
+		m_rfuCableWrapper = value.toBool();
+		if (m_controller) {
+			m_controller->setRFUCableWrapper(m_rfuCableWrapper);
+		}
+	}, this);
+	// Which board the ESP32 backend opens: the ones plugged in are listed (Refresh looks again), and Auto-detect takes the
+	// first of them. Per window like the rest; only the first window saves it.
+	m_actions.addMenu(tr("ESP32 board"), "rfuEsp32", "rfu");
+	m_rfuEsp32Primary = primary;
+	m_rfuEsp32Port = savedOr("rfu.esp32port", "");
+	updateRFUESP32Boards(false);
+	// How the chosen backend's connection is doing (ldnd, the ESP32 board, ...); the lines follow it about once a second.
+	m_actions.addMenu(tr("Status"), "rfuStatus", "rfu");
+	for (int i = 0; i < 5; ++i) {
+		auto line = m_actions.addAction(QString(), QString("rfuStatus.line%1").arg(i), []() {}, "rfuStatus");
+		line->setEnabled(false);
+		m_rfuStatusLines.append(line);
+	}
+	m_actions.addSeparator("rfuStatus");
+	auto rfuCheck = m_actions.addAction(tr("Check now"), "rfuStatus.check", [this]() {
+		if (m_controller) {
+			m_controller->probeRFU();
+		}
+		updateRFUStatus();
+		// The backend answers from its own thread; look again once it has had a moment.
+		QTimer::singleShot(300, this, &Window::updateRFUStatus);
+	}, "rfuStatus");
+	rfuCheck->setKeepsMenuOpen();
+	updateRFUStatus();
 	rfuBackend->connect([this](const QVariant& value) {
 		m_rfuBackend = value.toString();
+		m_actions.setMenuVisible("rfuEsp32", m_rfuBackend == QLatin1String("esp32"));
 		if (m_controller) {
 			m_controller->setRFUBackend(m_rfuBackend);
 		}
@@ -1656,10 +1703,32 @@ void Window::setupMenu(QMenuBar* menubar) {
 	if (m_config->getOption("rfu.backend").isEmpty() && m_config->getOption("rfu.enabled").toInt()) {
 		m_config->setOption("rfu.backend", "local");
 	}
+	// The ldnd backend used to be called "broadcast".
+	for (const char* key : {"rfu.backend", "rfuwrap.backend"}) {
+		if (m_config->getOption(key) == "broadcast") {
+			m_config->setOption(key, "ldnd");
+		}
+	}
+	// The wrapper used to have its own menu with its own backend; while it was on it held the link port, so its backend
+	// was the one in use.
+	const QString oldWrap = m_config->getOption("rfuwrap.backend");
+	if (!oldWrap.isEmpty() && oldWrap != QLatin1String("off") && m_config->getOption("rfu.cableWrapper").isEmpty()) {
+		m_config->setOption("rfu.backend", oldWrap);
+		m_config->setOption("rfu.cableWrapper", 1);
+	}
+	if (m_config->getOption("rfuwrap.log").toInt()) {
+		m_config->setOption("rfu.log", 1);
+	}
+	m_config->setOption("rfuwrap.backend", "off");
+	m_config->setOption("rfuwrap.log", 0);
+	cableWrapper->setValue(QVariant(savedOr("rfu.cableWrapper", "0").toInt() != 0));
 	rfuBackend->setValue(QVariant(savedOr("rfu.backend", "off")));
+	m_actions.setMenuVisible("rfuEsp32", m_rfuBackend == QLatin1String("esp32"));
 
 	// Diagnostics for a wireless adapter that misbehaves: a log of what the adapter and its backend did (Wi-Fi association,
 	// LDN authentication, the Pia session, the game's link traffic). It holds addresses and network names, not prod.keys.
+	// It also writes the cable wrapper's trace, or with the wrapper off, the cable traffic between games in mGBA's own
+	// multiplayer (rfu-wrapper-trace.log), which is the capture the wrapper is built from.
 	m_actions.addSeparator("rfu");
 	ConfigOption* rfuLog = localOption("rfu.log");
 	rfuLog->addBoolean(tr("Save adapter log"), &m_actions, "rfu");
@@ -1667,44 +1736,13 @@ void Window::setupMenu(QMenuBar* menubar) {
 		m_rfuLog = value.toBool();
 		if (m_controller) {
 			m_controller->setRFULogging(m_rfuLog);
+			m_controller->setRFUWrapperLogging(m_rfuLog);
 		}
 	}, this);
 	m_actions.addAction(tr("Open adapter log folder"), "rfuLogFolder", []() {
 		QDesktopServices::openUrl(QUrl::fromLocalFile(ConfigController::configDir()));
 	}, "rfu");
 	rfuLog->setValue(QVariant(savedOr("rfu.log", "0").toInt() != 0));
-
-	// RFU Cable Wrapper: lets a cable-only game (Ruby/Sapphire) talk to an FRLG leader. Local joins a leader in another
-	// mGBA, ESP32 a real Switch through the board, Broadcast one over Wi-Fi through ldnd. Its log is the wrapper's own trace (or, with the wrapper off, the
-	// cable traffic between games in mGBA's multiplayer).
-	m_actions.addMenu(tr("RFU Cable Wrapper"), "rfuwrap", "emu");
-	ConfigOption* wrapBackend = localOption("rfuwrap.backend");
-	wrapBackend->addValue(tr("Off"), "off", &m_actions, "rfuwrap");
-	m_actions.addSeparator("rfuwrap");
-	wrapBackend->addValue(tr("Local"), "local", &m_actions, "rfuwrap");
-	wrapBackend->addValue(tr("Broadcast"), "broadcast", &m_actions, "rfuwrap");
-	wrapBackend->addValue(tr("ESP32"), "esp32", &m_actions, "rfuwrap");
-	wrapBackend->connect([this](const QVariant& value) {
-		m_rfuWrapBackend = value.toString();
-		if (m_controller) {
-			m_controller->setRFUWrapperBackend(m_rfuWrapBackend);
-		}
-	}, this);
-	wrapBackend->setValue(QVariant(savedOr("rfuwrap.backend", "off")));
-
-	m_actions.addSeparator("rfuwrap");
-	ConfigOption* wrapLog = localOption("rfuwrap.log");
-	wrapLog->addBoolean(tr("Save adapter log"), &m_actions, "rfuwrap");
-	wrapLog->connect([this](const QVariant& value) {
-		m_rfuWrapLog = value.toBool();
-		if (m_controller) {
-			m_controller->setRFUWrapperLogging(m_rfuWrapLog);
-		}
-	}, this);
-	m_actions.addAction(tr("Open adapter log folder"), "rfuwrapLogFolder", []() {
-		QDesktopServices::openUrl(QUrl::fromLocalFile(ConfigController::configDir()));
-	}, "rfuwrap");
-	wrapLog->setValue(QVariant(savedOr("rfuwrap.log", "0").toInt() != 0));
 #endif
 
 	m_actions.addMenu(tr("Audio/&Video"), "av");
@@ -2212,6 +2250,142 @@ void Window::updateMRU() {
 
 	m_actions.rebuildMenu(menuBar(), this, *m_shortcutController);
 }
+
+#ifdef M_CORE_GBA
+// Emulation > Wireless Adapter > ESP32 board: Auto-detect, then every board plugged in right now. A board chosen earlier
+// that is not plugged in stays listed (and ticked), so the choice is not silently lost.
+void Window::updateRFUESP32Boards(bool rebuild) {
+	GBASIORFUESP32Port found[16];
+	size_t count = GBASIORFUESP32ListPorts(found, sizeof(found) / sizeof(found[0]));
+
+	m_actions.clearMenu("rfuEsp32");
+	m_rfuEsp32Actions.clear();
+	auto addBoard = [this](const QString& text, const QString& port) {
+		QString name = QString("rfuEsp32.%1").arg(port.isEmpty() ? QStringLiteral("auto") : port);
+		auto action = m_actions.addAction(text, name, [this, port]() {
+			setRFUESP32Port(port);
+		}, "rfuEsp32");
+		action->setExclusive();
+		action->setActive(port == m_rfuEsp32Port);
+		m_rfuEsp32Actions.append(qMakePair(action, port));
+	};
+
+	if (count) {
+		addBoard(tr("Auto-detect (%1)").arg(QString::fromUtf8(found[0].name)), QString());
+	} else {
+		addBoard(tr("Auto-detect"), QString());
+	}
+	m_actions.addSeparator("rfuEsp32");
+	bool savedListed = m_rfuEsp32Port.isEmpty();
+	for (size_t i = 0; i < count; ++i) {
+		QString port = QString::fromUtf8(found[i].name);
+		QString description = QString::fromUtf8(found[i].description);
+		addBoard(description.isEmpty() ? port : tr("%1 (%2)").arg(port, description), port);
+		if (!port.compare(m_rfuEsp32Port, Qt::CaseInsensitive)) {
+			savedListed = true;
+		}
+	}
+	if (!savedListed) {
+		addBoard(tr("%1 (not connected)").arg(m_rfuEsp32Port), m_rfuEsp32Port);
+	}
+	if (!count) {
+		auto none = m_actions.addAction(tr("No boards found"), "rfuEsp32.none", []() {}, "rfuEsp32");
+		none->setEnabled(false);
+	}
+	m_actions.addSeparator("rfuEsp32");
+	auto refresh = m_actions.addAction(tr("Refresh"), "rfuEsp32.refresh", [this]() {
+		// Not from inside the menu action being triggered: the rebuild replaces it.
+		QTimer::singleShot(0, this, [this]() {
+			updateRFUESP32Boards();
+		});
+	}, "rfuEsp32");
+	refresh->setKeepsMenuOpen();
+
+	// Refill just this submenu, so it stays open while Refresh is clicked; the whole menu bar only if it was never built.
+	if (rebuild && !m_actions.rebuildSubmenu("rfuEsp32", this, *m_shortcutController)) {
+		m_actions.rebuildMenu(menuBar(), this, *m_shortcutController);
+	}
+}
+
+// Emulation > Wireless Adapter > Status. Lines, in order: the state, what the backend talks to, what it is doing, rooms
+// in range, and the last error. The RFU Cable Wrapper's wireless side is shown when it holds the link port instead.
+void Window::updateRFUStatus() {
+	if (m_rfuStatusLines.size() < 5) {
+		return;
+	}
+	GBASIORFUBackendStatus status{};
+	QString backend;
+	bool wrapper = false;
+	bool attached = m_controller && m_controller->rfuStatus(&status, &backend, &wrapper);
+
+	QString state;
+	QString device;
+	QString activity;
+	QString rooms = tr("Rooms in range: %1").arg(QStringLiteral("-"));
+	QString error = tr("Last error: none");
+	if (!attached) {
+		bool chosen = m_rfuBackend != QLatin1String("off");
+		state = tr("Status: %1").arg(!chosen ? tr("Off") : m_controller ? tr("Not attached") : tr("No game running"));
+		device = tr("Device: none");
+		activity = tr("Activity: %1").arg(!chosen ? tr("choose Local, ldnd or ESP32 above") : tr("attached when a GBA game is running"));
+	} else {
+		QString link;
+		switch (status.link) {
+		case RFU_BACKEND_UNAVAILABLE:
+			link = tr("Not connected");
+			break;
+		case RFU_BACKEND_IDLE:
+			link = tr("Idle");
+			break;
+		case RFU_BACKEND_STARTING:
+			link = tr("Connecting");
+			break;
+		case RFU_BACKEND_READY:
+			link = tr("Ready");
+			break;
+		case RFU_BACKEND_JOINING:
+			link = tr("Joining");
+			break;
+		case RFU_BACKEND_JOINED:
+			link = tr("Connected to a host");
+			break;
+		}
+		QString who = wrapper ? tr("Cable wrapper (%1)").arg(backend) : backend;
+		state = tr("Status: %1 - %2").arg(who, link);
+		QString deviceText = QString::fromUtf8(status.device);
+		if (deviceText.isEmpty() && backend == QLatin1String("local")) {
+			deviceText = tr("other mGBA windows on this computer");
+		}
+		device = tr("Device: %1").arg(deviceText.isEmpty() ? tr("none") : deviceText);
+		QString detail = QString::fromUtf8(status.detail);
+		activity = tr("Activity: %1").arg(detail.isEmpty() ? QStringLiteral("-") : detail);
+		if (status.hostsHeard >= 0) {
+			rooms = tr("Rooms in range: %1").arg(status.hostsHeard);
+		}
+		if (status.lastError[0]) {
+			error = tr("Last error: %1").arg(QString::fromUtf8(status.lastError));
+		}
+	}
+	m_rfuStatusLines[0]->setVisibleName(state);
+	m_rfuStatusLines[1]->setVisibleName(device);
+	m_rfuStatusLines[2]->setVisibleName(activity);
+	m_rfuStatusLines[3]->setVisibleName(rooms);
+	m_rfuStatusLines[4]->setVisibleName(error);
+}
+
+void Window::setRFUESP32Port(const QString& port) {
+	m_rfuEsp32Port = port;
+	for (auto& entry : m_rfuEsp32Actions) {
+		entry.first->setActive(entry.second == port);
+	}
+	if (m_rfuEsp32Primary) {
+		m_config->setOption("rfu.esp32port", port);
+	}
+	if (m_controller) {
+		m_controller->setRFUESP32Port(port);
+	}
+}
+#endif
 
 void Window::ensureScripting() {
 #ifdef ENABLE_SCRIPTING

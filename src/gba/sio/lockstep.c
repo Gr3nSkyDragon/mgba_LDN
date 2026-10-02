@@ -118,7 +118,7 @@ static void _hardSync(struct GBASIOLockstepCoordinator*, struct GBASIOLockstepPl
 
 static void _lockstepEvent(struct mTiming*, void* context, uint32_t cyclesLate);
 
-// Optional trace of the cable traffic (Emulation > RFU Cable Wrapper > Save adapter log). The coordinator is shared by every
+// Optional trace of the cable traffic (Emulation > Wireless Adapter > Save adapter log). The coordinator is shared by every
 // window in the process, so the sink is process-wide and reference counted; each line is tagged with the player it is for.
 static FILE* sTrace;
 static Mutex sTraceMutex;

@@ -29,6 +29,14 @@ struct GBASIORFUBackend* GBASIORFUESP32Create(void);
 // the backend is attached.
 void GBASIORFUESP32SetPort(struct GBASIORFUBackend*, const char* port);
 
+// The boards plugged in right now, in the order auto-detection would pick them (for a frontend's device list).
+// Returns how many were written, at most `max`. `description` names the USB interface and may be empty.
+struct GBASIORFUESP32Port {
+	char name[32];
+	char description[32];
+};
+size_t GBASIORFUESP32ListPorts(struct GBASIORFUESP32Port* out, size_t max);
+
 CXX_GUARD_END
 
 #endif

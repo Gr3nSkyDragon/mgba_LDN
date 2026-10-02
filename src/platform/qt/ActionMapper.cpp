@@ -9,10 +9,15 @@
 #include "ConfigController.h"
 #include "ShortcutController.h"
 
+#include <QKeyEvent>
 #include <QMenu>
 #include <QMenuBar>
+#include <QMouseEvent>
 
 using namespace QGBA;
+
+static const char* const kKeepMenuOpen = "mgbaKeepMenuOpen";
+static const char* const kClearConnected = "mgbaClearConnected";
 
 void ActionMapper::addMenu(const QString& visibleName, const QString& name, const QString& parent) {
 	QString mname(QString(".%1").arg(name));
@@ -29,6 +34,18 @@ void ActionMapper::addHiddenMenu(const QString& visibleName, const QString& name
 void ActionMapper::clearMenu(const QString& name) {
 	m_menus[name].clear();
 	emit menuCleared(name);
+}
+
+void ActionMapper::setMenuVisible(const QString& name, bool visible) {
+	if (visible) {
+		m_invisibleMenus.remove(name);
+	} else {
+		m_invisibleMenus.insert(name);
+	}
+	QPointer<QMenu> qmenu = m_qmenus.value(name);
+	if (qmenu) {
+		qmenu->menuAction()->setVisible(visible);
+	}
 }
 
 void ActionMapper::rebuildMenu(QMenuBar* menubar, QWidget* context, const ShortcutController& shortcuts) {
@@ -49,7 +66,21 @@ void ActionMapper::rebuildMenu(QMenuBar* menubar, QWidget* context, const Shortc
 	}
 }
 
+bool ActionMapper::rebuildSubmenu(const QString& menu, QWidget* context, const ShortcutController& shortcuts) {
+	QPointer<QMenu> qmenu = m_qmenus.value(menu);
+	if (!qmenu) {
+		return false;
+	}
+	for (QAction* action : qmenu->actions()) {
+		qmenu->removeAction(action);
+	}
+	rebuildMenu(menu, qmenu, context, shortcuts);
+	return true;
+}
+
 void ActionMapper::rebuildMenu(const QString& menu, QMenu* qmenu, QWidget* context, const ShortcutController& shortcuts) {
+	m_qmenus[menu] = qmenu;
+	qmenu->installEventFilter(this);
 	for (const QString& actionName : m_menus[menu]) {
 		if (actionName.isNull()) {
 			qmenu->addSeparator();
@@ -61,6 +92,7 @@ void ActionMapper::rebuildMenu(const QString& menu, QMenu* qmenu, QWidget* conte
 		if (actionName[0] == '.') {
 			QString name = actionName.mid(1);
 			QMenu* newMenu = qmenu->addMenu(m_menuNames[name]);
+			newMenu->menuAction()->setVisible(!m_invisibleMenus.contains(name));
 			rebuildMenu(name, newMenu, context, shortcuts);
 			continue;
 		}
@@ -74,6 +106,7 @@ void ActionMapper::rebuildMenu(const QString& menu, QMenu* qmenu, QWidget* conte
 		if (action->isActive()) {
 			qaction->setChecked(true);
 		}
+		qaction->setProperty(kKeepMenuOpen, action->keepsMenuOpen());
 		const Shortcut* shortcut = shortcuts.shortcut(actionName);
 		if (shortcut) {
 			if (shortcut->shortcut() > 0) {
@@ -110,6 +143,7 @@ void ActionMapper::rebuildMenu(const QString& menu, QMenu* qmenu, QWidget* conte
 			}
 		});
 		QObject::connect(action.get(), &Action::enabled, qaction, &QAction::setEnabled);
+		QObject::connect(action.get(), &Action::visibleNameChanged, qaction, &QAction::setText);
 		QObject::connect(action.get(), &Action::activated, [qaction, weakAction = std::move(weakAction)](bool active) {
 			std::shared_ptr<Action> action(weakAction.lock());
 			if (qaction->isCheckable()) {
@@ -126,6 +160,10 @@ void ActionMapper::rebuildMenu(const QString& menu, QMenu* qmenu, QWidget* conte
 		}
 		context->addAction(qaction);
 	}
+	if (qmenu->property(kClearConnected).toBool()) {
+		return; // refilled in place by rebuildSubmenu: already connected
+	}
+	qmenu->setProperty(kClearConnected, true);
 	connect(this, &ActionMapper::menuCleared, qmenu, [qmenu, menu](const QString& name) {
 		if (name != menu) {
 			return;
@@ -134,6 +172,32 @@ void ActionMapper::rebuildMenu(const QString& menu, QMenu* qmenu, QWidget* conte
 			qmenu->removeAction(action);
 		}
 	});
+}
+
+// A QMenu closes itself when one of its items is triggered; for an action that keeps the menu open, trigger it here
+// and swallow the event instead.
+bool ActionMapper::eventFilter(QObject* obj, QEvent* event) {
+	QMenu* qmenu = qobject_cast<QMenu*>(obj);
+	if (!qmenu) {
+		return QObject::eventFilter(obj, event);
+	}
+	QAction* qaction = nullptr;
+	if (event->type() == QEvent::MouseButtonRelease) {
+		QMouseEvent* mouse = static_cast<QMouseEvent*>(event);
+		if (mouse->button() == Qt::LeftButton) {
+			qaction = qmenu->actionAt(mouse->pos());
+		}
+	} else if (event->type() == QEvent::KeyPress) {
+		int key = static_cast<QKeyEvent*>(event)->key();
+		if (key == Qt::Key_Return || key == Qt::Key_Enter) {
+			qaction = qmenu->activeAction();
+		}
+	}
+	if (qaction && qaction->isEnabled() && !qaction->menu() && qaction->property(kKeepMenuOpen).toBool()) {
+		qaction->trigger();
+		return true;
+	}
+	return QObject::eventFilter(obj, event);
 }
 
 void ActionMapper::addSeparator(const QString& menu) {

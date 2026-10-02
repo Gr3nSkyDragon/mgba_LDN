@@ -99,7 +99,7 @@ static bool _attachWrapper(const char* backend) {
 		snprintf(backendTrace, sizeof(backendTrace), "%s.backend", gTracePath);
 	}
 	GBASIORFUWrapperCreate(&gWrapper, backend);
-	if (!GBASIORFUWrapperAttachAir(&gWrapper, backend, backendTrace, NULL)) {
+	if (!GBASIORFUWrapperAttachAir(&gWrapper, backend, backendTrace)) {
 		LOGI("RFU cable wrapper: could not open the wireless side %s", backend);
 	}
 	gCore->setPeripheral(gCore, mPERIPH_GBA_LINK_PORT, &gWrapper.d);

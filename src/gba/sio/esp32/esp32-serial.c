@@ -89,30 +89,25 @@ static bool _platformWrite(struct Esp32Serial* port, const void* data, size_t le
 	return true;
 }
 
-// Whether a COM port of that name exists right now. The registry keeps entries for unplugged devices.
+// Whether a COM port of that name exists right now. The registry keeps entries for unplugged devices, but the port's
+// device name only exists while it is plugged in. Asking for the name (rather than opening the port) leaves the board
+// alone: opening a native USB Serial/JTAG port can reset the chip, and a port another program has open still counts.
 static bool _portPresent(const char* name) {
-	char device[80];
-	snprintf(device, sizeof(device), "\\\\.\\%s", name);
-	HANDLE probe = CreateFileA(device, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
-	bool present = probe != INVALID_HANDLE_VALUE || GetLastError() == ERROR_ACCESS_DENIED;
-	if (probe != INVALID_HANDLE_VALUE) {
-		CloseHandle(probe);
-	}
-	return present;
+	char target[512];
+	return QueryDosDeviceA(name, target, sizeof(target)) != 0;
 }
 
-// The COM port of a present USB device whose enumeration name (HKLM\SYSTEM\CurrentControlSet\Enum\USB\<name>) starts with
-// `prefix`. A composite device appears as VID_xxxx&PID_yyyy&MI_00 (its interface 0 is the serial function), a plain one
-// without the MI_ suffix; both start with the vendor id. Each has one key per physical instance, whose Device Parameters
-// hold the PortName.
-static bool _findPortForVendor(const char* prefix, char* out, size_t capacity) {
+// Adds the COM ports of present USB devices whose enumeration name (HKLM\SYSTEM\CurrentControlSet\Enum\USB\<name>)
+// starts with `prefix` to `out` (skipping names already there) until it holds `max`. A composite device appears as
+// VID_xxxx&PID_yyyy&MI_00 (its interface 0 is the serial function), a plain one without the MI_ suffix; both start with
+// the vendor id. Each has one key per physical instance, whose Device Parameters hold the PortName.
+static void _listPortsForVendor(const char* prefix, const char* description, struct Esp32SerialPortInfo* out, size_t max, size_t* count) {
 	HKEY usb;
 	if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Enum\\USB", 0, KEY_READ, &usb) != ERROR_SUCCESS) {
-		return false;
+		return;
 	}
-	bool found = false;
 	char device[256];
-	for (DWORD d = 0; !found; ++d) {
+	for (DWORD d = 0; *count < max; ++d) {
 		DWORD length = sizeof(device);
 		if (RegEnumKeyExA(usb, d, device, &length, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) {
 			break;
@@ -127,7 +122,7 @@ static bool _findPortForVendor(const char* prefix, char* out, size_t capacity) {
 			continue;
 		}
 		char instance[256];
-		for (DWORD i = 0; !found; ++i) {
+		for (DWORD i = 0; *count < max; ++i) {
 			DWORD instanceLength = sizeof(instance);
 			if (RegEnumKeyExA(deviceKey, i, instance, &instanceLength, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) {
 				break;
@@ -138,39 +133,57 @@ static bool _findPortForVendor(const char* prefix, char* out, size_t capacity) {
 			if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, path, 0, KEY_READ, &params) != ERROR_SUCCESS) {
 				continue;
 			}
-			char name[64];
-			DWORD size = sizeof(name);
+			char name[64] = {0};
+			DWORD size = sizeof(name) - 1;
 			DWORD type = 0;
 			bool have = RegQueryValueExA(params, "PortName", NULL, &type, (LPBYTE) name, &size) == ERROR_SUCCESS && type == REG_SZ;
 			RegCloseKey(params);
-			if (have && strlen(name) < capacity && _portPresent(name)) {
-				strcpy(out, name);
-				found = true;
+			if (!have || strlen(name) >= sizeof(out->name) || !_portPresent(name)) {
+				continue;
+			}
+			bool duplicate = false;
+			for (size_t j = 0; j < *count && !duplicate; ++j) {
+				duplicate = !_stricmp(out[j].name, name);
+			}
+			if (!duplicate) {
+				snprintf(out[*count].name, sizeof(out->name), "%s", name);
+				snprintf(out[*count].description, sizeof(out->description), "%s", description);
+				++*count;
 			}
 		}
 		RegCloseKey(deviceKey);
 	}
 	RegCloseKey(usb);
-	return found;
+}
+
+static size_t _platformListEspressif(struct Esp32SerialPortInfo* out, size_t max) {
+	// Boards with a native USB port (the S3/C3/C6 "USB" connector) enumerate as Espressif's own device, which goes first.
+	// Boards with only a UART bridge (a single-connector ESP32, or the "UART" connector of a two-port S3 board) show up
+	// as whichever bridge chip they carry, so those vendors are tried next. When several are plugged in, auto-detection
+	// takes the first; MGBA_RFU_ESP32_PORT (or Emulation > Wireless Adapter > ESP32 board) names one explicitly.
+	static const struct {
+		const char* prefix;
+		const char* description;
+	} kVendors[] = {
+		{ "VID_303A", "Espressif USB" }, // native USB Serial/JTAG
+		{ "VID_10C4", "CP210x" }, // Silicon Labs
+		{ "VID_1A86", "CH340/CH9102" }, // WCH
+		{ "VID_0403", "FTDI" },
+	};
+	size_t count = 0;
+	for (size_t i = 0; i < sizeof(kVendors) / sizeof(kVendors[0]) && count < max; ++i) {
+		_listPortsForVendor(kVendors[i].prefix, kVendors[i].description, out, max, &count);
+	}
+	return count;
 }
 
 static bool _platformFindEspressif(char* out, size_t capacity) {
-	// Boards with a native USB port (the S3/C3/C6 "USB" connector) enumerate as Espressif's own device, which goes first.
-	// Boards with only a UART bridge (a single-connector ESP32, or the "UART" connector of a two-port S3 board) show up
-	// as whichever bridge chip they carry, so those vendors are tried next. When several are plugged in the order above
-	// decides; MGBA_RFU_ESP32_PORT names one explicitly.
-	static const char* const kVendors[] = {
-		"VID_303A", // Espressif (native USB Serial/JTAG)
-		"VID_10C4", // Silicon Labs CP210x
-		"VID_1A86", // WCH CH340 / CH9102
-		"VID_0403", // FTDI
-	};
-	for (size_t i = 0; i < sizeof(kVendors) / sizeof(kVendors[0]); ++i) {
-		if (_findPortForVendor(kVendors[i], out, capacity)) {
-			return true;
-		}
+	struct Esp32SerialPortInfo first;
+	if (!_platformListEspressif(&first, 1) || strlen(first.name) >= capacity) {
+		return false;
 	}
-	return false;
+	strcpy(out, first.name);
+	return true;
 }
 
 #else
@@ -199,6 +212,11 @@ static bool _platformFindEspressif(char* out, size_t capacity) {
 	(void) out;
 	(void) capacity;
 	return false;
+}
+static size_t _platformListEspressif(struct Esp32SerialPortInfo* out, size_t max) {
+	(void) out;
+	(void) max;
+	return 0;
 }
 
 #endif
@@ -240,4 +258,16 @@ bool Esp32SerialWrite(struct Esp32Serial* port, const void* data, size_t length)
 
 bool Esp32SerialFindEspressif(char* out, size_t capacity) {
 	return sOps->find(out, capacity);
+}
+
+size_t Esp32SerialListEspressif(struct Esp32SerialPortInfo* out, size_t max) {
+	if (!max) {
+		return 0;
+	}
+	if (sOps == &kPlatformOps) {
+		return _platformListEspressif(out, max);
+	}
+	// A host application's implementation only knows how to find one device: that one is the list.
+	memset(out, 0, sizeof(*out));
+	return sOps->find(out->name, sizeof(out->name)) ? 1 : 0;
 }

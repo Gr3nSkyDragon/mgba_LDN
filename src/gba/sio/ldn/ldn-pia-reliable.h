@@ -15,7 +15,7 @@
 /*
  * Pia message tiling (a decrypted Pia payload is zero or more self-describing messages, an optional 2-byte
  * recipient-station footer, then 0xFF padding) and the Reliable(10) protocol riding inside it: a selective-repeat
- * sliding window carrying this project's actual RFU-adapter bytes (see rfu-broadcast.c) reliably and in order.
+ * sliding window carrying this project's actual RFU-adapter bytes (see rfu-ldnd.c) reliably and in order.
  *
  * Read from the `pokeldn` reference project's `pokeldn/ldn/reliable.py` (used only to learn the wire format and
  * the window algorithm - not copied source; see the project notes for the full field-by-field spec this was

@@ -65,9 +65,9 @@ if(NOT LIBMGBA_ONLY)
 	set(M_CORE_GB ON CACHE BOOL "Build Game Boy core")
 	set(USE_LZMA ON CACHE BOOL "Whether or not to enable 7-Zip support")
 	if(WIN32)
-		set(USE_LDN_BROADCAST ON CACHE BOOL "Whether or not to build the Broadcast (LDN, via ldnd) wireless adapter backend")
+		set(USE_LDND ON CACHE BOOL "Whether or not to build the ldnd (LDN) wireless adapter backend")
 	else()
-		set(USE_LDN_BROADCAST OFF CACHE BOOL "Whether or not to build the Broadcast (LDN, via ldnd) wireless adapter backend")
+		set(USE_LDND OFF CACHE BOOL "Whether or not to build the ldnd (LDN) wireless adapter backend")
 	endif()
 	set(USE_DISCORD_RPC ON CACHE BOOL "Whether or not to enable Discord RPC support")
 	set(ENABLE_SCRIPTING ON CACHE BOOL "Whether or not to enable scripting support")
@@ -228,7 +228,7 @@ if(WIN32)
 		endif()
 	endif()
 	list(APPEND OS_LIB ws2_32 shlwapi)
-	if(USE_LDN_BROADCAST)
+	if(USE_LDND)
 		list(APPEND OS_LIB bcrypt)
 	endif()
 	list(APPEND OS_DEFINES ENABLE_VFS_FD)
@@ -858,53 +858,14 @@ add_subdirectory(src/gba)
 add_subdirectory(src/sm83)
 add_subdirectory(src/util)
 
-if(USE_LDN_BROADCAST)
-	add_definitions(-DUSE_LDN_BROADCAST)
-	# Development tool: talks to a running ldnd and lists the Wi-Fi device it exposes.
+if(USE_LDND)
+	add_definitions(-DUSE_LDND)
 	add_executable(ldnd-probe
 		src/gba/sio/ldn/ldnd-probe.c
 		src/gba/sio/ldn/ldnd.c
-		src/gba/sio/ldn/netlink.c)
-	# Development tool: listens for a Switch's LDN advertisements (monitor mode) and decodes them.
-	add_executable(ldn-scan
-		src/gba/sio/ldn/ldn-scan.c
-		src/gba/sio/ldn/ldn.c
-		src/gba/sio/ldn/ldn-monitor.c
-		src/gba/sio/ldn/ldnd.c
-		src/gba/sio/ldn/netlink.c)
+		src/gba/sio/ldn/ldn.c)
 	if(WIN32)
-		target_link_libraries(ldn-scan bcrypt)
-	endif()
-	# Development tool: scans for a Switch's advertisement, then attempts real WPA2-PSK association with it.
-	add_executable(ldn-join
-		src/gba/sio/ldn/ldn-join.c
-		src/gba/sio/ldn/ldn.c
-		src/gba/sio/ldn/ldn-monitor.c
-		src/gba/sio/ldn/ldn-station.c
-		src/gba/sio/ldn/ldn-auth.c
-		src/gba/sio/ldn/ldnd.c
-		src/gba/sio/ldn/netlink.c)
-	if(WIN32)
-		target_link_libraries(ldn-join bcrypt)
-	endif()
-	# Development tool: like ldn-join, then also brings up and drives the Pia connection layer (Net/Session/RTT)
-	# to see whether the host accepts a Pia session - does not yet bridge any RFU/game data.
-	add_executable(ldn-pia-join
-		src/gba/sio/ldn/ldn-pia-join.c
-		src/gba/sio/ldn/ldn.c
-		src/gba/sio/ldn/ldn-monitor.c
-		src/gba/sio/ldn/ldn-station.c
-		src/gba/sio/ldn/ldn-auth.c
-		src/gba/sio/ldn/ldn-pia.c
-		src/gba/sio/ldn/ldn-pia-reliable.c
-		src/gba/sio/ldn/ldn-pia-connect.c
-		src/gba/sio/ldn/ldnd.c
-		src/gba/sio/ldn/netlink.c
-		src/util/crc32.c
-		src/third-party/zstd/zstdlib.c)
-	target_include_directories(ldn-pia-join PRIVATE include)
-	if(WIN32)
-		target_link_libraries(ldn-pia-join bcrypt)
+		target_link_libraries(ldnd-probe bcrypt)
 	endif()
 endif()
 
@@ -1121,6 +1082,11 @@ if(BUILD_UPDATER)
 	else()
 		set_target_properties(updater-stub PROPERTIES LINK_FLAGS_RELEASE -s)
 		set_target_properties(updater-stub PROPERTIES LINK_FLAGS_RELWITHDEBINFO -s)
+	endif()
+	if(DEFINED CMAKE_CONFIGURATION_TYPES)
+		# The genex suppresses the per-config subdirectory so that $<TARGET_FILE:updater-stub>
+		# is identical across configs; otherwise file(GENERATE) of updater.qrc conflicts
+		set_target_properties(updater-stub PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/$<0:>")
 	endif()
 endif()
 

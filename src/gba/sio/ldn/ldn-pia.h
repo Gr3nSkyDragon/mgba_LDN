@@ -6,8 +6,6 @@
 #ifndef GBA_SIO_LDN_PIA_H
 #define GBA_SIO_LDN_PIA_H
 
-#include "ldnd.h"
-
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -46,8 +44,8 @@
  *   then an 8-byte AES-GCM tag (truncated from the real 16), then the ciphertext.
  *
  * Session key: AES-128-ECB(FRLG's fixed 16-byte game key).encrypt(ssid) where `ssid` is the LDN advertisement's
- * raw 16-byte SSID field (LdnAdvertisement.ssid - NOT the hex-encoded 32-character Wi-Fi SSID string
- * LdnAdvertisementWlanSsid produces for nl80211; this is the same 16 raw bytes, used directly).
+ * raw 16-byte SSID field (LdndNetworkInfo.ssid - NOT the hex-encoded 32-character Wi-Fi SSID the network is
+ * joined by; this is the same 16 raw bytes, used directly).
  *
  * AES-GCM nonce (12 bytes) = (CRC32(ssid[1..15]) XOR the SENDER's own LDN IPv4 address, as a big-endian u32)
  * (4 bytes) || the header's own 8-byte nonce field. AAD is empty. The plaintext, once decrypted, may be a zstd
@@ -89,7 +87,7 @@ struct LdnPiaCrypto {
 	uint32_t netId; // CRC32(ssid[1..15])
 };
 
-// `ssid` is the LDN advertisement's raw 16-byte network SSID (LdnAdvertisement.ssid).
+// `ssid` is the LDN network's raw 16-byte SSID (LdndNetworkInfo.ssid).
 void LdnPiaCryptoInit(struct LdnPiaCrypto* crypto, const uint8_t ssid[16]);
 
 // Decrypts a received Pia datagram. `srcIp` is the SENDER's own LDN IPv4 address (big-endian byte order, i.e.
@@ -130,46 +128,8 @@ bool LdnPiaDecompress(const uint8_t* data, size_t length, uint8_t* out, size_t* 
 // encoder error (e.g. output buffer too small).
 bool LdnPiaCompress(const uint8_t* data, size_t length, uint8_t* out, size_t* outLength);
 
-/*
- * The actual UDP :12345 datagrams Pia rides on, sent/received as raw Ethernet frames over the STATION interface
- * (not through ldnd's kernel IP stack): ldnd's own SENDTO operation has no destination-address parameter (it is a
- * plain `send()`, confirmed by reading the daemon's own source - see the project notes), so an arbitrary-destination
- * UDP datagram can only go out as a hand-built Ethernet+IPv4+UDP frame injected on a raw AF_PACKET socket, the same
- * way ldn-monitor.c already injects/captures raw 802.11 frames. This also means no IP address ever needs to be
- * configured on the kernel interface - sending and receiving both bypass the kernel's IP stack entirely, exactly
- * like this project's LDN association/auth layers already do.
- */
-
 enum {
 	LDN_PIA_MAX_DATAGRAM = 2048, // payload only (the largest Pia message this project ever sends/expects)
 };
-
-struct LdnPiaSocket;
-
-// `ifIndex`/`ourMac` are the STATION interface's (see LdnStationFindInterface) - NOT the monitor interface.
-struct LdnPiaSocket* LdnPiaSocketOpen(struct LdndConnection* conn, uint32_t ifIndex, const uint8_t ourMac[6]);
-void LdnPiaSocketClose(struct LdnPiaSocket*);
-
-// Builds and sends one UDP :12345 datagram (Ethernet dst `destMac`, IPv4 src `srcIp` -> dst `destIp`) carrying
-// `payload` (a complete encrypted Pia datagram from LdnPiaEncrypt, or anything else the caller wants to send raw
-// on this port). Returns 0, or a negative LDND_ERR_*-style error.
-int LdnPiaSocketSend(struct LdnPiaSocket*, const uint8_t destMac[6], const uint8_t srcIp[4], const uint8_t destIp[4], const uint8_t* payload,
-                     size_t length);
-
-// Dequeues one received UDP :12345 datagram's payload (non-blocking; returns false if none is pending). `outIp`
-// receives the sender's IPv4 address; `*inOutLength` is the buffer size on entry (payloads over that size are
-// truncated) and the datagram's real length on return.
-// Sends one ARP frame (Ethernet ethertype 0x0806) out the station interface. The retail Switch did not send
-// anything back to a Ryubing-emulated host until it received an ARP telling it that host's IP-to-MAC mapping - and
-// group-broadcast ARP was NOT enough; a pairwise (unicast, kernel-encrypted) ARP straight to the Switch's MAC was
-// the decisive fix (see the project notes). The kernel encrypts whatever frame goes out the associated station
-// interface, so a unicast `destMac` here is a pairwise-protected ARP. `destMac` NULL = Ethernet broadcast.
-// `opcode` is 1 (request) or 2 (reply); `targetMac` may be NULL (zeros) for a request. Returns 0 or a negative error.
-int LdnPiaSocketSendArp(struct LdnPiaSocket*, const uint8_t* destMac, unsigned opcode, const uint8_t srcIp[4], const uint8_t targetIp[4],
-                        const uint8_t* targetMac);
-
-bool LdnPiaSocketPoll(struct LdnPiaSocket*, uint8_t outIp[4], uint8_t* outPayload, size_t* inOutLength);
-
-const char* LdnPiaSocketLastError(void);
 
 #endif
