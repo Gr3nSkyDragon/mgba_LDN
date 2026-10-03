@@ -6,14 +6,14 @@ nav_order: 2
 
 # The 3DS Virtual Console link, and what runs on it
 
-Measured from one capture: Azahar (VC Red, `uds-real` branch, joiner) trading with an unmodified retail 3DS (VC Red, host) over the
-air, one trade and one trade back. Preserved original: `logs/azahar/azahar_log_original_trade_20261003.txt`
-(SHA-256 `18c6b5ef...`); translated copy: `logs/azahar/azahar_trade_20261003.jsonl`; reproduce with
-`docs/azahar/azahar_log_to_jsonl.py` and `docs/azahar/align_azahar_mgba.py`. The Game Boy side is on
+Measured from five captures, all Azahar (VC Red, `uds-real` branch) against a retail 3DS (VC Red) over the air. In three of them the retail console hosts and
+Azahar joins, and each trades one Pokémon and trades it back; in the other two Azahar hosts and the retail console joins (neither completed).
+Logs are in `logs/azahar/`: `azahar_log_original_trade_20261003.txt` (SHA-256 `18c6b5ef...`), `azahar_log_prev_launch_20261003-1924.txt`,
+`azahar_log_repeat_trade_20261003.txt`, `azahar_log_roleswap_host_20261003.txt`, `azahar_log_roleswap_host2_20261003.txt` (each with a `.sha256`). Reproduce with
+`docs/azahar/azahar_log_to_jsonl.py`, `pia_messages.py`, `verify_vc_hmac.py` and `align_azahar_mgba.py`. The Game Boy side is on
 [The Game Boy link](gb_link.md). Tags as there: **[measured]**, **[src]** (pret source or the VC hook table), **[unknown]**.
 
-Three sessions of the same scenario have been captured (Azahar VC Red joining a retail VC Red host: one trade and one trade back each).
-Where a value differs between them the text says so; everything else was identical in all three. Role swaps, other games and battles are not captured yet.
+Unless a section says otherwise, a number comes from the first capture and a statement held in every capture. Other games (Blue, Yellow, Gen 2), a retail-to-retail capture and battles are not captured yet.
 
 # What the VC is
 
@@ -56,7 +56,7 @@ Top to bottom, for one Game Boy byte:
 | 802.11 | beacons with the Nintendo vendor element, association, EAPOL 4-way handshake, CCMP-encrypted data frames | Wi-Fi chip; in Azahar `uds_real` (ldnd or ESP32) | the beacon/association/EAPOL lines; not the frames themselves |
 
 - **The capture sits between Pia and UDS.** Azahar's `UDS DATA TRACE` lines are the payload the app hands to UDS `SendTo` (and what `PullPacket` returns). That payload is a Pia datagram, so the log shows Pia's header and tail but not 802.11.
-- **Two separate protections.** The air is encrypted with CCMP, keyed from the UDS passphrase (`TRL_NETWORK`). Pia then adds its own HMAC-MD5 tag (fixed key `PokemonSIO`) at the end of each datagram. A peer that is not the VC must satisfy both.
+- **Two separate protections.** The air is encrypted with CCMP. Its key is derived from the UDS passphrase (`TRL_NETWORK`) **and the 3DS's own UDS key** (AES key slot 0x2D, which Azahar takes from your key dump): AES-CTR of `MD5(passphrase)` with a counter of `MD5(host MAC, comm ID, id, network ID)`. Pia then adds its own HMAC-MD5 tag (fixed key `PokemonSIO`) at the end of each datagram. A peer that is not the VC must satisfy both.
 - **Bytes 0-11 of the frame** (`01 01`, length, six zeros, message type) come before the Pia magic. Which layer writes them is [unknown].
 
 # The UDS session
@@ -80,7 +80,7 @@ From the Azahar log, times relative to the first data frame:
 - **Application data.** 16 bytes in the beacon. Its contents, and whether the VC checks them on join, are [unknown] (H4).
 - The beacon, association and EAPOL are standard UDS and are handled by the platform, not by the VC.
 
-All VC traffic uses UDS **channel 243** ("GAME"). Nothing else crosses it.
+All Pia traffic uses UDS **channel 243** ("GAME"). UDS itself also exchanges small **channel-3 management** frames: a joiner sends them to its host about once a second when the link is quiet (Azahar as joiner did; the retail console as joiner did in the second host run, where Azahar answered). They are not Pia and are not in the `GAME` trace.
 
 # The frames
 
@@ -96,8 +96,8 @@ Every UDS payload on channel 243 starts with a 24-byte header.
 | 10 | 2 | message type (table below); constant for a given type |
 | 12 | 4 | **Pia magic `32 AB 98 64`**, constant (every Pia datagram starts with it, see [pokeldn's Pia page](https://github.com/Decryptu/pokeldn/blob/main/docs/pia.md)) |
 | 16 | 1 | Pia version byte `01`. The `0x80` "encrypted" bit is clear, which matches the plaintext payload |
-| 17 | 1 | sender id byte: `AA` in Azahar's frames, `2C` in the host's. `00`/`01` in the first setup frames. Probably Pia's connection id |
-| 18 | 2 | big-endian **packet id**, per sender. Azahar's count 1, 2, 3 ... 1051 with no gaps (every frame, control included); the host's rises with gaps because the log missed some of its frames |
+| 17 | 1 | sender id byte, a **per-session** value for each side (`AA`/`2C`, `F7`/`BC`, `14`/`1E` in the three retail-host sessions; it equals the "station constant id" in the station info message). `00`/`01` in the first setup frames. Probably Pia's connection id |
+| 18 | 2 | big-endian **packet id**, per sender. Azahar's count runs 1, 2, 3 ... with no gaps (every frame, control included); the retail console's rises with gaps (3, 8, 10, 11, ...) whose cause is [unknown] |
 | 20 | 2 | big-endian **sender's clock in milliseconds** (16-bit, wraps every 65.5 s; ticks at 1000.0 per second against the log time) |
 | 22 | 2 | big-endian **sender's estimate of the peer's clock**, same units. The difference of the two halves is about -15,435 in Azahar's frames and +15,480 in the host's, so the pair is mirrored |
 
@@ -111,7 +111,7 @@ The type id at offset 10 is constant for a given type and tracks the frame lengt
 
 This table classifies **frames by length**. For the messages inside them (what each frame actually carries) see [Messages inside a frame](#messages-inside-a-frame).
 
-Counts are Azahar-sent / host-sent over 245 s.
+Counts are Azahar-sent (joiner) / host-sent over 245 s in the first capture.
 
 | type | length | role | count (tx / rx) | cadence |
 |---|---|---|---|---|
@@ -131,10 +131,10 @@ Data frames are `24 + 56 x units + 16` bytes. Control frames carry no units. The
 
 The control frame bodies (after the 24-byte header) share a pattern **[measured, partly understood]**:
 
-- byte 0 is `00`; byte 1 is `01` in Azahar's frames and `00` in the host's;
+- byte 0 is `00`; byte 1 is the sender's station index: `01` in the joiner's frames, `00` in the host's;
 - bytes 2-3, big-endian, are the inner length, equal to `frame length - 60` for 60, 68, 76, 84, 140 and 208 byte frames;
-- bytes 4-7, big-endian: `1` in Azahar's frames and `2` in the host's. That is the **destination** UDS node id: Azahar sends to the host
-  (node 1), the host sends to Azahar (node 2). The same value is at unit offset 7 (below);
+- bytes 4-7, big-endian: `1` in the joiner's frames and `2` in the host's. That is the **destination** station id: the joiner sends to the host
+  (node 1), the host sends to the joiner (node 2). The same value is at unit offset 7 (below);
 - the rest is type-specific and mostly not decoded.
 
 ## Setup sequence [measured]
@@ -161,21 +161,23 @@ A unit is one Pia *message* of the game stream: a 20-byte message header with a 
 
 ## Unit layout [measured]
 
+Offsets are within the 56-byte unit (the 20-byte message header, then the 36-byte payload from offset 20). Roles, not directions, decide the role-dependent bytes: the
+tables below hold for the joiner and the host whichever of them was Azahar.
+
 | offset | size | field |
 |---|---|---|
-| 0-3 | 4 | `00 01 00 24` in Azahar's units, `00 00 00 24` in the host's. Byte 1 is `01` for the joiner, `00` for the host. `24` is constant |
-| 7 | 1 | `01` in Azahar's units, `02` in the host's (the same value as control-frame bytes 4-7) |
-| 12 | 1 | `30` constant |
-| 21 | 1 | `03` constant |
-| 23 | 1 | `0c` constant |
+| 0-3 | 4 | `00 01 00 24` from the joiner, `00 00 00 24` from the host. Byte 1 is the sender's station index (`01` joiner, `00` host); `24` is the payload length |
+| 7 | 1 | **destination station id**: `01` in the joiner's units (to the host), `02` in the host's units |
+| 12 | 1 | `30`: the game stream |
+| 20-23 | 4 | `00 03 00 0C`: reliable-stream data record, 12-byte header |
 | 28 | 4 | **stream index**, big-endian signed: starts at **-2001**, +1 per exchange, same numbering both ways |
-| 32 | 4 | peer index, big-endian signed: a per-frame value that tracks the other side's stream index (an ack carried in-band). Exact rule [unknown] |
+| 32 | 4 | **ack index**, big-endian signed: the highest index received from the peer + 1, carried in-band |
+| 36-43 | 8 | **loss bits** [unknown]: zero in most units. Non-zero patterns seen: `00 01 FF FF FF 00 00 00`, `FF FF FF FF FF 00 00 00`, `FF FE 00 00 00 00 00 00`, `00 00 00 00 01 00 00 00`. They occur in sessions with loss or re-sends (225 units in the first capture, about 1,900 in the second, about 3,800 in the first host run) and not at all in the third. They look like a bit mask |
 | 44 | 1 | **the Game Boy serial byte** |
-| 45 | 3 | flags: `01 01 00` in Azahar's units, `00 00 00` in the host's |
-| 37-40 | 4 | `00 00 00 00`, except `01 ff ff ff` in 225 of Azahar's 3275 units. Meaning [unknown] |
-| 48-51 | 4 | `00 00 00 00`, except `5c 91 a4 19` in 248 of the host's 3189 units. Meaning [unknown] |
-| 52 | 2 | little-endian counter = stream index + 2001 for **every** one of the 6464 units |
-| others | | zero |
+| 45-47 | 3 | **role flags**: `01 01 00` in the joiner's units, `00 00 00` in the host's (4 of 17,237 host units show `FE 00 00`) |
+| 48-51 | 4 | usually zero; otherwise a 32-bit value that is constant within a session for the console that sends it (retail: `5C91A419`, `1A0EDE1E`, `C39A2D0D`, `C39A2D0D` in captures 1 to 4; Azahar as host: `A3D50B02`). It is on 1 to 8 % of a console's units (spread over the whole stream in the retail-hosted captures, only in the first ~45 exchanges in the host run). The retail console sent the same value as host in capture 3 and as joiner in capture 4, seven minutes later [meaning unknown] |
+| 52-53 | 2 | **counter**, little-endian: stream index + 2001 for every one of the 34,762 units in the four game-stream captures |
+| 54-55 | 2 | zero |
 
 The byte at offset 44 is the Game Boy byte, the same value that the cartridge puts in `rSB` for that exchange. Everything on the
 [Game Boy page](gb_link.md) about byte meaning applies unchanged: `$60+nybble`, `$D0` menu bytes, `$FD` preambles, the party block.
@@ -187,9 +189,8 @@ The byte at offset 44 is the Game Boy byte, the same value that the cartridge pu
 That is, the Pia magic through the end of the payload, with only the tail itself left out. The key is the 10 ASCII bytes
 `50 6F 6B 65 6D 6F 6E 53 49 4F` (no NUL, no padding beyond HMAC's own).
 
-- **Verified** on **2071 of 2073** UDS GAME frames in the capture (`docs/azahar/verify_vc_hmac.py`). The two that do not verify are the first
-  frames of the session: a 20-byte frame sent by Azahar (header `01 21 ...`) and a 52-byte frame sent by the host (header `01 11 ...`). Neither has
-  the Pia magic or a tail.
+- **Verified** on **every Pia frame in all five captures** (6,974 frames, none failing; `docs/azahar/verify_vc_hmac.py`). The frames without a tail are the session's
+  hello (52 bytes, `01 11 ...`), hello reply (20 bytes, `01 21 ...`) and bye (16 bytes, `01 12 ...`); none has the Pia magic.
 - **How it was found.** Azahar's GDB stub was used to stop the VC at its MD5 routine (`code.bin` offset `0xbc2b8`, guest `0x1bc2b8`). The buffer it was
   given was `66 59 5d 53 5b 59 58 65 7f 79` then `36 36 ...`: the HMAC inner-pad block (key XOR `0x36`). XORing back gives `PokemonSIO`, the string that
   sits next to `TRL_NETWORK` in `code.bin`. The earlier plain-MD5 test could not match, because the tail is keyed.
@@ -197,14 +198,14 @@ That is, the Pia magic through the end of the payload, with only the tail itself
 - **Other titles.** `PokemonSIO` is present in `code.bin` of all six VC titles (Red, Blue, Yellow share one `code.bin`; Gold, Silver share another; Crystal has its own).
   Only Red was captured, so the key for the Gen 2 titles is [unconfirmed].
 - **Why Pia-level authentication is still there.** The air is CCMP-encrypted with a key from the UDS passphrase (`TRL_NETWORK`), and each Pia datagram carries this HMAC.
-  Both are fixed strings from the game, so neither needs anything from the 3DS's keys.
+  The Pia key and the passphrase are fixed strings from the game, but the CCMP key also needs the console key above, so a peer on the air needs that key; the `PokemonSIO` tag does not.
 - **What did not fire.** In the traced session (join and one trade) the AES-ECB loop, the two cipher wrappers and four hash functions at other addresses were never called.
   AES in `code.bin` is therefore not on the path of ordinary Pia traffic.
 
 # Messages inside a frame
 
-Everything after the 24-byte frame header and before the 16-byte tail is a sequence of **messages**. All 2071 frames with a Pia header split
-exactly into messages (`docs/azahar/pia_messages.py`; 0 unclassified). The 20-byte and 52-byte opening frames have no Pia header and are covered at the end.
+Everything after the 24-byte frame header and before the 16-byte tail is a sequence of **messages**. All 6,974 frames with a Pia header (five captures) split
+exactly into messages (`docs/azahar/pia_messages.py`; 0 unclassified). The 52-byte hello, 20-byte reply and 16-byte bye frames have no Pia header and are covered at the end.
 
 ## Message header (20 bytes) [measured]
 
@@ -309,6 +310,7 @@ it looks like the VC's role marker, standing in for the `01` / `02` bytes of the
 | 2 (retail hosts) | retail | 2.48 s | 3.84 s |
 | 3 (retail hosts) | retail | 2.59 s | 3.95 s |
 | 4 (Azahar hosts) | Azahar | 3.71 s | 5.28 s |
+| 5 (Azahar hosts) | Azahar | 4.86 s | 7.2 s |
 
 ## The reliable streams
 
@@ -321,11 +323,11 @@ The game stream (protocol `30`) and the system stream (protocol `02`, flag 1) us
 | 4 | 4 | `00 00 00 00` |
 | 8 | 4 | **own stream index**, signed big-endian, starts at -2001 |
 | 12 | 4 | **ack index**: the highest index received from the peer + 1 |
-| 16 | 20 | trailer; on the game stream: byte 8 (payload offset 24) is the Game Boy byte, then `01 01 00`; the last 4 bytes hold a counter (index + 2001, little-endian 16 bits) |
+| 16 | 20 | trailer: loss bits, Game Boy byte, role flags, per-run value, counter. Decoded field by field in [Unit layout](#unit-layout-measured) (unit offsets 36 to 55) |
 
 An **ack** has payload length 24 and the same layout with type `00 00`, a zero own index and the ack index at offset 12.
 Re-sends use the original index, so the stream index steps back (see [Reliability](#reliability-re-sends-and-acknowledgements)).
-Each of the 28 system messages the host sent was acknowledged by the joiner; a missed ack made the host send one twice (111.54 and 111.59 s).
+In the first capture each of the 28 system messages the host sent was acknowledged by the joiner; a missed ack made the host send one twice (111.54 and 111.59 s).
 
 ## The opening frames [partly decoded]
 
@@ -404,7 +406,7 @@ The VC does not rely on UDS delivering every frame. It layers its own scheme on 
   back (observed steps of -24, -148, -199, -298, -423).
 - **Acks.** The 84-byte frame carries, at body offset 32 (frame offset 56), a big-endian signed index: **the highest stream index received from the peer + 1**
   (exact for 243 of 305 Azahar acks and 172 of 183 host acks; the others are the re-send rewinds).
-- **Gaps.** None: in all four captures every index from -2001 to the last one is present in each direction (an earlier version of this page reported a few missing; that was a parser miss, not lost frames).
+- **Gaps.** None: in all five captures every index from -2001 to the last one is present in each direction (an earlier version of this page reported a few missing; that was a parser miss, not lost frames).
 
 # Mapping the VC stream onto the cartridge stream
 
@@ -420,8 +422,9 @@ stream, with differences in pacing and framing **[measured]**:
 | player block, first `fd` to patch-list `fd` | 427 (6-9 `fd` preamble) | 427 |
 | patch lists + trade selection | 404 / 373 | 257 / 253 / 210 |
 | rounds | 2 (enter, one trade) | 3 (enter, trade, trade back) |
-| mon pick | `60 + index` | `65` (Azahar, slot 6) / `64` (host, slot 5) |
+| mon pick | `60 + index` | `65` = slot 6 (both consoles in captures 2 and 3; in the first, Azahar `65` and the host `64` = slot 5) |
 | confirm | `62` | `62` |
+| leaving the selection screen | `6F` (Cancel) | each stream ends with a run of `6F` on both sides (4 to 7 exchanges): the players chose Cancel to leave |
 
 ## Where the exchanges are in time
 
@@ -438,17 +441,24 @@ Azahar side, de-duplicated stream index from the first byte (`t` as in the setup
 The 424-byte player block takes about 0.9 s on the wire, around 470 exchanges per second. The time between rounds (60-90 s) is the
 player choosing a mon and confirming, not protocol time.
 
-## What the trade looked like, decoded [measured]
+## What the trades looked like, decoded [measured]
 
-| t | direction | content |
-|---|---|---|
-| 21.2 s | Azahar to host | party `6f 95 4a 83 31 15` (slot 6 = Mew, OT YOSHIRA) |
-| 21.3 s | host to Azahar | party `b0 b2 07 96 b9 54`; slot 5 is the Oddish `b9`, nickname `8e 86 7f 96 84 84 83` ("OG WEED") |
-| 22.1 s and later | both | `65 ×8 ... 62 ×7`, `64 ×5 ... 62 ×7`: pick slot 6 and slot 5, both confirm |
-| 112.5 s | Azahar to host | party `6f 95 4a 83 31 b9`: slot 6 is now the Oddish |
-| 179.0 s | host to Azahar | party back to `b0 b2 07 96 54 b9` with the Mew returned |
+Party species are the internal index numbers in the player block's species list; nicknames come from the block's nickname table (Gen 1 charset). Azahar's party is the
+trainer `hiro`; the retail console's is `LINK`. Each session has three rounds: entering the room, after the trade, after the trade back.
 
-The Poliwrath (`6f`) is slot 1 in every list and was never traded.
+| capture | Azahar's party, slot 6 (round 1, 2, 3) | the retail console's party | traded |
+|---|---|---|---|
+| 1 (12:18) | `15` MEW, then `B9` OG WEED, then `15` MEW | slot 5 `B9` OG WEED; slot 6 `54` KUZKO. After the trade slot 5 is KUZKO and slot 6 is MEW | **Mew** (slot 6, OT YOSHIRA) for OG WEED (an Oddish, level 13) and back |
+| 2 (19:24) | `6F` BRUnO, then `B9` OG WEED, then `6F` BRUnO | slot 5 `54` KUZKO, slot 6 `B9` OG WEED; then slot 6 `6F` BRUnO; then OG WEED again | **Poliwrath** (BRUnO, slot 6) for OG WEED and back |
+| 3 (19:28) | same as capture 2 | same as capture 2 | **Poliwrath** for OG WEED and back |
+| 4 (host run 1) | `6F` BRUnO (round 1 only) | slot 6 `B9` OG WEED | none: the session stalled before the trade |
+| 5 (host run 2) | none | none | none: the session ended before the RN list |
+
+Azahar's party is the same six Pokémon in every capture (BRUnO the Poliwrath, BILLA, ARTICUNO, MEWTWO, GOLEM, MEW) but in different orders: in capture 1 the Poliwrath was slot 1 and the Mew slot 6;
+in captures 2 to 4 the Mew was slot 5 and the Poliwrath slot 6. The Poliwrath was therefore traded in captures 2 and 3. (An earlier version of this page said it was never traded; that was true only of the first capture.)
+
+Capture 1 timeline: Azahar's party `6f 95 4a 83 31 15` at 21.2 s; the host's `b0 b2 07 96 b9 54` at 21.3 s with the Oddish's nickname `8e 86 7f 96 84 84 83` ("OG WEED");
+`65 ×8 ... 62 ×7` and `64 ×5 ... 62 ×7` (the picks and both confirms) from 22.1 s; Azahar's party `6f 95 4a 83 31 b9` at 112.5 s; the host's party back to `b0 b2 07 96 54 b9` with the Mew at 179.0 s.
 
 # Gen 1 on the VC, in one picture
 
@@ -463,9 +473,11 @@ The Poliwrath (`6f`) is slot 1 in every list and was never traded.
 
 # Open questions
 
-- Where the shared profile value and the opening frame's 4-byte value come from, what the `06` / `01` byte in the profile means, and the 20-byte trailer of the game record besides the Game Boy byte.
-- Which of these the VC checks: whether it needs the pings answered, the clock sync, the station table, or the profile contents, and what it does when one is missing.
+- What the 8 "loss bits" (unit offsets 36 to 43) and the per-run 32-bit value (offsets 48 to 51) mean; where the shared profile value and the opening frame's 4-byte value come from; what the `06` / `01` byte in the profile means. (The 16-byte frame tail is solved: it is the HMAC.)
+- Which of the setup and keep-alive messages the VC actually requires: the pings, the clock sync, the station table, the profile contents, and what it does when one is missing.
+- Why Azahar fails as host (two different failures, see above) while the retail console as host works.
 - Who is the clock master on the VC: the host's `EF` first unit suggests the host, but nothing else in the stream distinguishes the roles.
 - Whether the comm ID, application data and `PokemonSIO` are shared across the Game Boy VC titles (H3, H4). Only Red was captured.
 - How a session ends. Gen 1 has no clean way out of the Trade Center (you leave by choosing Reset), so no teardown exchange exists in any capture; Gen 2 may differ.
-- Battles (`Wireless_start_exchange` and friends); only a trade was captured.
+- Battles (`Wireless_start_exchange` and friends); only trades were captured.
+- What a retail host does with a retail joiner at the table (a retail-to-retail capture with the passive sniffer is planned).

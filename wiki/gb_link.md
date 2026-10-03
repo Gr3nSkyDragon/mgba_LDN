@@ -12,6 +12,7 @@ ROM linked to a Blue cartridge ROM (`logs/gbtrace_20261003-154856.jsonl`, `src/g
 - **[src]** read from the pret source, with `file:line` where it helps.
 - **[measured]** seen in a trace.
 - **[unknown]** not yet established.
+- **[user-reported]** stated by the person running the captures, not found in the source or a trace.
 
 Only Gen 1 (Red/Blue) is covered. Yellow is the same code apart from the constants noted in the last section. Gen 2 is listed as
 a to-do at the end.
@@ -29,9 +30,10 @@ in. Both consoles always send and receive at the same moment, so there is no suc
 | master (internal clock) | `SC_START \| SC_INTERNAL` | the console generates it, 8192 Hz, about 1 ms per byte |
 | slave (external clock) | `SC_START \| SC_EXTERNAL` | waits for the master's clock |
 
-A slave that is not armed when the master clocks a byte reads `$FF` from the master's point of view. The mGBA lockstep driver
-returns `$FF` to a master whose partner has not armed `rSC` (`master_rx_ff_slave_idle`, `src/gb/sio/lockstep.c`). That edge case is
-the cause of a false handshake when the partner has just booted.
+On real hardware a master that clocks a byte while nothing is armed on the other end reads `$FF` (the idle line). The mGBA lockstep driver
+used to hand such a master the partner's stale last byte instead, which let a console that had only just booted look like a partner and
+produced a false handshake; it now returns `$FF` to a master whose partner has not armed `rSC` (`master_rx_ff_slave_idle`,
+`src/gb/sio/lockstep.c`).
 
 ## Serial interrupt handler
 
@@ -62,10 +64,11 @@ Until the connection is established (`hSerialConnectionStatus` = `$FF`), the han
 
 The two bytes `$01` and `$02` swapped at the start decide who is the master.
 
-- Both consoles set `hSerialConnectionStatus` = `$FF`, put `$02` in `rSB` and arm the external clock; the receptionist loop also
-  alternately sets `$01`/`SC_INTERNAL` each frame [src: `engine/link/cable_club_npc.asm:20-60`].
-- Whoever receives `$02` in the interrupt handler was the one clocking, so it is the master (`hSerialConnectionStatus` = `$02`); the
-  other receives `$01` and becomes the slave (`$01`).
+- Every iteration of the receptionist's 90-frame loop sets `hSerialConnectionStatus` = `$FF`, puts `$02` in `rSB` and arms the external clock, then
+  overwrites `rSB` with `$01`, starts an internal-clock transfer and waits a frame [src: `engine/link/cable_club_npc.asm:20-60`]. So each console
+  offers both roles every frame and whichever transfer completes first against an armed partner decides who is master.
+- The handler stores the byte it received as the new `hSerialConnectionStatus`. The console that receives `$02` (the other side's external-clock
+  byte) is therefore the master (`$02`, internal clock); the console that receives `$01` becomes the slave (`$01`).
 - **[measured]** The first bytes in the trace: the master's stream begins `01 00 00 00 60...`, the slave's begins `02 00 fe fe 00...`.
   Everything after that is symmetric.
 
@@ -99,8 +102,11 @@ Hook names in brackets are the VC hooks that sit at the same place in the ROM. S
    "Link closed because of inactivity".
 5. Otherwise go to `LinkMenu`.
 
-**[measured]** In the stable trade the "Please wait" step takes on the order of 175 `fe` polls from the slave while the master sends
-`60`. The wait is the 768-loop counter: 768 frames is roughly 12.8 s at 60 Hz [src-derived, not timed].
+The step ends when both consoles reach it; the `$0300` counter is only the **limit**: if the partner has not answered within 768 loops (about 12.8 s at
+60 Hz, derived from the source and not timed) the link is closed with the "inactivity" text.
+
+**[measured]** In the mGBA trade the master sent `60` about 186 times while the slave, whose player had not reached the screen yet, answered `fe` about 175 times;
+the exchange completed as soon as the slave sent its own `60`.
 
 ## 2. The nybble exchange (`Serial_SyncAndExchangeNybble`)
 
@@ -113,8 +119,9 @@ Used for every small decision (menu, trade confirm, mon pick) [`home/serial.asm:
 - then `Serial_ExchangeNybble` 10 more frames and `Serial_SendZeroByte` 10 frames. [`Wireless_net_delay_3` and `_4` change
   both counts to **26** on Red/Blue VC.]
 
-**[measured]** trade confirmation, per round: `60`×13 `00`×10 `62`×111 `00`×10 ... The long `62` run is the polling loop waiting for the other
-side to reach the same screen; the `00×10` blocks are the zero-byte phases.
+**[measured]** After the patch lists the master's stream in the mGBA trade is `60`×13 `00`×10 `62`×111 `00`×10 `62`×24 `00`×10 `62`×13 `00`×12. Each run of `6x`
+is one nybble sync (first the mon pick, then the confirm, then the post-trade syncs), each `00` run is the ten-frame zero-byte phase, and the long `62` run is the polling
+while the other player decides. The Virtual Console sends far fewer repeats of the same nybble (see the VC page).
 
 ## 3. The link menu (`LinkMenu`)
 
@@ -131,11 +138,12 @@ side to reach the same screen; the `00×10` blocks are the zero-byte phases.
 | `$D5` | A pressed on Colosseum |
 | `$D8` | B pressed (cancel) |
 
-`Serial_ExchangeLinkMenuSelection` sends the byte **twice** (`wLinkMenuSelectionSendBuffer` and `+1`) and reads twice, discarding the first
-as possibly stale. The top nybble must be `$D`. If both press A or B in the same cycle, the master's choice wins (`USING_INTERNAL_CLOCK`
+`Serial_ExchangeLinkMenuSelection` holds the byte twice (`wLinkMenuSelectionSendBuffer` and `+1`) and does **three** exchanges, discarding the first
+reply as possibly stale and keeping the other two ("sent thrice and read twice" in the source). The top nybble of a kept reply must be `$D`. If both press A or B in the same cycle, the master's choice wins (`USING_INTERNAL_CLOCK`
 tie-break). After the choice the master waits two extra frames before it clocks again.
 
-**[measured]** `d0 d0 00 d0 d0 00 ... d4 d4 d4 00 00 fe` on the master, one pair per menu cycle.
+**[measured]** The mGBA master sends `d0 d0 d0 00` once per menu cycle (three exchanges), ending `d4 d4 d4 00 00 fe` when A is pressed on Trade Center. The Virtual Console
+sends `d0 d0 00` per cycle, two exchanges.
 
 ## 4. Entering the room (`CableClub_DoBattleOrTrade`)
 
@@ -154,9 +162,10 @@ The player walks into the Trade Center and sits at the table. The ROM then runs 
 ### Serial_ExchangeBytes
 
 Not a plain loop [`home/serial.asm:56-110`]. Each byte goes through `Serial_ExchangeByte`, followed by a delay of 48 loop iterations.
-While `hSerialIgnoringInitialData` is set the received byte is dropped until `$FD` arrives, so a block does not start until the
-partner's preamble appears. The preamble that triggers it stays in the output, so the buffer begins at the first non-`$FD`
-byte after the run. The receiving side keeps what comes after the preamble.
+While `hSerialIgnoringInitialData` is set, every received byte is dropped **and the pointer is not advanced**, so the console keeps sending its own first byte
+(`$FD`) again and again until the partner's `$FD` arrives. That first `$FD` is dropped too, the flag is cleared, the first byte is sent once more, and from then on
+received bytes are stored and the buffer advances. So a block only starts once both consoles have reached the exchange, and the run of `$FD` on the wire is longer than the
+preamble by however many exchanges a console waited for its partner.
 
 ### The RN list (17 bytes)
 
@@ -164,7 +173,7 @@ byte after the run. The receiving side keeps what comes after the preamble.
 
 - 7 × `$FD` (`SERIAL_RN_PREAMBLE_LENGTH`), then 10 random numbers, each below `$FD` (rerolled otherwise) [`cable_club.asm:26-48`].
 - **[src]** The numbers are the RNG seed for the battle. Both consoles use the **master's** list (`cable_club.asm:147-155`).
-- **[measured]** Receive side shows `fd ×12` in front of the RN list as well (the slave's first-seen preamble stretched by idle `$FD`s).
+- **[measured]** The `$FD` run in front of the RN list is 8 to 14 long in the traces, not 7: the extra `$FD`s are the sender repeating its first byte while it waited (see `Serial_ExchangeBytes`).
 
 ### The player block (424 bytes)
 
@@ -183,10 +192,10 @@ byte after the run. The receiving side keeps what comes after the preamble.
 | 355 | 66 | 6 nicknames, 11 bytes each |
 | 421 | 3 | padding |
 
-Counting the preamble gives the full 424-byte span. **[measured]** The block run begins `fd×6 a7 a8 b1 ae 50 00×6 06 ...` (trainer
-"hiro", count 6) with the species list `6f 95 4a 83 31 15 ff` in the Azahar capture, and the span from the first `fd` to the
-last `ff ff ff` of the block to the next `fd` run is 427 exchanges, 3 more than the 424-byte block. The 3 extra exchanges sit between the
-blocks (`50 ff ff` on one side) and their origin is [unknown]. See [measurement notes](#measurement-notes).
+Counting the preamble gives the full 424-byte span. **[measured]** In the first Azahar capture the block run begins `fd×6 a7 a8 b1 ae 50 00×6 06 ...` (trainer
+"hiro", count 6) with the species list `6f 95 4a 83 31 15 ff`. In the Virtual Console captures the span from the first `fd` of the block run to the first `fd` of the patch-list run
+is 427 exchanges every time, 3 more than the 424-byte block; the 3 extra exchanges sit between the two blocks (`50 ff ff` on one side) and their origin is [unknown]. See
+[measurement notes](#measurement-notes).
 
 ### The 44-byte party mon struct
 
@@ -214,17 +223,17 @@ blocks (`50 ff ff` on one side) and their origin is [unknown]. See [measurement 
 
 ### The patch lists (200 bytes)
 
-A party block cannot contain `$FE`, because it means "no data". Before sending, `CableClub_DoBattleOrTradeAgain` scans the first
-252 bytes after the preamble in part 1 and the rest in part 2, replaces each `$FE` with `$FF`, and records its **1-based offset** in the
-patch list [`cable_club.asm:55-101`]. The receiver puts `$FE` back at every recorded offset.
+A party block cannot contain `$FE`, because it means "no data". Before sending, `CableClub_DoBattleOrTradeAgain` scans the **264 bytes of party mon structs**
+(`wPartyMons` up to `wPartyMonOT`; names are not scanned) in two parts, the first 252 bytes and the remaining 12, replaces each `$FE` with `$FF`, and records its
+**1-based offset within the part** in the patch list [`cable_club.asm:55-101`]. The receiver puts `$FE` back at every recorded offset.
 
     FD FD FD   (7 x 00)   [part 1 offsets] FF   [part 2 offsets] FF   00 ... (zeros to length 200)
 
 **[measured]** `fd fd fd 00×7 ff ff 00×190` when no `$FE` was in the party (both lists empty, which is the usual case).
 
-### The trailer
+### After the exchanges
 
-After the block exchanges, both ends reload `rIE` and the master's RN list is used by both consoles. The slave copies the
+Both ends reload `rIE`. The master's RN list is used by both consoles: the master keeps its own, the slave copies the
 other's list into its own `wLinkBattleRandomNumberList` [`cable_club.asm:147-155`].
 
 ## 5. The trade screen
@@ -248,12 +257,15 @@ three rounds (enter, after trade, after trade back).
 
 ## 6. Leaving
 
-`Wireless_net_stop` / `Wireless_net_end` mark `LinkMenu` exits [`engine/menus/main_menu.asm`]. In the ROM they just stop the exchange loop and clear `BIT_LINK_CONNECTED`.
+- **Link menu Cancel** (`.choseCancel` in `LinkMenu`, `engine/menus/main_menu.asm:289-300`): `Delay3`, `CloseLinkConnection`, the "Link canceled" text, clears
+  `BIT_LINK_CONNECTED`. The two Virtual Console hooks `Wireless_net_stop` and `Wireless_net_end` sit on this path. It is the way out of the link menu, not out of the Trade Center.
+- **The Trade Center** has no clean exit [user-reported, not in the source I read]: the way out is the Reset entry that replaces Save in the start menu. A session therefore has no teardown exchange.
+- **Leaving the selection screen** is the `$6F` (Cancel) nybble. **[measured]** Every trade capture ends with a run of `6F` from both sides (4 to 7 exchanges).
 
 # Measurement notes
 
-- **Phase landmarks in a byte stream.** Runs of `$FD` mark block starts: RN list (7-8), player block (6-9), patch lists (3-4).
-  The fd run lengths in traces vary because idle `$FD` bytes from the previous exchange extend the run on one side.
+- **Phase landmarks in a byte stream.** Runs of `$FD` mark block starts: RN list (7 plus repeats), player block (6 plus repeats), patch lists (3 plus repeats).
+  Run lengths vary because a sender repeats its first byte while it waits for the partner's preamble (see `Serial_ExchangeBytes`).
 - **Span from first `$FD` of a block to the first `$FD` of the next** is 17-18 (RN), 427 (player block), and 253-404 (patch lists
   plus the trade selection that follows them). The player-block 427 is 424 plus 3 unexplained exchanges before the patch-list preamble.
 - **Round count.** Entering the room, and each completed trade, repeat the RN list / party / patch-list sequence.
@@ -272,7 +284,8 @@ three rounds (enter, after trade, after trade back).
 
 # Open questions
 
-- Which of the two consoles is the master when both ROMs reach the room at once: this is settled by the `$01`/`$02` handshake
-  on hardware, but the VC skips that handshake (see the VC page).
+- The 3 unexplained exchanges between the player block and the patch lists in the Virtual Console captures (and why the cartridge trace shows the same 427 span).
+- Which console is master when both ROMs reach the receptionist at once: on hardware the `$01`/`$02` handshake settles it. The Virtual Console has no such bytes on the wire;
+  its host sends a single `EF` as its first unit instead (see the VC page).
 - The exact behaviour of `wUnknownSerialCounter2` in a real cable.
-- Everything for Gen 2.
+- Everything for Gen 2, including the Time Capsule room and whether Gen 2 has a clean exit.
