@@ -41,6 +41,23 @@ Gen 6/7 trades use). The patch table is in `docs/hook_table/hook_table.json` (ge
 byte values match the cartridge's, so the VC re-creates the cable stream inside the emulator and sends that. The block hooks
 are visible only as the points where the same bytes show up on the wire.
 
+# Where the layers are
+
+Top to bottom, for one Game Boy byte:
+
+| layer | what it is | where it runs | what we see of it |
+|---|---|---|---|
+| Game Boy ROM | Gen 1 code, `rSB` / `rSC` | the VC emulator in the app (`code.bin`) | the serial byte at unit offset 44 |
+| VC glue | the hooks and the per-exchange record | app | the 56-byte unit; stream index, counter |
+| **Pia** (`nn::pia`) | Nintendo's peer-to-peer middleware: session, mesh, clock sync, packet ids, per-packet tag | **inside the app process**; its strings and the `32 AB 98 64` magic are in `code.bin` | header bytes 12-23 and the 16-byte tail of every frame |
+| **UDS** (`nwm::UDS` service) | the 3DS local-wireless API: create/join a network, node ids (1-8), comm ID, beacon application data, data channels, `SendTo`/`PullPacket` | system service, called by the app over IPC | `channel 243`, node numbers, `secureSequence`; the join trace and `ConnectToNetwork` |
+| **NWM** (system module `nwm`) | the module that owns the Wi-Fi hardware; UDS is one of its services (`nwm::UDS`, plus EXT, INF, SAP, ...) | system process | Azahar's `Service.NWM` log lines (`nwm_uds.cpp`) |
+| 802.11 | beacons with the Nintendo vendor element, association, EAPOL 4-way handshake, CCMP-encrypted data frames | Wi-Fi chip; in Azahar `uds_real` (ldnd or ESP32) | the beacon/association/EAPOL lines; not the frames themselves |
+
+- **The capture sits between Pia and UDS.** Azahar's `UDS DATA TRACE` lines are the payload the app hands to UDS `SendTo` (and what `PullPacket` returns). That payload is a Pia datagram, so the log shows Pia's header and tail but not 802.11.
+- **Two separate protections.** The air is encrypted with CCMP, keyed from the UDS passphrase (`TRL_NETWORK`). Pia then adds its own tag inside the payload. A peer that is not the VC must satisfy both.
+- **Bytes 0-11 of the frame** (`01 01`, length, six zeros, message type) come before the Pia magic. Which layer writes them is [unknown].
+
 # The UDS session
 
 ## Joining
@@ -76,13 +93,18 @@ Every UDS payload on channel 243 starts with a 24-byte header.
 | 2 | 2 | little-endian, **frame length - 12** (96-byte frame: `54 00`) |
 | 4 | 6 | zeros |
 | 10 | 2 | message type (table below); constant for a given type |
-| 12 | 4 | session id (`32 ab 98 64` for the whole capture) |
-| 16 | 1 | `01` |
-| 17 | 1 | sender id byte: `AA` in Azahar's frames, `2C` in the host's. `00`/`01` in the first setup frames |
-| 18 | 2 | big-endian frame counter per sender (rises by 1-5 per data frame: 25, 27, 29, ... 990) |
-| 20 | 4 | changes every frame, increasing smoothly, looks time-based. Meaning [unknown] |
+| 12 | 4 | **Pia magic `32 AB 98 64`**, constant (every Pia datagram starts with it, see [pokeldn's Pia page](https://github.com/Decryptu/pokeldn/blob/main/docs/pia.md)) |
+| 16 | 1 | Pia version byte `01`. The `0x80` "encrypted" bit is clear, which matches the plaintext payload |
+| 17 | 1 | sender id byte: `AA` in Azahar's frames, `2C` in the host's. `00`/`01` in the first setup frames. Probably Pia's connection id |
+| 18 | 2 | big-endian **packet id**, per sender. Azahar's count 1, 2, 3 ... 1051 with no gaps (every frame, control included); the host's rises with gaps because the log missed some of its frames |
+| 20 | 2 | big-endian **sender's clock in milliseconds** (16-bit, wraps every 65.5 s; ticks at 1000.0 per second against the log time) |
+| 22 | 2 | big-endian **sender's estimate of the peer's clock**, same units. The difference of the two halves is about -15,435 in Azahar's frames and +15,480 in the host's, so the pair is mirrored |
 
-The 4-byte field at 20 and the type id do not look constant by design. Neither was derived. [unknown] whether either is part of any check.
+Bytes 0-11 (`01 01`, length, six zero bytes, message type) sit in front of the Pia magic and are not part of Pia's own header as pokeldn documents it.
+The VC code does contain Pia: `Pia Send`, `Pia Receive`, `SyncClockProtocol`, `Mesh`, `BackgroundScheduler` strings and the magic as a literal in five places
+(`vc_work/Red/exefs/code.bin`). The pair of clocks at offset 20 fits Pia's clock-synchronisation protocol.
+
+The type id at offset 10 is constant for a given type and tracks the frame length (`5865` is always 76 bytes). Its derivation is [unknown].
 
 ## Message types [measured]
 
@@ -152,12 +174,19 @@ A data frame holds `n` back-to-back **56-byte units**; each is one hardware exch
 The byte at offset 44 is the Game Boy byte, the same value that the cartridge puts in `rSB` for that exchange. Everything on the
 [Game Boy page](gb_link.md) about byte meaning applies unchanged: `$60+nybble`, `$D0` menu bytes, `$FD` preambles, the party block.
 
-## The frame tail (16 bytes) [unknown]
+## The frame tail (16 bytes) [unknown, narrowed]
 
 Every data frame ends with 16 bytes. All 792 data frames had a different tail, including frames re-sent with identical units (0 of 170).
+The 12,672 tail bytes are statistically uniform (chi-square 241 against 255 expected, bit balance 0.5025).
 It is **not** MD5, SHA-1, SHA-256, BLAKE2s or a CRC32 of the frame, the body, or the units (tested over header offsets 0-29).
-Whether it is a random nonce or a keyed authentication tag is [unknown]. This decides whether a peer that is not the VC can be
-accepted. It is the main open risk.
+
+What it most likely is, by analogy with Pia (see [pokeldn's Pia page](https://github.com/Decryptu/pokeldn/blob/main/docs/pia.md)):
+
+- Pia authenticates each datagram with a 16-byte tag. On the Switch the tag sits in the header; here the payload is not encrypted (version byte `01`, plain units), and the 16 bytes follow it.
+- The header carries **no 8-byte nonce**. Offset 20-23 is a clock pair, not a counter nonce, so a tag keyed by a nonce is less likely; a plain keyed MAC over the frame (CMAC or HMAC style) fits better.
+- Pia derives its session key from a per-game constant (the "game key") and per-session data; the VC code has a software AES whose block function is called from one ECB loop only, and an MD5 that is used only for an ID hash. So the key derivation can use AES, but a CCM/GCM mode built directly on that block function was not found.
+
+The tail algorithm and key are not recovered. This decides whether a peer that is not the VC can be accepted.
 
 # Reliability: re-sends and acknowledgements
 
@@ -226,7 +255,7 @@ The Poliwrath (`6f`) is slot 1 in every list and was never traded.
 
 # Open questions
 
-- The 16-byte tail, and the 4-byte changing field at header offset 20.
+- The 16-byte tail (algorithm and key), and the type id at header offset 10.
 - Contents and purpose of the setup and keep-alive frames (`5865`, `5f41`, `51f6`, `5a28`, `5ad7`, ...). Whether they must be answered in
   order for the link to stay open.
 - Who sends first, and who is the clock master on the VC (H2 and H6). The two streams are symmetric and carry no `01`/`02`.
