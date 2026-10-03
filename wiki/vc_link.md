@@ -49,13 +49,13 @@ Top to bottom, for one Game Boy byte:
 |---|---|---|---|
 | Game Boy ROM | Gen 1 code, `rSB` / `rSC` | the VC emulator in the app (`code.bin`) | the serial byte at unit offset 44 |
 | VC glue | the hooks and the per-exchange record | app | the 56-byte unit; stream index, counter |
-| **Pia** (`nn::pia`) | Nintendo's peer-to-peer middleware: session, mesh, clock sync, packet ids, per-packet tag | **inside the app process**; its strings and the `32 AB 98 64` magic are in `code.bin` | header bytes 12-23 and the 16-byte tail of every frame |
+| **Pia** (`nn::pia`) | Nintendo's peer-to-peer middleware: session, mesh, clock sync, packet ids, per-packet tag | **inside the app process**; its strings and the `32 AB 98 64` magic are in `code.bin` | header bytes 12-23 and the 16-byte HMAC-MD5 tail of every frame |
 | **UDS** (`nwm::UDS` service) | the 3DS local-wireless API: create/join a network, node ids (1-8), comm ID, beacon application data, data channels, `SendTo`/`PullPacket` | system service, called by the app over IPC | `channel 243`, node numbers, `secureSequence`; the join trace and `ConnectToNetwork` |
 | **NWM** (system module `nwm`) | the module that owns the Wi-Fi hardware; UDS is one of its services (`nwm::UDS`, plus EXT, INF, SAP, ...) | system process | Azahar's `Service.NWM` log lines (`nwm_uds.cpp`) |
 | 802.11 | beacons with the Nintendo vendor element, association, EAPOL 4-way handshake, CCMP-encrypted data frames | Wi-Fi chip; in Azahar `uds_real` (ldnd or ESP32) | the beacon/association/EAPOL lines; not the frames themselves |
 
 - **The capture sits between Pia and UDS.** Azahar's `UDS DATA TRACE` lines are the payload the app hands to UDS `SendTo` (and what `PullPacket` returns). That payload is a Pia datagram, so the log shows Pia's header and tail but not 802.11.
-- **Two separate protections.** The air is encrypted with CCMP, keyed from the UDS passphrase (`TRL_NETWORK`). Pia then adds its own tag inside the payload. A peer that is not the VC must satisfy both.
+- **Two separate protections.** The air is encrypted with CCMP, keyed from the UDS passphrase (`TRL_NETWORK`). Pia then adds its own HMAC-MD5 tag (fixed key `PokemonSIO`) at the end of each datagram. A peer that is not the VC must satisfy both.
 - **Bytes 0-11 of the frame** (`01 01`, length, six zeros, message type) come before the Pia magic. Which layer writes them is [unknown].
 
 # The UDS session
@@ -174,19 +174,26 @@ A data frame holds `n` back-to-back **56-byte units**; each is one hardware exch
 The byte at offset 44 is the Game Boy byte, the same value that the cartridge puts in `rSB` for that exchange. Everything on the
 [Game Boy page](gb_link.md) about byte meaning applies unchanged: `$60+nybble`, `$D0` menu bytes, `$FD` preambles, the party block.
 
-## The frame tail (16 bytes) [unknown, narrowed]
+## The frame tail (16 bytes): HMAC-MD5 with a fixed key [measured]
 
-Every data frame ends with 16 bytes. All 792 data frames had a different tail, including frames re-sent with identical units (0 of 170).
-The 12,672 tail bytes are statistically uniform (chi-square 241 against 255 expected, bit balance 0.5025).
-It is **not** MD5, SHA-1, SHA-256, BLAKE2s or a CRC32 of the frame, the body, or the units (tested over header offsets 0-29).
+**tail = HMAC-MD5(key = `PokemonSIO`, message = frame[12 : length - 16])**
 
-What it most likely is, by analogy with Pia (see [pokeldn's Pia page](https://github.com/Decryptu/pokeldn/blob/main/docs/pia.md)):
+That is, the Pia magic through the end of the payload, with only the tail itself left out. The key is the 10 ASCII bytes
+`50 6F 6B 65 6D 6F 6E 53 49 4F` (no NUL, no padding beyond HMAC's own).
 
-- Pia authenticates each datagram with a 16-byte tag. On the Switch the tag sits in the header; here the payload is not encrypted (version byte `01`, plain units), and the 16 bytes follow it.
-- The header carries **no 8-byte nonce**. Offset 20-23 is a clock pair, not a counter nonce, so a tag keyed by a nonce is less likely; a plain keyed MAC over the frame (CMAC or HMAC style) fits better.
-- Pia derives its session key from a per-game constant (the "game key") and per-session data; the VC code has a software AES whose block function is called from one ECB loop only, and an MD5 that is used only for an ID hash. So the key derivation can use AES, but a CCM/GCM mode built directly on that block function was not found.
-
-The tail algorithm and key are not recovered. This decides whether a peer that is not the VC can be accepted.
+- **Verified** on **2071 of 2073** UDS GAME frames in the capture (`docs/azahar/verify_vc_hmac.py`). The two that do not verify are the first
+  frames of the session: a 20-byte frame sent by Azahar (header `01 21 ...`) and a 52-byte frame sent by the host (header `01 11 ...`). Neither has
+  the Pia magic or a tail.
+- **How it was found.** Azahar's GDB stub was used to stop the VC at its MD5 routine (`code.bin` offset `0xbc2b8`, guest `0x1bc2b8`). The buffer it was
+  given was `66 59 5d 53 5b 59 58 65 7f 79` then `36 36 ...`: the HMAC inner-pad block (key XOR `0x36`). XORing back gives `PokemonSIO`, the string that
+  sits next to `TRL_NETWORK` in `code.bin`. The earlier plain-MD5 test could not match, because the tail is keyed.
+- **The key is a constant.** It is not derived from the session, the MAC addresses, the network id or the passphrase. Anyone can compute a valid tail.
+- **Other titles.** `PokemonSIO` is present in `code.bin` of all six VC titles (Red, Blue, Yellow share one `code.bin`; Gold, Silver share another; Crystal has its own).
+  Only Red was captured, so the key for the Gen 2 titles is [unconfirmed].
+- **Why Pia-level authentication is still there.** The air is CCMP-encrypted with a key from the UDS passphrase (`TRL_NETWORK`), and each Pia datagram carries this HMAC.
+  Both are fixed strings from the game, so neither needs anything from the 3DS's keys.
+- **What did not fire.** In the traced session (join and one trade) the AES-ECB loop, the two cipher wrappers and four hash functions at other addresses were never called.
+  AES in `code.bin` is therefore not on the path of ordinary Pia traffic.
 
 # Reliability: re-sends and acknowledgements
 
@@ -255,10 +262,10 @@ The Poliwrath (`6f`) is slot 1 in every list and was never traded.
 
 # Open questions
 
-- The 16-byte tail (algorithm and key), and the type id at header offset 10.
+- The type id at header offset 10, and the two session-opening frames that carry no Pia header (`01 21`, `01 11`).
 - Contents and purpose of the setup and keep-alive frames (`5865`, `5f41`, `51f6`, `5a28`, `5ad7`, ...). Whether they must be answered in
   order for the link to stay open.
 - Who sends first, and who is the clock master on the VC (H2 and H6). The two streams are symmetric and carry no `01`/`02`.
 - Whether the comm ID and application data are shared across the Game Boy VC titles (H3, H4).
-- Whether the VC accepts a peer that is not the VC.
+- Whether the VC accepts a peer that is not the VC. The tail is now computable, so this can be tested.
 - The behaviour for battles (`Wireless_start_exchange` and friends); only a trade was captured.
