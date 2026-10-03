@@ -91,6 +91,17 @@ static void _finishTransfer(struct GBSIOLockstepNode* node) {
 	}
 	struct GBSIO* sio = node->d.p;
 	sio->pendingSB = node->p->pendingSB[!node->id];
+	if (!node->id && node->p->d.attached > 1 && node->p->players[1]) {
+		// The master only gets a reply from a unit that has armed its serial port (SC bit 7). One that is not in link
+		// mode does not answer, so the master reads $FF off the idle line instead of that unit's stale SB value.
+		// Gen 1's Cable Club relies on this to tell whether the other player is also waiting at the receptionist; without
+		// it, whichever player talks to the receptionist first can get a false "partner found" from the idle one.
+		uint8_t otherSC = node->p->players[1]->d.p->p->memory.io[GB_REG_SC];
+		if (!(otherSC & 0x80)) {
+			GBLinkTraceLockstep(sio->p, node->id, "master_rx_ff_slave_idle", 0, sio->pendingSB, otherSC);
+			sio->pendingSB = 0xFF;
+		}
+	}
 	GBLinkTraceSerial(sio->p, node->id, node->p->pendingSB[node->id], sio->pendingSB);
 	if (GBRegisterSCIsEnable(sio->p->memory.io[GB_REG_SC])) {
 		sio->remainingBits = 8;

@@ -28,6 +28,10 @@ void LinkTraceWatchdogStop(void);
 #endif
 
 #define MAX_HOOKS 48
+#define MAX_VARS 16
+#define MAX_BUFS 8
+#define BUF_MAX 512
+#define BUF_STABLE_FRAMES 6
 #define MAX_RAM 24
 #define MAX_ROUTINES 24
 #define MAX_PLAYERS 4
@@ -60,6 +64,20 @@ struct RoutineDef {
 	uint16_t addr;
 };
 
+struct VarDef {
+	char name[48];
+	char alias[48];
+	uint16_t addr;
+};
+
+struct BufDef {
+	char name[48];
+	char alias[48];
+	uint16_t addr;
+	uint16_t len;
+	bool rx;
+};
+
 struct GameDef {
 	char title[24];
 	char game[16];
@@ -69,6 +87,10 @@ struct GameDef {
 	size_t nRam;
 	struct RoutineDef routines[MAX_ROUTINES];
 	size_t nRoutines;
+	struct VarDef vars[MAX_VARS];
+	size_t nVars;
+	struct BufDef bufs[MAX_BUFS];
+	size_t nBufs;
 };
 
 struct HookRuntime {
@@ -92,6 +114,17 @@ struct GBLinkTrace {
 	struct HookRuntime rt[MAX_HOOKS];
 	ssize_t exchangeBytesId;
 	ssize_t linkMenuId;
+
+	// Marker sampler (no breakpoints): watches state variables and block buffers once per frame on the core thread.
+	bool breakpoints;
+	struct mCoreCallbacks callbacks;
+	bool callbacksAdded;
+	bool varSeen[MAX_VARS];
+	uint8_t varLast[MAX_VARS];
+	uint8_t bufLast[MAX_BUFS][BUF_MAX];
+	bool bufSeen[MAX_BUFS];
+	bool bufPending[MAX_BUFS];
+	int bufStable[MAX_BUFS];
 };
 
 // Process-wide sink shared by every core in the process (both windows of a multiplayer pair).
@@ -523,6 +556,18 @@ static bool _loadGame(const char* path, const char* romTitle, struct GameDef* ou
 			strncpy(out->routines[out->nRoutines].name, b, sizeof(out->routines[0].name) - 1);
 			out->routines[out->nRoutines].bank = (int) bank;
 			out->routines[out->nRoutines++].addr = (uint16_t) addr;
+		} else if (sscanf(line, "var %47s %x %47s", b, &addr, d) == 3 && out->nVars < MAX_VARS) {
+			struct VarDef* v = &out->vars[out->nVars++];
+			strncpy(v->name, b, sizeof(v->name) - 1);
+			strncpy(v->alias, d, sizeof(v->alias) - 1);
+			v->addr = (uint16_t) addr;
+		} else if (sscanf(line, "buf %47s %x %u %63s %47s", b, &addr, &bank, a, d) == 5 && out->nBufs < MAX_BUFS && bank <= BUF_MAX) {
+			struct BufDef* bd = &out->bufs[out->nBufs++];
+			strncpy(bd->name, b, sizeof(bd->name) - 1);
+			strncpy(bd->alias, d, sizeof(bd->alias) - 1);
+			bd->addr = (uint16_t) addr;
+			bd->len = (uint16_t) bank;
+			bd->rx = strcmp(a, "rx") == 0;
 		} else if (sscanf(line, "hook %47s %63s %u %x %71s %47s", b, a, &bank, &addr, d, e) == 6 && out->nHooks < MAX_HOOKS) {
 			struct HookDef* h = &out->hooks[out->nHooks++];
 			strncpy(h->name, b, sizeof(h->name) - 1);
@@ -536,6 +581,60 @@ static bool _loadGame(const char* path, const char* romTitle, struct GameDef* ou
 	}
 	fclose(f);
 	return found;
+}
+
+// ---- Markers: hook-level events derived WITHOUT breakpoints ------------------------------------------------------
+// Breakpoints make mGBA single-step the cores (mDebuggerRunTimeout), which breaks the GB lockstep timing. Instead a
+// videoFrameEnded callback samples the game's own link state once per frame on the core thread: state variables are
+// logged when they change, and block buffers (RNG list, party block, patch lists) are logged once they stop changing.
+// Each marker carries the VC hook name it corresponds to (the `hook` field) so it can be aligned with VC captures.
+static void _sampleMarkers(struct GBLinkTrace* t) {
+	size_t i;
+	for (i = 0; i < t->game.nVars; ++i) {
+		struct VarDef* v = &t->game.vars[i];
+		uint8_t now = (uint8_t) t->core->rawRead8(t->core, v->addr, -1);
+		if (t->varSeen[i] && t->varLast[i] == now) {
+			continue;
+		}
+		char extra[64];
+		if (t->varSeen[i]) {
+			snprintf(extra, sizeof(extra), "\"old\":%u,\"new\":%u", t->varLast[i], now);
+		} else {
+			snprintf(extra, sizeof(extra), "\"old\":null,\"new\":%u", now);
+		}
+		t->varSeen[i] = true;
+		t->varLast[i] = now;
+		_emit(t->gb, t->instance, t->player, "evt", "marker", v->name, v->alias, NULL, -1, NULL, extra);
+	}
+	for (i = 0; i < t->game.nBufs; ++i) {
+		struct BufDef* b = &t->game.bufs[i];
+		uint8_t cur[BUF_MAX];
+		size_t j;
+		for (j = 0; j < b->len; ++j) {
+			cur[j] = (uint8_t) t->core->rawRead8(t->core, (uint16_t) (b->addr + j), -1);
+		}
+		if (!t->bufSeen[i]) {
+			memcpy(t->bufLast[i], cur, b->len);
+			t->bufSeen[i] = true;
+			continue;
+		}
+		if (memcmp(cur, t->bufLast[i], b->len) != 0) {
+			memcpy(t->bufLast[i], cur, b->len);
+			t->bufPending[i] = true;
+			t->bufStable[i] = 0;
+		} else if (t->bufPending[i] && ++t->bufStable[i] >= BUF_STABLE_FRAMES) {
+			t->bufPending[i] = false;
+			char* hex = _hexString(t->bufLast[i], b->len);
+			char extra[64];
+			snprintf(extra, sizeof(extra), "\"stable_frames\":%d", BUF_STABLE_FRAMES);
+			_emit(t->gb, t->instance, t->player, b->rx ? "rx" : "tx", "marker", b->name, b->alias, NULL, b->len, hex ? hex : "", extra);
+			free(hex);
+		}
+	}
+}
+
+static void _frameEnded(void* context) {
+	_sampleMarkers((struct GBLinkTrace*) context);
 }
 
 struct GBLinkTrace* GBLinkTraceCreate(struct mCore* core, struct mDebugger* debugger) {
@@ -579,6 +678,8 @@ struct GBLinkTrace* GBLinkTraceCreate(struct mCore* core, struct mDebugger* debu
 	}
 
 	bool haveGame = hooksPath && _loadGame(hooksPath, romTitle, &t->game);
+	const char* bpOpt = _option(core, "linkTrace.breakpoints", "MGBA_LINKTRACE_BREAKPOINTS");
+	t->breakpoints = bpOpt && atoi(bpOpt) != 0;
 	snprintf(t->instance, sizeof(t->instance), "%s", haveGame && t->game.game[0] ? t->game.game : (romTitle[0] ? romTitle : "gb"));
 
 	// Register for the byte-level lockstep tap.
@@ -606,7 +707,7 @@ struct GBLinkTrace* GBLinkTraceCreate(struct mCore* core, struct mDebugger* debu
 
 	size_t installed = 0, failed = 0;
 #ifdef ENABLE_DEBUGGERS
-	if (haveGame && debugger) {
+	if (haveGame && debugger && t->breakpoints) {
 		if (!core->debugger) {
 			mDebuggerAttach(debugger, core);
 		}
@@ -647,11 +748,19 @@ struct GBLinkTrace* GBLinkTraceCreate(struct mCore* core, struct mDebugger* debu
 	UNUSED(debugger);
 #endif
 
-	char extra[320], title[64];
+	if (haveGame && (t->game.nVars || t->game.nBufs)) {
+		memset(&t->callbacks, 0, sizeof(t->callbacks));
+		t->callbacks.context = t;
+		t->callbacks.videoFrameEnded = _frameEnded;
+		core->addCoreCallbacks(core, &t->callbacks);
+		t->callbacksAdded = true;
+	}
+
+	char extra[420], title[64];
 	_jsonEscape(title, sizeof(title), romTitle);
-	snprintf(extra, sizeof(extra), "\"title\":\"%s\",\"hooks_file\":%s,\"hooks_matched\":%s,\"hooks_installed\":%u,\"hooks_failed\":%u,\"bytes\":%s",
-	         title, hooksPath ? "true" : "false", haveGame ? "true" : "false", (unsigned) installed, (unsigned) failed,
-	         t->bytes ? "true" : "false");
+	snprintf(extra, sizeof(extra), "\"title\":\"%s\",\"hooks_file\":%s,\"hooks_matched\":%s,\"breakpoints\":%s,\"hooks_installed\":%u,\"hooks_failed\":%u,\"marker_vars\":%u,\"marker_bufs\":%u,\"bytes\":%s",
+	         title, hooksPath ? "true" : "false", haveGame ? "true" : "false", t->breakpoints ? "true" : "false",
+	         (unsigned) installed, (unsigned) failed, (unsigned) t->game.nVars, (unsigned) t->game.nBufs, t->bytes ? "true" : "false");
 	_emit(t->gb, t->instance, t->player, "evt", "meta", "start", NULL, NULL, -1, NULL, extra);
 	return t;
 }
@@ -659,6 +768,10 @@ struct GBLinkTrace* GBLinkTraceCreate(struct mCore* core, struct mDebugger* debu
 void GBLinkTraceDestroy(struct GBLinkTrace* t) {
 	if (!t) {
 		return;
+	}
+	if (t->callbacksAdded && t->core) {
+		t->core->removeCoreCallbacks(t->core, &t->callbacks);
+		t->callbacksAdded = false;
 	}
 #ifdef ENABLE_DEBUGGERS
 	if (t->attached && t->core && t->core->debugger) {
