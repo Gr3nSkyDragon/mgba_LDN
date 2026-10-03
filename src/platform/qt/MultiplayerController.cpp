@@ -475,6 +475,19 @@ int MultiplayerController::attached() {
 }
 
 MultiplayerController::Player* MultiplayerController::player(int id) {
+#ifdef M_CORE_GB
+	// Restores the pre-436d6c5a0 behaviour: GBSIOLockstep swaps its node ids when the second unit claims the link clock
+	// first, and player() used to follow that swap on demand. Since that commit m_players was only re-sorted on
+	// attach/detach, so after a swap wait/signal/addCycles/useCycles acted on the wrong window.
+	if (m_platform == mPLATFORM_GB) {
+		for (auto iter = m_pids.begin(); iter != m_pids.end(); ++iter) {
+			if (iter.value().attached && iter.value().node.gb && iter.value().node.gb->id == id) {
+				return &iter.value();
+			}
+		}
+		return nullptr;
+	}
+#endif
 	if (id >= m_players.size()) {
 		return nullptr;
 	}
@@ -487,6 +500,19 @@ MultiplayerController::Player* MultiplayerController::player(int id) {
 }
 
 const MultiplayerController::Player* MultiplayerController::player(int id) const {
+#ifdef M_CORE_GB
+	// Restores the pre-436d6c5a0 behaviour: GBSIOLockstep swaps its node ids when the second unit claims the link clock
+	// first, and player() used to follow that swap on demand. Since that commit m_players was only re-sorted on
+	// attach/detach, so after a swap wait/signal/addCycles/useCycles acted on the wrong window.
+	if (m_platform == mPLATFORM_GB) {
+		for (auto iter = m_pids.begin(); iter != m_pids.end(); ++iter) {
+			if (iter.value().attached && iter.value().node.gb && iter.value().node.gb->id == id) {
+				return &iter.value();
+			}
+		}
+		return nullptr;
+	}
+#endif
 	if (id >= m_players.size()) {
 		return nullptr;
 	}
@@ -516,7 +542,7 @@ void MultiplayerController::fixOrder() {
 #endif
 #ifdef M_CORE_GB
 	case mPLATFORM_GB:
-		if (player(0)->node.gb->id == 1) {
+		if (player(0) && player(0)->node.gb->id == 1) {
 			std::swap(m_players[0], m_players[1]);
 		}
 		break;

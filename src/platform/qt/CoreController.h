@@ -10,6 +10,8 @@
 #include <QList>
 #include <QMutex>
 #include <QObject>
+
+#include <atomic>
 #include <QSize>
 
 #include "VFileDevice.h"
@@ -40,6 +42,7 @@
 #include <mgba/gba/interface.h>
 #endif
 
+struct GBLinkTrace;
 struct mCore;
 
 namespace QGBA {
@@ -338,6 +341,8 @@ private:
 	struct mDebugger m_debugger;
 #endif
 
+	struct GBLinkTrace* m_linkTrace = nullptr;
+
 	int m_fastForward = false;
 	int m_fastForwardForced = false;
 	int m_fastForwardVolume = -1;
@@ -346,7 +351,11 @@ private:
 	float m_fastForwardHeldRatio = -1.f;
 	float m_fpsTarget;
 
-	bool m_mute;
+	bool m_mute = false;
+	// Mute changes are applied on the core thread (see applyPendingMute) so that a window gaining focus never has to
+	// interrupt a core that is blocked waiting on its multiplayer lockstep partner.
+	std::atomic<bool> m_muteDirty{false};
+	void applyPendingMute();
 
 	InputController* m_inputController = nullptr;
 	LogController* m_log = nullptr;

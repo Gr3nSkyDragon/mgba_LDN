@@ -6,6 +6,7 @@ set(SOURCE_FILES
 	gb.c
 	input.c
 	io.c
+	linktrace.c
 	mbc.c
 	mbc/huc-3.c
 	mbc/licensed.c
@@ -21,6 +22,10 @@ set(SOURCE_FILES
 	sio.c
 	timer.c
 	video.c)
+
+if(WIN32)
+	list(APPEND SOURCE_FILES linktrace-win32.c)
+endif()
 
 set(SIO_FILES
 	sio/lockstep.c

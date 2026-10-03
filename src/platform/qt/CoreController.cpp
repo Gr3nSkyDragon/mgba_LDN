@@ -29,6 +29,7 @@
 #endif
 #ifdef M_CORE_GB
 #include <mgba/internal/gb/gb.h>
+#include <mgba/internal/gb/linktrace.h>
 #include <mgba/internal/gb/renderers/cache-set.h>
 #endif
 #include "feature/sqlite3/no-intro.h"
@@ -74,10 +75,22 @@ CoreController::CoreController(mCore* core, QObject* parent)
 			controller->attachRFU();
 			break;
 #endif
+#ifdef M_CORE_GB
+		case mPLATFORM_GB:
+			// Native link tracer (replaces scripting for link captures): installed here, on the core thread before any
+			// multiplayer link exists, so nothing ever has to interrupt a core that is waiting on its lockstep partner.
+#ifdef ENABLE_DEBUGGERS
+			controller->m_linkTrace = GBLinkTraceCreate(context->core, &controller->m_debugger);
+#else
+			controller->m_linkTrace = GBLinkTraceCreate(context->core, nullptr);
+#endif
+			break;
+#endif
 		default:
 			break;
 		}
 
+		controller->applyPendingMute();
 		controller->updateFastForward();
 
 		if (controller->m_multiplayer) {
@@ -116,7 +129,7 @@ CoreController::CoreController(mCore* core, QObject* parent)
 
 	m_threadContext.frameCallback = [](mCoreThread* context) {
 		CoreController* controller = static_cast<CoreController*>(context->userData);
-
+		controller->applyPendingMute();
 		if (controller->m_autosaveCounter == AUTOSAVE_GRANULARITY) {
 			if (controller->m_autosave) {
 				mCoreSaveState(context->core, 0, controller->m_saveStateFlags);
@@ -135,6 +148,12 @@ CoreController::CoreController(mCore* core, QObject* parent)
 			mCoreSaveState(context->core, 0, controller->m_saveStateFlags);
 		}
 
+#ifdef M_CORE_GB
+		if (controller->m_linkTrace) {
+			GBLinkTraceDestroy(controller->m_linkTrace);
+			controller->m_linkTrace = nullptr;
+		}
+#endif
 		controller->clearMultiplayerController();
 #ifdef M_CORE_GBA
 		controller->detachDolphin();
@@ -151,6 +170,7 @@ CoreController::CoreController(mCore* core, QObject* parent)
 
 	m_threadContext.unpauseCallback = [](mCoreThread* context) {
 		CoreController* controller = static_cast<CoreController*>(context->userData);
+		controller->applyPendingMute();
 
 		QMetaObject::invokeMethod(controller, "unpaused");
 	};
@@ -312,6 +332,9 @@ void CoreController::loadConfig(ConfigController* config) {
 	m_fastForwardMute = config->getOption("fastForwardMute", false).toInt();
 	mCoreConfigCopyValue(&m_threadContext.core->config, config->config(), "volume");
 	mCoreConfigCopyValue(&m_threadContext.core->config, config->config(), "mute");
+	mCoreConfigCopyValue(&m_threadContext.core->config, config->config(), "linkTrace.dir");
+	mCoreConfigCopyValue(&m_threadContext.core->config, config->config(), "linkTrace.hooks");
+	mCoreConfigCopyValue(&m_threadContext.core->config, config->config(), "linkTrace.bytes");
 	m_preload = config->getOption("preload", true).toInt();
 
 	QSize sizeBefore = screenDimensions();
@@ -659,8 +682,16 @@ void CoreController::changePlayer(int id) {
 
 void CoreController::overrideMute(bool override) {
 	m_mute = override;
+	m_muteDirty = true;
+}
 
-	Interrupter interrupter(this);
+// Runs on the core thread (start, frame and unpause callbacks), where nothing else is touching the core's options.
+// This used to be an Interrupter on the UI thread from every window focus change, which deadlocks when the core is
+// waiting on a multiplayer lockstep partner (see the stall dumps in logs/).
+void CoreController::applyPendingMute() {
+	if (!m_muteDirty.exchange(false)) {
+		return;
+	}
 	mCore* core = m_threadContext.core;
 	if (m_mute) {
 		core->opts.mute = true;

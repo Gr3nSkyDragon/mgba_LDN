@@ -7,6 +7,7 @@
 
 #include <mgba/internal/gb/gb.h>
 #include <mgba/internal/gb/io.h>
+#include <mgba/internal/gb/linktrace.h>
 
 #define LOCKSTEP_INCREMENT 512
 
@@ -90,6 +91,7 @@ static void _finishTransfer(struct GBSIOLockstepNode* node) {
 	}
 	struct GBSIO* sio = node->d.p;
 	sio->pendingSB = node->p->pendingSB[!node->id];
+	GBLinkTraceSerial(sio->p, node->id, node->p->pendingSB[node->id], sio->pendingSB);
 	if (GBRegisterSCIsEnable(sio->p->memory.io[GB_REG_SC])) {
 		sio->remainingBits = 8;
 		mTimingDeschedule(&sio->p->timing, &sio->event);
