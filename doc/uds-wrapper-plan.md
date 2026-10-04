@@ -188,3 +188,51 @@ Next:
    that opens a `UDSJoiner` and prints the state until `udsJoinerReady()` (milestone M3).
 2. Review the menu stubs in a running build; decide what greys out when the VC box is ticked.
 3. L4 with the nybble sync only, then the bulk exchanges (M4, M5).
+
+## 8. Stage 2: mGBA to a retail 3DS over the real radio
+
+Stage 1 is done: a Game Boy Red/Blue game in mGBA trades with Azahar's VC through the UDP bridge (commit "Working mGBA to Azahar
+trade"). Stage 2 swaps the bridge for the real air. Everything above `uds-room.c` stays as it is.
+
+**Layout.** `uds-room.c` talks to an "air" that exchanges `WifiPacket`s (type, channel, MACs, body). The bridge is one air. The real one is
+new and sits between the room and the board:
+
+```
+uds-room.c   (join, SecureData, Pia)         unchanged
+  uds-air-radio.c   WifiPacket <-> 802.11 MPDU: management frames, data frames, sequence numbers, packet numbers
+    uds-ccmp.c        AES-128, CCM with an 8-byte tag, key derivation (AES-CTR of MD5(passphrase), slot 0x2D)
+    uds-esp32.c       Azahar firmware framing (version, type, seq, flags, length, payload, CRC-32, COBS) and its commands
+      esp32-serial.c    existing: port picker, VID 303A, 921600 baud, DTR/RTS
+```
+
+The firmware's own `main/uds_wire.c` is portable C with golden vectors; it is reused rather than rewritten. The board needs no change.
+
+**Known from Azahar** (the same code already trades as a client against a retail host): the passphrase `TRL_NETWORK\0`; the CCMP nonce and
+AAD layout (`uds_data.cpp`); the retail association request body (SSID = network id as eight hex characters, rates, extended rates); that
+frames to the host are unicast ToDS, the host's game frames are broadcast no-DS, its EAPoL frames FromDS; the board uses a twin MAC
+(first octet XOR 0x02) so the host's unicast frames are retransmitted rather than ACKed by hardware, and that already works.
+
+**Milestones**
+| | work | check |
+|---|---|---|
+| R0 | `uds-ccmp.c` and the frame builders in portable C | byte-exact against the MPDUs Azahar logged (`mpdu=` next to `plaintext=` in its UDS DATA/JOIN TRACE lines) and the passive-sniffer capture |
+| R1 | `uds-esp32.c` over the existing serial layer: Hello/HelloAck, Start, SetChannel, SetWatch, TxFrame, Rx | the status line shows the firmware version; wrong firmware (the GB-Link LDN board) is reported |
+| R2 | scan: channel hop, read a retail 3DS host's beacon (network info tag, application data) | the room reports the host as it does on the bridge |
+| R3 | join: authentication, association request, EAPoL start, the host's EAPoL reply | "joined" with a node id from a retail host |
+| R4 | Pia session over the air | "game stream may start", then the sync and menu of stage 1 |
+| R5 | a trade with a retail 3DS | the stage 1 trade, against retail |
+| R6 | robustness: retries and ACK behaviour, channel changes, a second session, errors in the status line | |
+
+**Needs from you:** a retail 3DS that can host VC Red or Blue, and the 3DS UDS key from your own key dump (the file Azahar reads,
+`aes_keys.txt`; never shipped, never logged). The backend choice is the existing menu: `ESP32` plus the Virtual Console box means the
+real air, `Local` plus the box means the bridge.
+
+**Risks:** a retail host may be stricter than Azahar about timing and acknowledgements; the board cannot serve Azahar and mGBA at the
+same time; the first join attempt against a retail host was deauthenticated by it once in Azahar's logs.
+
+**R0 status (done):** `uds-keyfile.c` (reads `slot0x2DKeyN`, or makes the key from `slot0x2DKeyX`, `slot0x2DKeyY` and `generatorConstant`/`generator`;
+Settings > BIOS > "3DS UDS key file", saved as `vcwrapper.keyfile`, with a status line that never shows the key), `uds-ccmp.c` (AES-128, CCM with the
+published FIPS-197 and RFC 3610 vectors, the per-network data key, protected data frames, management frames, the association request body). Tests:
+`uds-key-test`, `uds-ccmp-test` (37 checks), and `uds-ccmp-golden`, which decrypts and rebuilds every `TX MPDU` line in an Azahar log:
+1,181 of 1,181 frames from the 2026-10-03 trade decrypt to the logged plaintext and rebuild byte for byte, and the association request frame is identical.
+The key file for the check is made by `run-azahar-export-key.cmd` (see the Azahar repository).

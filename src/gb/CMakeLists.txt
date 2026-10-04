@@ -35,7 +35,9 @@ set(SIO_FILES
 	sio/uds-room.c
 	sio/uds-udp.c
 	sio/uds-joiner.c
-	sio/uds-gblink.c)
+	sio/uds-gblink.c
+	sio/uds-keyfile.c
+	sio/uds-ccmp.c)
 
 set(EXTRA_FILES
 	extra/proxy.c)

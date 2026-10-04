@@ -881,6 +881,27 @@ if(BUILD_UDS_TEST)
 	if(WIN32)
 		target_link_libraries(uds-bridge-test ws2_32)
 	endif()
+
+	# The key-file reader, with made-up values.
+	add_executable(uds-key-test
+		src/gb/sio/uds-key-test.c
+		src/gb/sio/uds-keyfile.c)
+	target_include_directories(uds-key-test PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
+
+	# AES, CCM, the data key and the 802.11 frame builders, against published vectors.
+	add_executable(uds-ccmp-test
+		src/gb/sio/uds-ccmp-test.c
+		src/gb/sio/uds-ccmp.c
+		src/util/md5.c)
+	target_include_directories(uds-ccmp-test PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
+
+	# The same code against frames Azahar logged (needs the user's key file and a log; see the file's header).
+	add_executable(uds-ccmp-golden
+		src/gb/sio/uds-ccmp-golden.c
+		src/gb/sio/uds-ccmp.c
+		src/gb/sio/uds-keyfile.c
+		src/util/md5.c)
+	target_include_directories(uds-ccmp-golden PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
 endif()
 
 if(USE_LDND)

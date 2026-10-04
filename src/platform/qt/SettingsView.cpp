@@ -25,6 +25,8 @@
 #include <mgba/core/serialize.h>
 #include <mgba/core/version.h>
 #include <mgba/internal/gba/gba.h>
+#include <mgba/internal/gb/sio/uds-keyfile.h>
+#include <QFileInfo>
 
 #ifdef BUILD_SDL
 #define SDL_MAIN_HANDLED
@@ -244,6 +246,11 @@ SettingsView::SettingsView(ConfigController* controller, InputController* inputC
 		}
 	}
 #endif
+
+	connect(m_ui.udsKeyFileBrowse, &QPushButton::clicked, [this]() {
+		selectFile(m_ui.udsKeyFile, tr("Select 3DS UDS key file"), tr("Key files (*.txt);;All files (*)"));
+	});
+	connect(m_ui.udsKeyFile, &QLineEdit::textChanged, this, &SettingsView::updateUdsKeyStatus);
 
 #ifdef M_CORE_GBA
 	connect(m_ui.gbaBiosBrowse, &QPushButton::clicked, [this]() {
@@ -465,6 +472,21 @@ QString SettingsView::makePortablePath(const QString& path) {
 	return path;
 }
 
+// Checks the key file the way the wrapper will read it and says what it found. The key itself is never shown.
+void SettingsView::updateUdsKeyStatus() {
+	const QString path = m_ui.udsKeyFile->text().trimmed();
+	if (path.isEmpty()) {
+		m_ui.udsKeyStatus->setText(QString());
+		return;
+	}
+	uint8_t key[16];
+	QFileInfo info(path);
+	const QString resolved = info.isRelative() ? m_controller->configDir() + QLatin1Char('/') + path : path;
+	const UDSKeyStatus status = udsKeyFileLoad(resolved.toUtf8().constData(), key);
+	memset(key, 0, sizeof(key));
+	m_ui.udsKeyStatus->setText(QString::fromUtf8(udsKeyStatusText(status)));
+}
+
 void SettingsView::selectBios(QLineEdit* bios) {
 	selectFile(bios, tr("Select BIOS"));
 }
@@ -496,6 +518,7 @@ void SettingsView::updateConfig() {
 	saveSetting("gb.bios", m_ui.gbBios);
 	saveSetting("gbc.bios", m_ui.gbcBios);
 	saveSetting("sgb.bios", m_ui.sgbBios);
+	saveSetting("vcwrapper.keyfile", m_ui.udsKeyFile);
 	saveSetting("sgb.borders", m_ui.sgbBorders);
 	saveSetting("useBios", m_ui.useBios);
 	saveSetting("skipBios", m_ui.skipBios);
@@ -718,6 +741,8 @@ void SettingsView::reloadConfig() {
 	loadSetting("gb.bios", m_ui.gbBios);
 	loadSetting("gbc.bios", m_ui.gbcBios);
 	loadSetting("sgb.bios", m_ui.sgbBios);
+	loadSetting("vcwrapper.keyfile", m_ui.udsKeyFile);
+	updateUdsKeyStatus();
 	loadSetting("sgb.borders", m_ui.sgbBorders, true);
 	loadSetting("useBios", m_ui.useBios);
 	loadSetting("skipBios", m_ui.skipBios);
