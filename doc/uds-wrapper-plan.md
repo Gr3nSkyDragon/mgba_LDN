@@ -291,3 +291,49 @@ Steps (the hook wrapper stays as the reference oracle throughout, behind its cur
 
 Open: what the GB-Link GB mode passes through and how fast (to ask the GB-Link developers); how the translator paces the 424-byte
 block (the cartridge clocks it at about 1 byte per ms while the VC creates it at once); Gen 2 and Yellow cable behaviour is unmeasured.
+
+### 9.1 Findings that shape the wire-level front end (step 3)
+
+From two recorded cable trades (two mGBA windows on the lockstep driver, Red master / Blue slave both times; the 4 October one has the
+slave pressing A first), the ROM source (`home/serial.asm`) and the recordings' phase split (`docs/cable/cable_phases.py`,
+`cable_blocks.py`; both traces split into the same nine bursts):
+
+* **Roles on the wire.** Master's first exchange is `01`/`02`, the slave's `02`/`01`. The slave then answers `00` once and `FE` until it
+  has something. The role is not tied to the lockstep id (it swapped between the two recordings); it went to the window that talked to
+  the receptionist first. A wrapper that always presents `02` with an armed external clock always gets a cartridge that is master.
+* **`FE` is flow control.** `Serial_ExchangeByte` re-sends the same byte one frame later whenever the reply is `FE`. So when no host unit
+  is available at the moment the cartridge clocks, the front end answers `FE` and sends no unit; the cartridge retries. Units then
+  exist only for transfers that completed, as in the emulator model.
+* **A cartridge cannot be paused.** The emulated ROM waits (in virtual time) for the 3DS's unit; a real master clocks about once per
+  2 ms. Blocks must be buffered: the host's block arrives in Pia bursts and is answered from a buffer at wire speed, and the
+  cartridge's bytes are queued as units in bulk.
+* **Blocks.** After the room sync (26 exchanges: `fe`, `60`x13, `00`x12) come, per block, a run of `fd` preamble bytes and then the data
+  (`hSerialIgnoringInitialData` discards what arrives until an `fd` is received): 10-byte random-number list, the 424-byte player block
+  and the 200-byte patch lists. The wrapper must recognise the preamble to know when a block starts.
+* **Menu cycle.** The master sends `d0 d0 d0 00` per cycle and the slave `d0 d0 00 fe`; when the slave presses A the master's next cycle is
+  unchanged (it receives `d4 d4 00 fe`, adopts, and leaves 13 s later at the room sync). It never echoes `d4`.
+* **Sync length is the cartridge's.** The master sends `60|n` until it has received a 6x, then a fixed number more and then `00`s; the
+  VC host's burst has another length, so after the cartridge's last sync byte the front end keeps answering the host's remaining sync
+  units itself (the tail in `udsCableSync`).
+
+Plan for the front end: a slave state machine driven by "the cartridge clocked byte b at time t" returning the byte to preload, with phases
+role, sync, menu, and a pass-through for the rest that answers from the host's queued units (`FE` when none) and bulk-buffers blocks.
+It is tested offline by replaying the recorded master bytes, with the host's units taken from the Azahar and retail captures.
+
+### 9.2 Step 3, first part: `uds-wire` (role, sync, pass-through)
+
+`uds-wire.c/.h` is the permanent slave. Interface: `udsWirePoll(now)`, `udsWirePreload()` (the byte the slave shifts out next, decided before the
+master clocks) and `udsWireExchanged(now, byte)`. Phases DOWN, ROLE, IDLE, SYNC, PASS:
+
+* **DOWN**: no Pia session, or a sync that timed out: the cartridge sees an idle line (`FF`). A session begins once per link-up.
+* **ROLE / IDLE**: replies `02`, then `00`, then `FE` to the master's `01 00 00`, as the recorded real slave did; no units (the VC has no role bytes).
+* **SYNC**: starts at the master's first 6x. The 3DS side runs by itself (`udsCableSync`); the cartridge gets `FE` until the 3DS's nybble is known, then
+  `60|nybble` while it sends 6x and `00` while it sends `00`, so its own fixed loops end with the 3DS's nybble. It ends when the 3DS side has finished and
+  the cartridge sends something that is not sync; that exchange gets no unit of its own.
+* **PASS**: one unit per completed exchange. A unit from the 3DS is the reply and the master's byte goes out; with none the reply is `FE`, the byte goes
+  out once and the cartridge's retry does not send it again; an `FE` that is the 3DS's own unit is data (the retry is a new exchange).
+
+`uds-wire-test` (39 checks) runs a model of the cartridge (`Serial_ExchangeByte` retry after a frame, the three sync loops) against a scripted 3DS, including a late
+3DS and a 3DS that never answers, and replays the first 99 recorded exchanges (`uds-wire-test-vectors.h`): the sync starts at exchange 4 and ends at 67 as in the recording,
+and the 3DS receives exactly the units its side of the sync produces on its own. Not yet: the link menu and the `fd` blocks as phases of their own (bulk buffering),
+a second sync in the room (needs the block context to tell it from data), the mGBA driver around it (step 4).

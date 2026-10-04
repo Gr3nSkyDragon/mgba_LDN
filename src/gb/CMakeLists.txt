@@ -36,6 +36,7 @@ set(SIO_FILES
 	sio/uds-udp.c
 	sio/uds-joiner.c
 	sio/uds-cable.c
+	sio/uds-wire.c
 	sio/uds-gblink.c
 	sio/uds-keyfile.c
 	sio/uds-ccmp.c

@@ -874,6 +874,13 @@ if(BUILD_UDS_TEST)
 		src/gb/sio/uds-cable.c)
 	target_include_directories(uds-cable-test PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
 
+	# The wire-level front end (a permanent slave on a link cable), against a model of the cartridge and a recorded cable trade.
+	add_executable(uds-wire-test
+		src/gb/sio/uds-wire-test.c
+		src/gb/sio/uds-wire.c
+		src/gb/sio/uds-cable.c)
+	target_include_directories(uds-wire-test PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
+
 	# The same test for the Azahar bridge side, over real localhost sockets.
 	add_executable(uds-bridge-test
 		src/gb/sio/uds-bridge-test.c
