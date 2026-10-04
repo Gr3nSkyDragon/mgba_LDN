@@ -876,10 +876,15 @@ if(BUILD_UDS_TEST)
 		src/gb/sio/uds-room.c
 		src/gb/sio/uds-udp.c
 		src/gb/sio/uds-joiner.c
+		src/gb/sio/uds-air-radio.c
+		src/gb/sio/uds-esp32.c
+		src/gb/sio/uds-ccmp.c
+		src/gb/sio/uds-keyfile.c
+		src/gba/sio/esp32/esp32-serial.c
 		src/util/md5.c)
 	target_include_directories(uds-bridge-test PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
 	if(WIN32)
-		target_link_libraries(uds-bridge-test ws2_32)
+		target_link_libraries(uds-bridge-test ws2_32 setupapi)
 	endif()
 
 	# The key-file reader, with made-up values.
@@ -902,6 +907,46 @@ if(BUILD_UDS_TEST)
 		src/gb/sio/uds-keyfile.c
 		src/util/md5.c)
 	target_include_directories(uds-ccmp-golden PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
+
+	# The serial framing of Azahar's ESP32 UDS radio board, no hardware needed.
+	add_executable(uds-esp32-test
+		src/gb/sio/uds-esp32-test.c
+		src/gb/sio/uds-esp32.c
+		src/gba/sio/esp32/esp32-serial.c)
+	target_include_directories(uds-esp32-test PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
+	if(WIN32)
+		target_link_libraries(uds-esp32-test setupapi)
+	endif()
+
+	# Joins a retail 3DS Game Boy VC host over the air and runs the Pia session (R3/R4 of the real-air stage).
+	add_executable(uds-air-probe
+		src/gb/sio/uds-air-probe.c
+		src/gb/sio/uds-joiner.c
+		src/gb/sio/uds-air-radio.c
+		src/gb/sio/uds-room.c
+		src/gb/sio/uds-session.c
+		src/gb/sio/uds-pia.c
+		src/gb/sio/uds-udp.c
+		src/gb/sio/uds-esp32.c
+		src/gb/sio/uds-ccmp.c
+		src/gb/sio/uds-keyfile.c
+		src/gba/sio/esp32/esp32-serial.c
+		src/util/md5.c)
+	target_include_directories(uds-air-probe PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
+	if(WIN32)
+		target_link_libraries(uds-air-probe setupapi ws2_32)
+	endif()
+
+	# Talks to the board: prints its firmware and the 3DS hosts it hears (R1/R2 of the real-air stage).
+	add_executable(uds-esp32-probe
+		src/gb/sio/uds-esp32-probe.c
+		src/gb/sio/uds-esp32.c
+		src/gb/sio/uds-room.c
+		src/gba/sio/esp32/esp32-serial.c)
+	target_include_directories(uds-esp32-probe PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
+	if(WIN32)
+		target_link_libraries(uds-esp32-probe setupapi)
+	endif()
 endif()
 
 if(USE_LDND)

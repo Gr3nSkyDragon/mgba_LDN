@@ -184,18 +184,19 @@ static void _sendEapolStart(struct UDSRoom* room, uint32_t nowMs) {
 }
 
 // Finds the Nintendo network-info tag in a beacon body and fills the host description from it.
-static bool _parseBeacon(const struct UDSRoomPacket* packet, struct UDSRoomHost* host) {
+bool udsRoomParseBeacon(const uint8_t* data, size_t size, struct UDSRoomHost* host) {
 	size_t pos = BEACON_FIXED;
-	while (pos + 2 <= packet->size) {
-		uint8_t id = packet->data[pos];
-		size_t length = packet->data[pos + 1];
-		if (pos + 2 + length > packet->size) {
+	while (pos + 2 <= size) {
+		uint8_t id = data[pos];
+		size_t length = data[pos + 1];
+		if (pos + 2 + length > size) {
 			return false;
 		}
-		const uint8_t* body = &packet->data[pos + 2];
+		const uint8_t* body = &data[pos + 2];
 		if (id == TAG_VENDOR && length >= NETWORK_INFO_MIN && body[3] == NETWORK_INFO_TYPE) {
 			host->commId = _be32(&body[NET_COMM_ID]);
 			host->networkId = _be32(&body[NET_NETWORK_ID]);
+			host->id = body[8];
 			size_t appSize = body[NET_APPDATA_SIZE];
 			if (NET_APPDATA + appSize > length) {
 				return false;
@@ -246,7 +247,7 @@ void udsRoomReceive(struct UDSRoom* room, uint32_t nowMs, const uint8_t* datagra
 		}
 		struct UDSRoomHost host;
 		memset(&host, 0, sizeof(host));
-		if (!_parseBeacon(&packet, &host) || (room->wantCommId && host.commId != room->wantCommId)) {
+		if (!udsRoomParseBeacon(packet.data, packet.size, &host) || (room->wantCommId && host.commId != room->wantCommId)) {
 			return;
 		}
 		memcpy(host.mac, packet.transmitter, 6);

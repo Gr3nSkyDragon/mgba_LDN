@@ -223,16 +223,32 @@ frames to the host are unicast ToDS, the host's game frames are broadcast no-DS,
 | R5 | a trade with a retail 3DS | the stage 1 trade, against retail |
 | R6 | robustness: retries and ACK behaviour, channel changes, a second session, errors in the status line | |
 
-**Needs from you:** a retail 3DS that can host VC Red or Blue, and the 3DS UDS key from your own key dump (the file Azahar reads,
-`aes_keys.txt`; never shipped, never logged). The backend choice is the existing menu: `ESP32` plus the Virtual Console box means the
+**Needs from you:** a retail 3DS that can host VC Red or Blue, and the 3DS UDS key in a file of your own (`slot0x2DKeyN=...`, or
+`slot0x2DKeyX` and `slot0x2DKeyY`, as in `aes_keys.txt`; never shipped, never logged). The backend choice is the existing menu: `ESP32` plus the Virtual Console box means the
 real air, `Local` plus the box means the bridge.
 
 **Risks:** a retail host may be stricter than Azahar about timing and acknowledgements; the board cannot serve Azahar and mGBA at the
 same time; the first join attempt against a retail host was deauthenticated by it once in Azahar's logs.
 
-**R0 status (done):** `uds-keyfile.c` (reads `slot0x2DKeyN`, or makes the key from `slot0x2DKeyX`, `slot0x2DKeyY` and `generatorConstant`/`generator`;
+**R0 status (done):** `uds-keyfile.c` (reads `slot0x2DKeyN`, or makes the key from `slot0x2DKeyX` and `slot0x2DKeyY` with the built-in generator constant, or the file's own `generatorConstant`/`generator` line;
 Settings > BIOS > "3DS UDS key file", saved as `vcwrapper.keyfile`, with a status line that never shows the key), `uds-ccmp.c` (AES-128, CCM with the
 published FIPS-197 and RFC 3610 vectors, the per-network data key, protected data frames, management frames, the association request body). Tests:
 `uds-key-test`, `uds-ccmp-test` (37 checks), and `uds-ccmp-golden`, which decrypts and rebuilds every `TX MPDU` line in an Azahar log:
 1,181 of 1,181 frames from the 2026-10-03 trade decrypt to the logged plaintext and rebuild byte for byte, and the association request frame is identical.
-The key file for the check is made by `run-azahar-export-key.cmd` (see the Azahar repository).
+The key file for the check is the user's own (a `slot0x2DKeyN=` line, or KeyX and KeyY); nothing in the repository contains key material.
+
+**R1 status (written, framing tested, board not yet tried):** `uds-esp32.c` is the serial protocol of Azahar's `esp32-uds-bridge` firmware (its own
+COBS and CRC code, written from the documented framing; not the GB-Link LDN framing) on top of the existing `esp32-serial.c`: Hello with a
+wait for the board to boot, Start, SetChannel, SetWatch, TxFrame, SetBeacon, Ping, and the Rx, Status, Log, TxDone events.
+`uds-esp32-test` (635 checks, no hardware) matches three frames from the firmware's own host test byte for byte and round-trips every payload size
+around the COBS block limit. `uds-esp32-probe [COMx] [--seconds N] [--channel N]` prints the firmware version and board MAC, then hops channels
+1, 6 and 11 and lists the 3DS hosts it hears (R2's scan; no key needed). `udsRoomParseBeacon` is now public, shared with the bridge join.
+
+**R2, R3, R4 (done, live):** `uds-esp32-probe` heard the retail XL's beacons (293 in 30 s, none bad). `uds-air-radio.c` joins a retail 3DS Game Boy VC host over
+the air: `uds-air-probe` reached "joined, node 2 of 2" in 0.55 s and "Pia session: game stream may start" in 0.67 s, and held the link for 20 s with no
+send failures and nothing dropped for decryption (13 host retransmissions were filtered by packet number). The radio opens without blocking (the board
+needs a few seconds): `UDS_AIR_BOOTING` sends Hello from the poll, then Start with the decoy-MAC flag.
+
+**R5 (written, not yet tried):** `Wireless Adapter > ESP32` plus the `Virtual Console (Gen 1-2)` box runs the same `GBVCLink` on the real radio; `Local` plus
+the box stays on the Azahar bridge (`GBVCLinkConfig`). The board is the "ESP32 board" menu choice (empty: find it), the key file is Settings > BIOS > "3DS UDS key
+file" (read when the game starts). `MGBA_VCLINK_TRACE` now also logs every unit sent and received and, on the radio, counters every 5 s.

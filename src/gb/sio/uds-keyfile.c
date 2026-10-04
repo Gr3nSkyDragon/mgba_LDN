@@ -12,6 +12,11 @@
 
 #define UDS_SLOT 0x2D
 
+// The 3DS key generator's constant. It is not console specific (the same on every 3DS), so a file that has KeyX and KeyY
+// but no generatorConstant still gives the key. A generatorConstant in the file takes precedence.
+static const uint8_t sGeneratorConstant[16] = {0x1F, 0xF9, 0xE9, 0xAA, 0xC5, 0xFE, 0x04, 0x08,
+                                               0x02, 0x45, 0x91, 0xDC, 0x5D, 0x52, 0x76, 0x8A};
+
 static void _lrot128(const uint8_t in[16], unsigned rot, uint8_t out[16]) {
 	rot %= 128;
 	unsigned byteShift = rot / 8;
@@ -154,8 +159,8 @@ enum UDSKeyStatus udsKeyTextLoad(const char* text, size_t length, uint8_t key[16
 	if (haveN) {
 		memcpy(key, keyN, 16);
 		status = UDS_KEY_OK_NORMAL;
-	} else if (haveX && haveY && haveGen) {
-		udsKeyDerive(keyX, keyY, generator, key);
+	} else if (haveX && haveY) {
+		udsKeyDerive(keyX, keyY, haveGen ? generator : sGeneratorConstant, key);
 		status = UDS_KEY_OK_DERIVED;
 	} else if (bad) {
 		status = UDS_KEY_BAD_VALUE;
@@ -194,6 +199,27 @@ enum UDSKeyStatus udsKeyFileLoad(const char* path, uint8_t key[16]) {
 	return status;
 }
 
+bool udsKeyFileWrite(const char* path, const uint8_t key[16]) {
+	static const char hex[] = "0123456789ABCDEF";
+	char line[128];
+	size_t pos = (size_t) snprintf(line, sizeof(line), "# UDS data key (key slot 0x2D) made by mGBA. Keep it private.\nslot0x2DKeyN=");
+	size_t i;
+	for (i = 0; i < 16; ++i) {
+		line[pos++] = hex[key[i] >> 4];
+		line[pos++] = hex[key[i] & 0x0F];
+	}
+	line[pos++] = '\n';
+	FILE* file = fopen(path, "wb");
+	if (!file) {
+		memset(line, 0, sizeof(line));
+		return false;
+	}
+	bool ok = fwrite(line, 1, pos, file) == pos;
+	ok = fclose(file) == 0 && ok;
+	memset(line, 0, sizeof(line));
+	return ok;
+}
+
 bool udsKeyStatusOk(enum UDSKeyStatus status) {
 	return status == UDS_KEY_OK_NORMAL || status == UDS_KEY_OK_DERIVED;
 }
@@ -203,13 +229,13 @@ const char* udsKeyStatusText(enum UDSKeyStatus status) {
 	case UDS_KEY_OK_NORMAL:
 		return "UDS key loaded (slot0x2DKeyN)";
 	case UDS_KEY_OK_DERIVED:
-		return "UDS key made from slot0x2DKeyX, slot0x2DKeyY and the generator constant";
+		return "UDS key made from slot0x2DKeyX and slot0x2DKeyY";
 	case UDS_KEY_NO_FILE:
 		return "no UDS key file set, or it cannot be read";
 	case UDS_KEY_NOT_FOUND:
 		return "the file has no slot0x2D key";
 	case UDS_KEY_INCOMPLETE:
-		return "the file has slot0x2DKeyX or KeyY but not both, or no generatorConstant, and no slot0x2DKeyN";
+		return "the file has slot0x2DKeyX or slot0x2DKeyY but not both, and no slot0x2DKeyN";
 	case UDS_KEY_BAD_VALUE:
 		return "a slot 0x2D or generator line is not 32 hex digits";
 	}

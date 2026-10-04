@@ -226,6 +226,8 @@ public slots:
 	// Azahar, the ROM hooks, and the serial device. Needs a Game Boy core running Red, Blue or Yellow.
 	void setVCWrapper(bool enabled);
 	bool vcWrapperRequested() const { return m_vcWrapper; }
+	// The 3DS UDS key file the real-radio mode needs (Settings > BIOS), as a path the program can open.
+	void setVCKeyFile(const QString& path);
 	// The connection of the attached wireless adapter's backend, or else the RFU Cable Wrapper's wireless side, for the
 	// status menu. False when neither is attached. `backend` gets its name, `wrapper` whether it is the wrapper's.
 	bool rfuStatus(GBASIORFUBackendStatus* out, QString* backend, bool* wrapper) const;
@@ -410,6 +412,10 @@ private:
 	void applyVC();
 	void stopVC();
 	GBVCLink* m_vcLink = nullptr;
+	bool m_vcLinkRadio = false; // what the running link was made for, to restart it when the choice changes
+	QString m_vcLinkPort;
+	QString m_vcLinkKey;
+	QString m_vcKeyFile;
 	bool m_rfuWrapperLogEnabled = false; // "Save adapter log" of the wrapper: <config dir>/rfu-wrapper-trace.log
 	bool m_rfuWrapperTraceHeld = false; // this controller holds a reference on the cable trace file
 	QByteArray m_eReaderData;

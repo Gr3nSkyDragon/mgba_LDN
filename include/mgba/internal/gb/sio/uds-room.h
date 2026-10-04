@@ -73,6 +73,7 @@ struct UDSRoomHost {
 	uint8_t channel;
 	uint32_t commId;
 	uint32_t networkId;
+	uint8_t id; // the network info's id byte (part of the data key's counter)
 	uint8_t appData[16]; // the first 16 bytes of the beacon's application data
 	uint8_t appDataSize;
 	uint16_t nodeId; // ours, assigned by the host
@@ -112,6 +113,10 @@ void udsRoomPoll(struct UDSRoom* room, uint32_t nowMs);
 
 // Wraps one Pia frame (a UDS channel-243 payload) in a SecureData frame to the host. False until the join is complete.
 bool udsRoomSendPia(struct UDSRoom* room, const uint8_t* frame, size_t size);
+
+// Finds the Nintendo network-info tag in a beacon body (the 12 fixed bytes, then tagged parameters; for an 802.11 beacon frame that is
+// the part after the 24-byte header) and fills the comm id, network id and application data of `host`. False when there is none.
+bool udsRoomParseBeacon(const uint8_t* body, size_t size, struct UDSRoomHost* host);
 
 // Pure helpers, exposed for the test.
 size_t udsBuildAuth(uint8_t out[6], unsigned sequence);

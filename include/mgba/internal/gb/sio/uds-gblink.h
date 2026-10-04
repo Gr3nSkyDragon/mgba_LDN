@@ -42,8 +42,21 @@ struct GBVCLink;
 
 #define GBVC_NAME_WORDS 10
 
+enum GBVCAir {
+	GBVC_AIR_BRIDGE, // Wireless Adapter > Local: the UDP pair to Azahar's test bridge
+	GBVC_AIR_RADIO, // Wireless Adapter > ESP32: the real radio through the ESP32 board, to a retail 3DS
+};
+
+struct GBVCLinkConfig {
+	enum GBVCAir air;
+	uint16_t listenPort; // bridge: 0 takes AZAHAR_UDS_BRIDGE or the default
+	uint16_t sendPort;
+	const char* portName; // radio: the board's serial port, NULL or empty to find it
+	const char* keyPath; // radio: the 3DS UDS key file (Settings > BIOS)
+};
+
 struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, const uint16_t name[GBVC_NAME_WORDS],
-                                uint16_t listenPort, uint16_t sendPort);
+                                const struct GBVCLinkConfig* config);
 void GBVCLinkDestroy(struct GBVCLink* link);
 
 CXX_GUARD_END

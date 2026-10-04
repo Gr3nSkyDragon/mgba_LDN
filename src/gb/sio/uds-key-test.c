@@ -86,12 +86,26 @@ static void testParse(void) {
 	    "generatorConstant=00000000000000000000000000000001\n";
 	CHECK(LOAD(otherSlot, key) == UDS_KEY_NOT_FOUND, "other slots are not mistaken for 0x2D");
 
+	// Without a generator line the built-in constant is used: the result must equal the explicit derivation with it.
 	static const char noGen[] =
-	    "slot0x2DKeyX=00000000000000000000000000000000\nslot0x2DKeyY=00000000000000000000000000000000\n";
-	CHECK(LOAD(noGen, key) == UDS_KEY_INCOMPLETE, "no generator constant");
+	    "slot0x2DKeyX=000102030405060708090A0B0C0D0E0F\nslot0x2DKeyY=F0E0D0C0B0A090807060504030201000\n";
+	static const uint8_t builtin[16] = {0x1F, 0xF9, 0xE9, 0xAA, 0xC5, 0xFE, 0x04, 0x08, 0x02, 0x45, 0x91, 0xDC, 0x5D, 0x52, 0x76, 0x8A};
+	static const uint8_t xs[16] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F};
+	static const uint8_t ys[16] = {0xF0, 0xE0, 0xD0, 0xC0, 0xB0, 0xA0, 0x90, 0x80, 0x70, 0x60, 0x50, 0x40, 0x30, 0x20, 0x10, 0x00};
+	uint8_t explicitKey[16];
+	udsKeyDerive(xs, ys, builtin, explicitKey);
+	CHECK(LOAD(noGen, key) == UDS_KEY_OK_DERIVED && !memcmp(key, explicitKey, 16), "no generator line: the built-in constant is used");
+
+	// A generator line in the file wins over the built-in one.
+	static const char ownGen[] =
+	    "slot0x2DKeyX=000102030405060708090A0B0C0D0E0F\nslot0x2DKeyY=F0E0D0C0B0A090807060504030201000\n"
+	    "generatorConstant=00000000000000000000000000000001\n";
+	CHECK(LOAD(ownGen, key) == UDS_KEY_OK_DERIVED && memcmp(key, explicitKey, 16), "a generatorConstant line overrides the built-in one");
 
 	static const char onlyX[] = "slot0x2DKeyX=00000000000000000000000000000000\ngeneratorConstant=00000000000000000000000000000001\n";
 	CHECK(LOAD(onlyX, key) == UDS_KEY_INCOMPLETE, "KeyY missing");
+	static const char onlyY[] = "slot0x2DKeyY=00000000000000000000000000000000\n";
+	CHECK(LOAD(onlyY, key) == UDS_KEY_INCOMPLETE, "KeyX missing");
 
 	static const char bad[] = "slot0x2DKeyN=0001020304\n";
 	CHECK(LOAD(bad, key) == UDS_KEY_BAD_VALUE, "a short value");
@@ -106,6 +120,21 @@ static void testParse(void) {
 	// A bad line for another key does not spoil a good KeyN.
 	static const char mixed[] = "slot0x2DKeyX=oops\nslot0x2DKeyN=000102030405060708090A0B0C0D0E0F\n";
 	CHECK(LOAD(mixed, key) == UDS_KEY_OK_NORMAL, "a bad KeyX does not matter when KeyN is there");
+}
+
+static void testWrite(void) {
+	// A key made from KeyX and KeyY, written out and read back, is the same key.
+	static const char derived[] =
+	    "slot0x2DKeyX=000102030405060708090A0B0C0D0E0F\nslot0x2DKeyY=F0E0D0C0B0A090807060504030201000\n";
+	uint8_t made[16], back[16];
+	CHECK(LOAD(derived, made) == UDS_KEY_OK_DERIVED, "made from X and Y");
+	const char* path = "uds-key-test-written.txt";
+	CHECK(udsKeyFileWrite(path, made), "write");
+	CHECK(udsKeyFileLoad(path, back) == UDS_KEY_OK_NORMAL && !memcmp(made, back, 16), "the written file loads as KeyN, same key");
+	CHECK(!udsKeyFileWrite("this/directory/does/not/exist/key.txt", made), "a write to a missing directory fails");
+	remove(path);
+	memset(made, 0, sizeof(made));
+	memset(back, 0, sizeof(back));
 }
 
 static void testRealFiles(void) {
@@ -133,6 +162,7 @@ static void testRealFiles(void) {
 int main(void) {
 	testDerive();
 	testParse();
+	testWrite();
 	testRealFiles();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;

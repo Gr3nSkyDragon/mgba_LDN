@@ -1372,26 +1372,46 @@ void CoreController::setVCWrapper(bool enabled) {
 	applyVC();
 }
 
-// The Virtual Console wrapper needs a Game Boy core running one of the known games, the box ticked and Wireless Adapter >
-// Local (the only air it has so far: the UDP pair to Azahar's test bridge, AZAHAR_UDS_BRIDGE). Like the RFU Cable Wrapper's
-// wireless side it does not wait for the game: the join starts at once and takes the first matching beacon, so it is up
-// before the game opens its link. The link is created and destroyed with the core stopped.
+// The Virtual Console wrapper needs a Game Boy core running one of the known games, the box ticked and a Wireless Adapter backend that
+// has a meaning for it: ESP32 is the real radio (the board and the 3DS UDS key file from Settings > BIOS, to a retail 3DS), Local is the
+// UDP pair to Azahar's test bridge (AZAHAR_UDS_BRIDGE). Like the RFU Cable Wrapper's wireless side it does not wait for the game: the
+// join starts at once and takes the first matching beacon, so it is up before the game opens its link. The link is created and
+// destroyed with the core stopped.
 void CoreController::applyVC() {
-	const bool wanted = m_vcWrapper && platform() == mPLATFORM_GB && m_rfuRequestedBackend == QLatin1String("local");
+	const bool radio = m_rfuRequestedBackend == QLatin1String("esp32");
+	const bool wanted = m_vcWrapper && platform() == mPLATFORM_GB && (radio || m_rfuRequestedBackend == QLatin1String("local"));
 	if (!wanted) {
 		stopVC();
 		return;
 	}
-	if (m_vcLink) {
+	if (m_vcLink && m_vcLinkRadio == radio && (!radio || (m_vcLinkPort == m_rfuEsp32Port && m_vcLinkKey == m_vcKeyFile))) {
 		return;
 	}
+	stopVC();
 	Interrupter interrupter(this);
 	clearMultiplayerController();
 	uint16_t name[GBVC_NAME_WORDS] = {'M', 'G', 'B', 'A'};
-	m_vcLink = GBVCLinkCreate(m_threadContext.core, &m_debugger, name, 0, 0);
+	const QByteArray port = m_rfuEsp32Port.toUtf8();
+	const QByteArray key = m_vcKeyFile.toUtf8();
+	GBVCLinkConfig config = {};
+	config.air = radio ? GBVC_AIR_RADIO : GBVC_AIR_BRIDGE;
+	config.portName = port.constData();
+	config.keyPath = key.constData();
+	m_vcLink = GBVCLinkCreate(m_threadContext.core, &m_debugger, name, &config);
+	m_vcLinkRadio = radio;
+	m_vcLinkPort = m_rfuEsp32Port;
+	m_vcLinkKey = m_vcKeyFile;
 	if (!m_vcLink) {
 		LOG(QT, ERROR) << tr("Virtual Console: could not start (see the log above)");
 	}
+}
+
+void CoreController::setVCKeyFile(const QString& path) {
+	if (m_vcKeyFile == path) {
+		return;
+	}
+	m_vcKeyFile = path;
+	applyVC();
 }
 
 void CoreController::stopVC() {
@@ -1501,6 +1521,7 @@ void CoreController::setRFUESP32Port(const QString& port) {
 		return;
 	}
 	m_rfuEsp32Port = port;
+	applyVC(); // the Virtual Console wrapper's radio uses the same board choice
 	if (rfuEnabled() && m_rfuBackendName == QLatin1String("esp32")) {
 		Interrupter interrupter(this);
 		stopRFU();

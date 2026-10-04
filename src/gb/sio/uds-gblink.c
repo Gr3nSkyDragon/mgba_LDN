@@ -120,6 +120,8 @@ struct GBVCLink {
 
 	int lastRoom;
 	int lastSession;
+	int lastRadio;
+	uint32_t lastRadioStatsMs;
 	FILE* trace;
 };
 
@@ -209,6 +211,7 @@ static void _queueUnit(struct GBVCLink* link, uint8_t byte) {
 		_trace(link, "tx window full, byte %02X dropped", byte);
 		return;
 	}
+	_trace(link, "tx %02X", byte);
 	++link->txUnits;
 }
 
@@ -220,11 +223,34 @@ static bool _popUnit(struct GBVCLink* link, uint8_t* byte) {
 	if (!udsSessionPopUnit(&link->joiner.session, byte)) {
 		return false;
 	}
+	_trace(link, "rx %02X", *byte);
 	++link->rxUnits;
 	return true;
 }
 
 static void _logStates(struct GBVCLink* link) {
+	if (link->joiner.useRadio) {
+		struct UDSAirRadio* radio = &link->joiner.radio;
+		if ((int) radio->state != link->lastRadio) {
+			link->lastRadio = (int) radio->state;
+			if (radio->state == UDS_AIR_BOOTING) {
+				mLOG(GB_SIO, INFO, "Virtual Console: waiting for the ESP32 board to start");
+			} else if (radio->state == UDS_AIR_READY) {
+				mLOG(GB_SIO, INFO, "Virtual Console: ESP32 radio up (firmware %u.%u), scanning for a 3DS host", radio->esp.info.major,
+				     radio->esp.info.minor);
+			} else if (radio->state == UDS_AIR_FAILED) {
+				mLOG(GB_SIO, ERROR, "Virtual Console: ESP32 radio failed: %s", radio->error);
+			}
+			_trace(link, "radio state %d %s", (int) radio->state, radio->state == UDS_AIR_FAILED ? radio->error : "");
+		}
+		uint32_t now = link->joiner.nowMs;
+		if (radio->state == UDS_AIR_READY && now - link->lastRadioStatsMs >= 5000) {
+			link->lastRadioStatsMs = now;
+			_trace(link, "radio: beacons %u, sent %u (failed %u), delivered %u, dropped: no key %u, decrypt %u, repeats %u, other %u",
+			       radio->beaconsSeen, radio->framesSent, radio->txFailed, radio->framesReceived, radio->droppedNoKey,
+			       radio->droppedDecrypt, radio->droppedReplay, radio->droppedOther);
+		}
+	}
 	int room = link->joiner.room.state;
 	if (room != link->lastRoom) {
 		static const char* const names[] = {"scanning for a host", "authenticating", "associated, EAPoL start sent", "joined"};
@@ -598,7 +624,7 @@ static ssize_t _setBreakpoint(struct GBVCLink* link, struct VCAddr at) {
 // Create / destroy ----------------------------------------------------------------------------------------------------
 
 struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, const uint16_t name[GBVC_NAME_WORDS],
-                                uint16_t listenPort, uint16_t sendPort) {
+                                const struct GBVCLinkConfig* config) {
 	if (!core || core->platform(core) != mPLATFORM_GB) {
 		return NULL;
 	}
@@ -628,6 +654,7 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 	link->startMs = _nowMs();
 	link->lastRoom = -1;
 	link->lastSession = -1;
+	link->lastRadio = -1;
 	link->fakeBeginId = link->fakeEndId = link->syncId = link->menuId = -1;
 
 	const char* dir = getenv("MGBA_VCLINK_TRACE");
@@ -637,9 +664,15 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 		link->trace = fopen(path, "w");
 	}
 
-	if (!udsJoinerOpen(&link->joiner, name, listenPort, sendPort)) {
-		mLOG(GB_SIO, ERROR, "Virtual Console: cannot listen on 127.0.0.1:%u (is another mGBA using it?)",
-		     listenPort ? listenPort : 0);
+	if (config->air == GBVC_AIR_RADIO) {
+		char error[200];
+		if (!udsJoinerOpenRadio(&link->joiner, name, config->portName, config->keyPath, error, sizeof(error))) {
+			mLOG(GB_SIO, ERROR, "Virtual Console: cannot start the ESP32 radio: %s", error);
+			GBVCLinkDestroy(link);
+			return NULL;
+		}
+	} else if (!udsJoinerOpen(&link->joiner, name, config->listenPort, config->sendPort)) {
+		mLOG(GB_SIO, ERROR, "Virtual Console: cannot listen for Azahar's UDS bridge (is another mGBA using the port?)");
 		GBVCLinkDestroy(link);
 		return NULL;
 	}
@@ -683,8 +716,13 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 	link->event.priority = 0x40;
 	mTimingSchedule(&link->gb->timing, &link->event, GBVC_POLL_CYCLES);
 
-	mLOG(GB_SIO, INFO, "Virtual Console: %s, waiting for Azahar's UDS bridge on 127.0.0.1:%u (sending to %u)",
-	     game->title, link->joiner.udp.listenPort, link->joiner.udp.sendPort);
+	if (config->air == GBVC_AIR_RADIO) {
+		mLOG(GB_SIO, INFO, "Virtual Console: %s over the ESP32 radio%s%s", game->title,
+		     config->portName && *config->portName ? " on " : "", config->portName && *config->portName ? config->portName : "");
+	} else {
+		mLOG(GB_SIO, INFO, "Virtual Console: %s, waiting for Azahar's UDS bridge on 127.0.0.1:%u (sending to %u)", game->title,
+		     link->joiner.udp.listenPort, link->joiner.udp.sendPort);
+	}
 	_trace(link, "created for %s", game->title);
 	return link;
 }

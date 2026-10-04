@@ -940,6 +940,15 @@ void Window::gameStarted() {
 	m_controller->setRFUWrapperLogging(m_rfuLog);
 	m_controller->setRFUESP32Port(m_rfuEsp32Port);
 	m_controller->setRFUCableWrapper(m_rfuCableWrapper);
+	{
+		// The Virtual Console wrapper's real-radio mode reads the 3DS UDS key file named in Settings > BIOS (a relative path is
+		// relative to the config folder).
+		QString keyFile = m_config->getOption("vcwrapper.keyfile").trimmed();
+		if (!keyFile.isEmpty() && QFileInfo(keyFile).isRelative()) {
+			keyFile = ConfigController::configDir() + QLatin1Char('/') + keyFile;
+		}
+		m_controller->setVCKeyFile(keyFile);
+	}
 	m_controller->setVCWrapper(m_vcWrapper);
 	m_controller->setRFUBackend(m_rfuBackend);
 #endif

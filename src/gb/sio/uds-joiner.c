@@ -10,7 +10,17 @@
 
 static void _roomSend(void* context, const uint8_t* datagram, size_t size) {
 	struct UDSJoiner* joiner = context;
-	udsUdpSend(&joiner->udp, datagram, size);
+	if (joiner->useRadio) {
+		udsAirRadioSend(&joiner->radio, datagram, size);
+	} else {
+		udsUdpSend(&joiner->udp, datagram, size);
+	}
+}
+
+// A packet the radio received, in the room's datagram form.
+static void _radioDeliver(void* context, const uint8_t* datagram, size_t size) {
+	struct UDSJoiner* joiner = context;
+	udsRoomReceive(&joiner->room, joiner->nowMs, datagram, size);
 }
 
 static void _sessionSend(void* context, const uint8_t* frame, size_t size) {
@@ -59,7 +69,23 @@ bool udsJoinerOpen(struct UDSJoiner* joiner, const uint16_t name[UDS_NAME_WORDS]
 	return true;
 }
 
+bool udsJoinerOpenRadio(struct UDSJoiner* joiner, const uint16_t name[UDS_NAME_WORDS], const char* portName, const char* keyPath, char* error,
+                        size_t errorSize) {
+	memset(joiner, 0, sizeof(*joiner));
+	memcpy(joiner->name, name, sizeof(joiner->name));
+	uint8_t mac[6] = {0x02, 0x47, 0x42, rand() & 0xFF, rand() & 0xFF, rand() & 0xFF};
+	joiner->useRadio = true;
+	if (!udsAirRadioOpen(&joiner->radio, portName, keyPath, mac, _radioDeliver, joiner, error, errorSize)) {
+		return false;
+	}
+	udsRoomInit(&joiner->room, mac, joiner->name, _roomSend, _roomJoined, _roomPia, joiner);
+	return true;
+}
+
 void udsJoinerClose(struct UDSJoiner* joiner) {
+	if (joiner->useRadio) {
+		udsAirRadioClose(&joiner->radio);
+	}
 	udsUdpClose(&joiner->udp);
 	joiner->sessionActive = false;
 }
@@ -68,8 +94,12 @@ void udsJoinerPoll(struct UDSJoiner* joiner, uint32_t nowMs) {
 	joiner->nowMs = nowMs;
 	uint8_t datagram[UDS_BRIDGE_MAX_DATAGRAM];
 	size_t size;
-	while ((size = udsUdpReceive(&joiner->udp, datagram, sizeof(datagram))) > 0) {
-		udsRoomReceive(&joiner->room, nowMs, datagram, size);
+	if (joiner->useRadio) {
+		udsAirRadioPoll(&joiner->radio, nowMs);
+	} else {
+		while ((size = udsUdpReceive(&joiner->udp, datagram, sizeof(datagram))) > 0) {
+			udsRoomReceive(&joiner->room, nowMs, datagram, size);
+		}
 	}
 	udsRoomPoll(&joiner->room, nowMs);
 	if (joiner->sessionActive) {
