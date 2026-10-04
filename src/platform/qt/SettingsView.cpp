@@ -253,12 +253,6 @@ SettingsView::SettingsView(ConfigController* controller, InputController* inputC
 	m_ui.gbaBiosBrowse->hide();
 #endif
 
-	// prod.keys: used by the wireless adapter's Broadcast (LDN) backend to read a Switch's advertisements. Not tied
-	// to any platform core, so it is always shown here regardless of which cores were built.
-	connect(m_ui.prodKeysBrowse, &QPushButton::clicked, [this]() {
-		selectFile(m_ui.prodKeys, tr("Select prod.keys"));
-	});
-
 #ifdef M_CORE_GB
 	connect(m_ui.gbBiosBrowse, &QPushButton::clicked, [this]() {
 		selectBios(m_ui.gbBios);
@@ -499,7 +493,6 @@ void SettingsView::selectImage(QLineEdit* field) {
 
 void SettingsView::updateConfig() {
 	saveSetting("gba.bios", m_ui.gbaBios);
-	saveSetting("rfu.ldn.keys", m_ui.prodKeys);
 	saveSetting("gb.bios", m_ui.gbBios);
 	saveSetting("gbc.bios", m_ui.gbcBios);
 	saveSetting("sgb.bios", m_ui.sgbBios);
@@ -722,7 +715,6 @@ void SettingsView::updateConfig() {
 void SettingsView::reloadConfig() {
 	loadSetting("bios", m_ui.gbaBios);
 	loadSetting("gba.bios", m_ui.gbaBios);
-	loadSetting("rfu.ldn.keys", m_ui.prodKeys);
 	loadSetting("gb.bios", m_ui.gbBios);
 	loadSetting("gbc.bios", m_ui.gbcBios);
 	loadSetting("sgb.bios", m_ui.sgbBios);

@@ -12,7 +12,7 @@ You will need your Switch prod.keys. You **must** have your Switch prod.keys for
 
 You'll also need a way to broadcast Wi-Fi, be that a USB Wi-Fi adapter or devboard like the ESP32. If you're getting an ESP32, I recommend an ESP32-S3, as that is also compatible with [Pokemon Automation](https://pokemonautomation.github.io/index.html)
 
-If you're using a USB Wi-Fi adapter, you'll need to set up ldnd.exe from [unlimitedcoder2](https://gist.github.com/unlimitedcoder2/af2f09694563c6a6cd3d3e9ec45750bd). You'll need to follow the steps in that repository to set up your USB Wi-Fi adapter (you will need a compatible USB Wi-Fi adapter). I've been using a cheap/generic AC1300 adapter in my testing. This is a Windows-only program. If you have experience with Linux, you can probably convert it to be Linux-compatible fairly easily. You'll also need to tell mGBA where your prod.keys are stored when using your desktop (Tools > Settings > BIOS > prod.keys). 
+If you're using a USB Wi-Fi adapter, you'll need to set up ldnd.exe from [unlimitedcoder2](https://github.com/unlimitedcoder2/ldnrs/releases), in a version that speaks ldnd protocol 7 (older ldnd builds are not supported any more). You'll need to follow the steps in that repository to set up your USB Wi-Fi adapter (you will need a compatible USB Wi-Fi adapter). I've been using a cheap/generic AC1300 adapter in my testing. This is a Windows-only program. If you have experience with Linux, you can probably convert it to be Linux-compatible fairly easily. ldnd loads your prod.keys itself (its `--keys` option), so mGBA doesn't need to know where they are. mGBA uses ldnd's default pipe (`\\.\pipe\ldnd`), or the one named by the `LDN_DAEMON` environment variable.
 
 If you're using an ESP32, you'll need to install the firmware either [manually](https://github.com/GB-Link/GB-Link-Switch-LDN) or via [the GB-Link Switch LDN webpage](https://switch.gblink.io/?from=gblink-launcher). You'll also need to install your prod.keys on the ESP32. The webpage is a little more convenient to use so I'd recommend trying that first.
 
@@ -20,17 +20,17 @@ If you're using an ESP32, you'll need to install the firmware either [manually](
 
 **DO NOT USE SPEED-UP** under any circumstances. The trade setup or actual trade will likely break down. You probably won't mess up your save file, as the game should just throw a communication error and revert to the last save, but I didn't test this to verify.
 
-The Switch **must** host all trades. The emulator can only join for now. I may work on getting Broadcast mode hosting working, but for now, all Wireless Adapter modes except Local are join-only.
+The Switch **must** host all trades. The emulator can only join for now. I may work on getting ldnd mode hosting working, but for now, all Wireless Adapter modes except Local are join-only.
 
 Do not use the Wireless Union Room (the left window lady on the upper floor of the Pokemon Center). You can go exploring there if you want, but actual trading is the right window lady.
 
 ### Desktop
 
-For trading between instances of mGBA, you can choose to enable the Wireless Adapter (Emulation > Wireless Adapter > Local) for up to two instances. This is more of a novelty thing, as the link cable mode works for up to four players, but I used this for developing the other modes and therefore included it. If you want to familiarize yourself with the Ruby/Sapphire to FRLG process, you can enable the local Cable Wrapper (Emulation > RFU Cable Wrapper > Local) in the Ruby/Sapphire instance and the Wireless Adapter (Emulation > Wireless Adapter > Local) for the FRLG instance. **FRLG must host the trade**. Let FRLG host before talking to the Link Cable Trade lady at the middle window in Ruby/Sapphire.
+For trading between instances of mGBA, you can choose to enable the Wireless Adapter (Emulation > Wireless Adapter > Local) for up to two instances. This is more of a novelty thing, as the link cable mode works for up to four players, but I used this for developing the other modes and therefore included it. If you want to familiarize yourself with the Ruby/Sapphire to FRLG process, you can enable the local Cable Wrapper (Emulation > Wireless Adapter > Local, then tick Cable wrapper (Ruby/Sapphire)) in the Ruby/Sapphire instance and the Wireless Adapter (Emulation > Wireless Adapter > Local) for the FRLG instance. **FRLG must host the trade**. Let FRLG host before talking to the Link Cable Trade lady at the middle window in Ruby/Sapphire.
 
-For trading between a computer (FRLG/Emerald) and a Switch, you can choose Broadcast (Emulation > Wireless Adapter > Broadcast) or ESP32 (Emulation > Wireless Adapter > ESP32). Broadcast is designed for a USB Wi-Fi adapter and requires ldnd.exe to be set up correctly and running, and ESP32 is designed for the GB-Link Switch LDN firmware configuration. The ESP32 firmware may have other functionality like battling, berry blending, etc implemented, but I only tested trading. 
+For trading between a computer (FRLG/Emerald) and a Switch, you can choose ldnd (Emulation > Wireless Adapter > ldnd) or ESP32 (Emulation > Wireless Adapter > ESP32). ldnd is designed for a USB Wi-Fi adapter and requires ldnd.exe to be set up correctly and running, and ESP32 is designed for the GB-Link Switch LDN firmware configuration. The ESP32 firmware may have other functionality like battling, berry blending, etc implemented, but I only tested trading. 
 
-For trading between a computer (Ruby/Sapphire) and a Switch, you **must** choose ESP32 (Emulation > RFU Cable Wrapper > ESP32) for Ruby/Sapphire. Broadcast is currently stubbed and does not work. Let FRLG host the trade before interacting with the Link Trade Cable lady at the middle window in Ruby/Sapphire. 
+For trading between a computer (Ruby/Sapphire) and a Switch, you **must** choose ESP32 and tick Cable wrapper (Emulation > Wireless Adapter > ESP32, then Cable wrapper (Ruby/Sapphire)) for Ruby/Sapphire. ldnd is currently stubbed and does not work. Let FRLG host the trade before interacting with the Link Trade Cable lady at the middle window in Ruby/Sapphire. 
 
 ### Android
 

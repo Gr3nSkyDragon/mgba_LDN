@@ -28,7 +28,7 @@ CXX_GUARD_START
  *
  * Peer side: the driver hands the peer each complete game command and asks it for the virtual player's next one.
  * Nothing wireless is attached yet; the built-in stub peer behaves like a minimal FireRed on the other end of the
- * cable (link type, player data exchange) and is what the Local/Broadcast/ESP32 connections currently all use.
+ * cable (link type, player data exchange) and is what the Local/ldnd/ESP32 connections currently all use.
  */
 
 enum {
@@ -88,7 +88,7 @@ struct GBASIORFUWrapper {
 	unsigned packets;
 };
 
-// connection is only used in the trace for now ("local", "broadcast", "esp32": all stubs).
+// connection is only used in the trace for now ("local", "ldnd", "esp32": all stubs).
 void GBASIORFUWrapperCreate(struct GBASIORFUWrapper* wrapper, const char* connection);
 void GBASIORFUWrapperDestroy(struct GBASIORFUWrapper* wrapper);
 

@@ -55,21 +55,29 @@ public:
 	void setExclusive(bool exclusive = true) { m_exclusive = exclusive; }
 	void setRole(Role role) { m_role = role; }
 
+	// Triggering it from a menu leaves the menu open (e.g. a "Refresh" that updates the menu it is in).
+	bool keepsMenuOpen() const { return m_keepsMenuOpen; }
+	void setKeepsMenuOpen(bool keep = true) { m_keepsMenuOpen = keep; }
+
 	Action& operator=(const Action&);
 
 public slots:
 	void trigger(bool = true);
 	void setEnabled(bool = true);
 	void setActive(bool = true);
+	// Relabels it in place, in every menu it is already in (e.g. a line of live status).
+	void setVisibleName(const QString&);
 
 signals:
 	void enabled(bool);
 	void activated(bool);
+	void visibleNameChanged(const QString&);
 
 private:
 	bool m_enabled = true;
 	bool m_active = false;
 	bool m_exclusive = false;
+	bool m_keepsMenuOpen = false;
 	Role m_role = Role::NO_ROLE;
 
 	Function m_function;

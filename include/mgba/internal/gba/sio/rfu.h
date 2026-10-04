@@ -72,6 +72,32 @@ enum GBASIORFUEventType {
 	RFU_EVENT_CONNECT_REQUEST,
 };
 
+// How far a backend's connection to whatever carries its "air" (ldnd, the ESP32 board, ...) has got, for a frontend.
+enum GBASIORFUBackendLink {
+	RFU_BACKEND_UNAVAILABLE, // it cannot be reached (ldnd not running, no board plugged in, ...)
+	RFU_BACKEND_IDLE, // nothing is open because nothing needs it yet; it is contacted when the game uses the adapter
+	RFU_BACKEND_STARTING, // being opened: connecting, booting, handshaking, waiting for the radio
+	RFU_BACKEND_READY, // reachable and working, not joined to anyone
+	RFU_BACKEND_JOINING, // joining a host
+	RFU_BACKEND_JOINED, // in a session with a host
+};
+
+enum {
+	RFU_BACKEND_STATUS_TEXT = 160,
+};
+
+struct GBASIORFUBackendStatus {
+	enum GBASIORFUBackendLink link;
+	// Human-readable, one line each; any may be empty. `device`: what the backend talks to (e.g. "ldnd 1.2 (protocol
+	// 7)", "COM4"). `detail`: what it is doing (e.g. "Radio ready", "Searching", "Pia session with 1A2B").
+	// `lastError`: the most recent problem, kept until things work again.
+	char device[RFU_BACKEND_STATUS_TEXT];
+	char detail[RFU_BACKEND_STATUS_TEXT];
+	char lastError[RFU_BACKEND_STATUS_TEXT];
+	// Hosts heard recently (rooms seen), -1 when the backend does not know.
+	int hostsHeard;
+};
+
 struct GBASIORFU;
 
 struct GBASIORFUBackend {
@@ -105,6 +131,12 @@ struct GBASIORFUBackend {
 
 	// Payload of a SendData command. Host: broadcast to all clients. Client: send to the host.
 	void (*sendData)(struct GBASIORFUBackend*, const uint8_t* data, size_t length);
+
+	// A snapshot of the connection, for a frontend's status display. Any thread, must not block. Optional.
+	void (*status)(struct GBASIORFUBackend*, struct GBASIORFUBackendStatus*);
+	// The frontend asked to check the connection now: contact the device if the backend is idle and would otherwise
+	// wait for the game to use the adapter. Any thread, must not block. Optional.
+	void (*probe)(struct GBASIORFUBackend*);
 };
 
 struct GBASIORFUPacket {
@@ -205,10 +237,15 @@ void GBASIORFUCreate(struct GBASIORFU*, struct GBASIORFUBackend*);
 void GBASIORFUDestroy(struct GBASIORFU*);
 
 // The backends a wireless adapter can be attached to, by name: "local" (other mGBA processes on this computer, UDP),
-// "broadcast" (a real Switch over LDN) and "usb" (an external adapter such as an ESP32). The last two are stubs for
+// "ldnd" (a real Switch over LDN) and "usb" (an external adapter such as an ESP32). The last two are stubs for
 // now. Returns NULL for an unknown name. Destroy releases a backend that was not (or is no longer) attached.
 struct GBASIORFUBackend* GBASIORFUBackendCreate(const char* name);
 void GBASIORFUBackendDestroy(struct GBASIORFUBackend*);
+// Fills `out` from the backend's status hook; a backend without one (local, a stub) reports READY with no details.
+// Any thread, but the backend must stay attached for the duration of the call.
+void GBASIORFUBackendGetStatus(struct GBASIORFUBackend*, struct GBASIORFUBackendStatus* out);
+// Calls the backend's probe hook, if it has one. Same threading as GBASIORFUBackendGetStatus.
+void GBASIORFUBackendProbe(struct GBASIORFUBackend*);
 
 // Send the protocol trace to a file (used for development). Pass NULL to stop.
 void GBASIORFUSetTraceFile(struct GBASIORFU*, const char* path);

@@ -120,6 +120,18 @@ enum {
 	RFU1_CLIENT_ACK = 7,
 
 	kMaxPayload = 92,
+
+	// A room beacon heard within this long counts as in range for the status display.
+	kBeaconFreshMs = 2000,
+};
+
+// Where the I/O thread is, for the status display.
+enum EspPhase {
+	ESP_PHASE_LOOKING,
+	ESP_PHASE_MISSING,
+	ESP_PHASE_BOOTING,
+	ESP_PHASE_HANDSHAKE,
+	ESP_PHASE_READY,
 };
 
 struct GBASIORFUESP32 {
@@ -145,6 +157,14 @@ struct GBASIORFUESP32 {
 	bool connected;
 	uint16_t connectDevice;
 	uint32_t connectDeadline;
+	// For the status display (_status), written by the I/O thread.
+	enum EspPhase phase;
+	char statusPort[32];
+	char statusError[RFU_BACKEND_STATUS_TEXT];
+	char statusEvent[64]; // the board's last bridge/room/link event
+	bool beaconSeen;
+	uint32_t beaconAt;
+	uint16_t beaconDevice;
 
 	// Host role (the game in the emulator leads a group, see 4. above). Also under `lock`: the emulation thread sets it, the
 	// I/O thread advertises it and reports the board's join request.
@@ -189,6 +209,23 @@ static void _putBe32(uint8_t* p, uint32_t value) {
 	p[1] = (uint8_t) (value >> 16);
 	p[2] = (uint8_t) (value >> 8);
 	p[3] = (uint8_t) value;
+}
+
+static void _setPhase(struct GBASIORFUESP32* esp, enum EspPhase phase) {
+	_lockEnter(&esp->lock);
+	esp->phase = phase;
+	snprintf(esp->statusPort, sizeof(esp->statusPort), "%s", phase == ESP_PHASE_LOOKING || phase == ESP_PHASE_MISSING ? "" : esp->portName);
+	if (phase != ESP_PHASE_READY) {
+		esp->statusEvent[0] = 0;
+		esp->beaconSeen = false;
+	}
+	_lockLeave(&esp->lock);
+}
+
+static void _setError(struct GBASIORFUESP32* esp, const char* error) {
+	_lockEnter(&esp->lock);
+	snprintf(esp->statusError, sizeof(esp->statusError), "%s", error);
+	_lockLeave(&esp->lock);
 }
 
 // Queues one GB frame (already built) for the I/O thread to send as a type 7 message. Any thread.
@@ -263,10 +300,14 @@ static void _handleFrame(struct GBASIORFUESP32* esp, const struct Esp32WireFrame
 		}
 		if (!strncmp(text, "LDN_ERROR", 9)) {
 			GBASIORFUTrace(esp->rfu, "ESP32  device error: %s", text);
+			_setError(esp, text);
 		} else if (frame->type == ESP32_TYPE_EVENT &&
 		           (!strncmp(text, "LDN_ROOM", 8) || !strncmp(text, "LDN_LINK", 8) || !strncmp(text, "LDN_BRIDGE", 10) ||
 		            !strncmp(text, "LDN_NET_LOST", 12))) {
 			GBASIORFUTrace(esp->rfu, "ESP32  event: %s", text);
+			_lockEnter(&esp->lock);
+			snprintf(esp->statusEvent, sizeof(esp->statusEvent), "%s", text);
+			_lockLeave(&esp->lock);
 			if (!esp->stop && (!strncmp(text, "LDN_BRIDGE stopped", 18) || !strncmp(text, "LDN_BRIDGE join timed out", 25) ||
 			                   !strncmp(text, "LDN_NET_LOST", 12))) {
 				esp->bridgeRestart = true;
@@ -340,6 +381,11 @@ static void _handleRfu1(struct GBASIORFUESP32* esp, const uint8_t* rfu1, size_t 
 			GBASIORFUTrace(esp->rfu, "ESP32  first room beacon: device %04X, words %08X %08X %08X %08X %08X %08X", header & 0xFFFF, words[0], words[1],
 			               words[2], words[3], words[4], words[5]);
 		}
+		_lockEnter(&esp->lock);
+		esp->beaconSeen = true;
+		esp->beaconAt = _ticks();
+		esp->beaconDevice = (uint16_t) header;
+		_lockLeave(&esp->lock);
 		GBASIORFUBroadcastReceived(esp->rfu, (uint16_t) header, occupied ? 0xFF : 0, words);
 	} else if (type == RFU1_CONNECT_ACK) {
 		_lockEnter(&esp->lock);
@@ -466,8 +512,12 @@ static bool _handshake(struct GBASIORFUESP32* esp) {
 	}
 	esp->port = Esp32SerialOpen(esp->portName, 921600);
 	if (!esp->port) {
+		char error[64];
+		snprintf(error, sizeof(error), "Could not open %s", esp->portName);
+		_setError(esp, error);
 		return false;
 	}
+	_setPhase(esp, ESP_PHASE_BOOTING);
 	GBASIORFUTrace(esp->rfu, "ESP32  opened %s (the board resets when its port is opened; waiting for it to boot)", esp->portName);
 	Esp32WireParserInit(&esp->parser);
 
@@ -488,6 +538,7 @@ static bool _handshake(struct GBASIORFUESP32* esp) {
 	const uint8_t nul = 0;
 	Esp32SerialWrite(esp->port, &nul, 1);
 	Esp32WireParserInit(&esp->parser);
+	_setPhase(esp, ESP_PHASE_HANDSHAKE);
 	esp->bytesRead = 0;
 	esp->rxUsed = 0;
 	esp->session = 0;
@@ -501,6 +552,7 @@ static bool _handshake(struct GBASIORFUESP32* esp) {
 	if (!hello) {
 		GBASIORFUTrace(esp->rfu, "ESP32  no LDN_HELLO reply (read %u bytes, %u frames ok / %u bad, last text \"%s\") - is this the GB-Link bridge firmware?",
 		               esp->bytesRead, esp->parser.framesOk, esp->parser.framesBad, esp->lastText);
+		_setError(esp, "No reply from the board - is this the GB-Link bridge firmware?");
 		return false;
 	}
 	uint32_t session = (_ticks() ^ 0x5A5A1234u) | 1u;
@@ -509,6 +561,7 @@ static bool _handshake(struct GBASIORFUESP32* esp) {
 	_command(esp, text);
 	if (!_await(esp, "LDN_BEGUN", 3000)) {
 		GBASIORFUTrace(esp->rfu, "ESP32  LDN_BEGIN failed");
+		_setError(esp, "The board did not start a session (LDN_BEGIN failed)");
 		return false;
 	}
 	esp->session = session;
@@ -517,6 +570,7 @@ static bool _handshake(struct GBASIORFUESP32* esp) {
 	_command(esp, "LDN_ADAPTER host");
 	if (!_await(esp, "LDN_ADAPTER host", 2000)) {
 		GBASIORFUTrace(esp->rfu, "ESP32  LDN_ADAPTER host failed (needs bridge firmware 2.0 or later)");
+		_setError(esp, "Adapter-host mode failed (needs bridge firmware 2.0 or later)");
 		return false;
 	}
 	GBASIORFUTrace(esp->rfu, "ESP32  board is in adapter-host mode");
@@ -615,6 +669,8 @@ ESP_THREAD_FUNC(_thread) {
 	while (!esp->stop) {
 		if (_handshake(esp)) {
 			reportedMissing = false;
+			_setError(esp, "");
+			_setPhase(esp, ESP_PHASE_READY);
 			_flagSet(&esp->ready, 1);
 			_run(esp);
 			_flagSet(&esp->ready, 0);
@@ -629,6 +685,11 @@ ESP_THREAD_FUNC(_thread) {
 				GBASIORFUTrace(esp->rfu, "ESP32  the board went away: the Switch's session with the game is over");
 				GBASIORFUDisconnected(esp->rfu, (int) clientSlot);
 			}
+			if (!esp->stop) {
+				char error[64];
+				snprintf(error, sizeof(error), "Lost the board on %s", esp->portName);
+				_setError(esp, error);
+			}
 			if (esp->port) {
 				// Hand the board back to its standalone GBA-cable mode.
 				_command(esp, "LDN_ADAPTER uart");
@@ -638,6 +699,7 @@ ESP_THREAD_FUNC(_thread) {
 			GBASIORFUTrace(esp->rfu, "ESP32  no board found (looking for an Espressif USB serial port; set MGBA_RFU_ESP32_PORT to name one)");
 			reportedMissing = true;
 		}
+		_setPhase(esp, reportedMissing ? ESP_PHASE_MISSING : ESP_PHASE_LOOKING);
 		if (esp->port) {
 			Esp32SerialClose(esp->port);
 			esp->port = NULL;
@@ -814,6 +876,60 @@ static void _sendData(struct GBASIORFUBackend* backend, const uint8_t* data, siz
 	}
 }
 
+// Any thread.
+static void _status(struct GBASIORFUBackend* backend, struct GBASIORFUBackendStatus* out) {
+	struct GBASIORFUESP32* esp = (struct GBASIORFUESP32*) backend;
+	uint32_t now = _ticks();
+	_lockEnter(&esp->lock);
+	bool beacon = esp->beaconSeen && now - esp->beaconAt < kBeaconFreshMs;
+	out->hostsHeard = beacon ? 1 : 0;
+	if (esp->statusPort[0]) {
+		snprintf(out->device, sizeof(out->device), "ESP32 board on %s", esp->statusPort);
+	} else if (esp->configuredPort[0]) {
+		snprintf(out->device, sizeof(out->device), "ESP32 board on %s", esp->configuredPort);
+	} else {
+		snprintf(out->device, sizeof(out->device), "ESP32 board (auto-detect)");
+	}
+	snprintf(out->lastError, sizeof(out->lastError), "%s", esp->statusError);
+	switch (esp->phase) {
+	case ESP_PHASE_LOOKING:
+		out->link = RFU_BACKEND_STARTING;
+		snprintf(out->detail, sizeof(out->detail), "Looking for the board");
+		break;
+	case ESP_PHASE_MISSING:
+		out->link = RFU_BACKEND_UNAVAILABLE;
+		snprintf(out->detail, sizeof(out->detail), "No board found; retrying");
+		break;
+	case ESP_PHASE_BOOTING:
+		out->link = RFU_BACKEND_STARTING;
+		snprintf(out->detail, sizeof(out->detail), "Waiting for the board to boot");
+		break;
+	case ESP_PHASE_HANDSHAKE:
+		out->link = RFU_BACKEND_STARTING;
+		snprintf(out->detail, sizeof(out->detail), "Handshaking with the board");
+		break;
+	case ESP_PHASE_READY:
+		if (esp->connected) {
+			out->link = RFU_BACKEND_JOINED;
+			snprintf(out->detail, sizeof(out->detail), "In a session with %04X", esp->connectDevice);
+		} else if (esp->connectPending) {
+			out->link = RFU_BACKEND_JOINING;
+			snprintf(out->detail, sizeof(out->detail), "Joining %04X", esp->connectDevice);
+		} else {
+			out->link = RFU_BACKEND_READY;
+			if (beacon) {
+				snprintf(out->detail, sizeof(out->detail), "Room %04X in range", esp->beaconDevice);
+			} else if (esp->statusEvent[0]) {
+				snprintf(out->detail, sizeof(out->detail), "Searching (%s)", esp->statusEvent);
+			} else {
+				snprintf(out->detail, sizeof(out->detail), "Searching");
+			}
+		}
+		break;
+	}
+	_lockLeave(&esp->lock);
+}
+
 struct GBASIORFUBackend* GBASIORFUESP32Create(void) {
 	struct GBASIORFUESP32* esp = calloc(1, sizeof(*esp));
 	if (!esp) {
@@ -832,6 +948,7 @@ struct GBASIORFUBackend* GBASIORFUESP32Create(void) {
 	esp->d.connect = _connect;
 	esp->d.disconnect = _disconnect;
 	esp->d.sendData = _sendData;
+	esp->d.status = _status;
 	return &esp->d;
 }
 
@@ -842,4 +959,14 @@ void GBASIORFUESP32SetPort(struct GBASIORFUBackend* backend, const char* port) {
 		return;
 	}
 	snprintf(esp->configuredPort, sizeof(esp->configuredPort), "%s", port);
+}
+
+size_t GBASIORFUESP32ListPorts(struct GBASIORFUESP32Port* out, size_t max) {
+	struct Esp32SerialPortInfo found[16];
+	size_t count = Esp32SerialListEspressif(found, max < 16 ? max : 16);
+	for (size_t i = 0; i < count; ++i) {
+		snprintf(out[i].name, sizeof(out[i].name), "%s", found[i].name);
+		snprintf(out[i].description, sizeof(out[i].description), "%s", found[i].description);
+	}
+	return count;
 }
