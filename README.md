@@ -4,6 +4,10 @@
 
 This fork and its primary unique feature(s) were coded using LLM generated material. Consequently, this fork is not associated with nor endorsed by mGBA or its primary contributors. It's provided as-is and is designed to be used in a Windows environment when using a computer and Android when using a mobile device. This was designed for trading between Gen 3 GBA Pokemon games and the Switch ports. 
 
+### Note FOR GSD:
+
+[Useful link](https://github.com/Zapeth/citra/wiki/AES-Keys)
+
 # How to run
 
 ### Prerequisites
