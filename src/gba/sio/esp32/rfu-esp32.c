@@ -219,6 +219,11 @@ static void _setPhase(struct GBASIORFUESP32* esp, enum EspPhase phase) {
 		esp->statusEvent[0] = 0;
 		esp->beaconSeen = false;
 	}
+	if (phase == ESP_PHASE_BOOTING) {
+		// The board is back: whatever went wrong before (it was lost, the port would not open) is history. A fresh failure
+		// in this attempt sets its own error.
+		esp->statusError[0] = 0;
+	}
 	_lockLeave(&esp->lock);
 }
 

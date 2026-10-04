@@ -65,6 +65,9 @@ enum {
 
 	// A room heard within this long counts as in range for the status display.
 	kRoomFreshMs = 4000,
+	// A room unheard for this long is no longer offered to connect(). A scan visits each of the three channels in turn,
+	// so a room that is still up is refreshed every couple of seconds; this leaves room for a slow scan.
+	kRoomStaleMs = 15000,
 
 	// The largest single tiled message this backend ever sends: a Reliable(10) frame wrapping up to
 	// LDN_PIA_RELIABLE_MAX_PAYLOAD bytes of inner payload (8-byte sub-header + payload), plus the message-tiling
@@ -336,6 +339,9 @@ static void _onEvent(void* context, const struct LdndEvent* event) {
 	case LDND_EVENT_JOIN:
 	case LDND_EVENT_LEAVE: {
 		const struct LdndParticipant* participant = event->participant;
+		if (!participant) {
+			break;
+		}
 		GBASIORFUTrace(ldnd->rfu, "LDN    ldnd: participant %u %s: \"%.*s\" %u.%u.%u.%u", event->index,
 		               event->kind == LDND_EVENT_JOIN ? "joined" : "left", participant->nameLength, (const char*) participant->name, participant->ip[0],
 		               participant->ip[1], participant->ip[2], participant->ip[3]);
@@ -1036,15 +1042,17 @@ static bool _init(struct GBASIORFUBackend* backend, struct GBASIORFU* rfu) {
 static void _deinit(struct GBASIORFUBackend* backend) {
 	struct GBASIORFULdnd* ldnd = (struct GBASIORFULdnd*) backend;
 #ifdef _WIN32
+	// `stopping` goes up before the session is ended: a handshake the worker finishes in between would otherwise
+	// publish a session (and its heap-allocated Reliable state) that nothing is left to end.
+	EnterCriticalSection(&ldnd->lock);
+	ldnd->stopping = true;
+	if (ldnd->worker && ldnd->conn) {
+		// A join can keep the worker inside ldnd for a minute; this cuts it short.
+		LdndAbort(ldnd->conn);
+	}
+	LeaveCriticalSection(&ldnd->lock);
 	_endPiaSession(ldnd);
 	if (ldnd->worker) {
-		EnterCriticalSection(&ldnd->lock);
-		ldnd->stopping = true;
-		if (ldnd->conn) {
-			// A join can keep the worker inside ldnd for a minute; this cuts it short.
-			LdndAbort(ldnd->conn);
-		}
-		LeaveCriticalSection(&ldnd->lock);
 		_wakeWorker(ldnd);
 		WaitForSingleObject(ldnd->worker, INFINITE);
 		CloseHandle(ldnd->worker);
@@ -1116,9 +1124,11 @@ static void _connect(struct GBASIORFUBackend* backend, uint16_t deviceId) {
 	struct GBASIORFULdnd* ldnd = (struct GBASIORFULdnd*) backend;
 #ifdef _WIN32
 	EnterCriticalSection(&ldnd->lock);
+	uint32_t now = GetTickCount();
 	bool known = ldnd->targetDeviceId == deviceId;
 	for (size_t i = 0; i < kMaxRooms && !known; ++i) {
-		known = ldnd->rooms[i].valid && ldnd->rooms[i].trainerId == deviceId;
+		// A room not heard from for a while has most likely gone: joining it would only wait out the join budget.
+		known = ldnd->rooms[i].valid && ldnd->rooms[i].trainerId == deviceId && now - ldnd->rooms[i].lastSeen < kRoomStaleMs;
 	}
 	bool otherSession = ldnd->piaActive && ldnd->piaDeviceId != deviceId;
 	LeaveCriticalSection(&ldnd->lock);
