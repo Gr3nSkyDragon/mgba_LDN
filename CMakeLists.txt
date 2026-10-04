@@ -868,6 +868,12 @@ if(BUILD_UDS_TEST)
 		src/util/md5.c)
 	target_include_directories(uds-test PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
 
+	# The cable side of the wrapper (transfer pairing, nybble sync, link menu), with a scripted host and no emulator.
+	add_executable(uds-cable-test
+		src/gb/sio/uds-cable-test.c
+		src/gb/sio/uds-cable.c)
+	target_include_directories(uds-cable-test PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
+
 	# The same test for the Azahar bridge side, over real localhost sockets.
 	add_executable(uds-bridge-test
 		src/gb/sio/uds-bridge-test.c

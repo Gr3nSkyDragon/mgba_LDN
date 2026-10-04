@@ -252,3 +252,42 @@ needs a few seconds): `UDS_AIR_BOOTING` sends Hello from the poll, then Start wi
 **R5 (written, not yet tried):** `Wireless Adapter > ESP32` plus the `Virtual Console (Gen 1-2)` box runs the same `GBVCLink` on the real radio; `Local` plus
 the box stays on the Azahar bridge (`GBVCLinkConfig`). The board is the "ESP32 board" menu choice (empty: find it), the key file is Settings > BIOS > "3DS UDS key
 file" (read when the game starts). `MGBA_VCLINK_TRACE` now also logs every unit sent and received and, on the radio, counters every 5 s.
+
+## 9. Decoupling the wrapper from the emulator (branch UDS-decoupling)
+
+Goal: the translation between a Game Boy's serial port and the VC's unit stream must not need the emulator, so the same code can sit
+behind a real cartridge (a GB-Link GB-mode adapter or direct pins) on the ESP32. The emulated ROM is to be treated as a retail
+cartridge on a cable.
+
+**Model: a permanent slave.** On a cable the console that receives `$02` during the receptionist's handshake becomes master. The
+wrapper always offers `$02` with an armed external clock, so the cartridge is always master and drives every transfer, which is what
+the VC's hook forces today (`Link_fake_connection_status`). The wrapper never generates a clock. It must have its reply byte ready
+before the cartridge clocks it (the "reply lags one exchange" already measured), and it answers `$FE` ("no data", the ROM retries)
+when the other console has nothing for it yet.
+
+```
+  cartridge or emulated ROM
+    cable port        mGBA serial driver (today: hooks)  |  GB-Link GB mode / pins (later)
+    L4b  translator   uds-cable.c   NO emulator types: units through a UDSUnitPort, time and intents passed in
+    L3   Pia session  uds-session.c
+    L2/L1             uds-room.c, uds-air-radio.c, uds-ccmp.c ...
+```
+
+Steps (the hook wrapper stays as the reference oracle throughout, behind its current code path):
+
+1. **Done.** `uds-cable.c/.h`: transfer pairing, the nybble sync burst, the link menu exchange and the first-unit handling moved out of
+   `uds-gblink.c`, with the unit stream behind `struct UDSUnitPort`. `uds-gblink.c` now only reads the ROM's RAM (the nybble, the menu
+   selection) and fixes registers; behaviour is meant to be identical. `uds-cable-test` checks the moved logic against a scripted
+   host (39 checks). **Not yet re-run live** against Azahar or a retail 3DS after the move.
+2. **Next.** Record a real master-to-slave cable trade (two mGBA instances on the lockstep driver) as ground truth for what the cartridge
+   puts on the wire in every phase and what the slave replies.
+3. Wire-level front end for the translator: derive the intents from cable bytes (`60|n` is a nybble sync, a `Dx` byte is a menu
+   selection, `$FD` starts a block, ...) instead of from RAM, as a slave that returns the preloaded reply for each clocked byte.
+   Offline test: replay the recorded master stream and compare the replies with the real slave's, and the unit stream with the
+   hook wrapper's and the retail captures.
+4. mGBA serial driver as the permanent slave (no breakpoints); live trades against Azahar, then a retail 3DS.
+5. Move translator, session, CCMP and radio into an ESP-IDF component; cable port from the GB-Link GB mode or direct pins (a DMG's
+   link line is 5 V, a Game Boy Color's 3.3 V: level shifting is needed for direct pins).
+
+Open: what the GB-Link GB mode passes through and how fast (to ask the GB-Link developers); how the translator paces the 424-byte
+block (the cartridge clocks it at about 1 byte per ms while the VC creates it at once); Gen 2 and Yellow cable behaviour is unmeasured.

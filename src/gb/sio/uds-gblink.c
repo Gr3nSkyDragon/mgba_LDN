@@ -9,6 +9,7 @@
 #include <mgba/debugger/debugger.h>
 #include <mgba/internal/gb/gb.h>
 #include <mgba/internal/gb/io.h>
+#include <mgba/internal/gb/sio/uds-cable.h>
 #include <mgba/internal/gb/sio/uds-joiner.h>
 #include <mgba/internal/sm83/sm83.h>
 
@@ -22,14 +23,8 @@
 #include <windows.h>
 #endif
 
-#define GBVC_SYNC_SIXTIES 5 // after the host's answer: this many more 60|nybble, then GBVC_SYNC_ZEROS of 00
-#define GBVC_SYNC_ZEROS 5
-#define GBVC_SYNC_TIMEOUT_MS 20000
-#define GBVC_SYNC_TAIL_MAX 40 // most units followed after the first 12
-#define GBVC_SYNC_TAIL_QUIET_MS 250 // the host's burst is over when it has sent nothing for this long
 #define GBVC_POLL_CYCLES 4096 // about 1 ms
 #define GBVC_USING_INTERNAL_CLOCK 0x02
-#define GBVC_FIRST_UNIT_BYTE 0x00 // the joiner's unit at index -2001; the host's is EF
 
 struct VCAddr {
 	int bank;
@@ -53,12 +48,14 @@ struct VCGame {
 	uint16_t menuReturn; // its final `ret`
 	uint16_t menuSend; // wLinkMenuSelectionSendBuffer (two bytes)
 	uint16_t menuReceive; // wLinkMenuSelectionReceiveBuffer (two bytes)
+	uint16_t curMap; // wCurMap, for the trace heartbeat only
+	uint16_t linkState; // wLinkState, likewise
 };
 
 static const struct VCGame sGames[] = {
-	{"POKEMON RED", {1, 0x7202}, {1, 0x7260}, {0, 0x227F}, 0x22C2, 0x20AF, 0xCC42, 0xCC3E, 0xCC3D, 0xCC47, 0xFFAA, 0x2247, 0x226D, 0xCC42, 0xCC3D},
-	{"POKEMON BLU", {1, 0x7202}, {1, 0x7260}, {0, 0x227F}, 0x22C2, 0x20AF, 0xCC42, 0xCC3E, 0xCC3D, 0xCC47, 0xFFAA, 0x2247, 0x226D, 0xCC42, 0xCC3D},
-	{"POKEMON YEL", {1, 0x7077}, {1, 0x70D8}, {0, 0x20DB}, 0x211E, 0x1E64, 0xCC42, 0xCC3E, 0xCC3D, 0xCC47, 0xFFAA, 0x20A3, 0x20C9, 0xCC42, 0xCC3D},
+	{"POKEMON RED", {1, 0x7202}, {1, 0x7260}, {0, 0x227F}, 0x22C2, 0x20AF, 0xCC42, 0xCC3E, 0xCC3D, 0xCC47, 0xFFAA, 0x2247, 0x226D, 0xCC42, 0xCC3D, 0xD35E, 0xD12B},
+	{"POKEMON BLU", {1, 0x7202}, {1, 0x7260}, {0, 0x227F}, 0x22C2, 0x20AF, 0xCC42, 0xCC3E, 0xCC3D, 0xCC47, 0xFFAA, 0x2247, 0x226D, 0xCC42, 0xCC3D, 0xD35E, 0xD12B},
+	{"POKEMON YEL", {1, 0x7077}, {1, 0x70D8}, {0, 0x20DB}, 0x211E, 0x1E64, 0xCC42, 0xCC3E, 0xCC3D, 0xCC47, 0xFFAA, 0x20A3, 0x20C9, 0xCC42, 0xCC3D, 0xD35D, 0xD12A},
 };
 
 // Recognised, but there is no Gen 2 driver yet (different link code and a different key, see the plan's open questions).
@@ -71,13 +68,6 @@ enum HleKind {
 	HLE_MENU, // Serial_ExchangeLinkMenuSelection
 };
 
-enum SyncPhase {
-	SYNC_IDLE,
-	SYNC_WAIT, // exchanging 60|nybble units until the host's 6x arrives
-	SYNC_AFTER, // the ROM's two shorter loops after that
-	SYNC_TAIL, // following the host's burst to its end
-};
-
 struct GBVCLink {
 	struct GBSIODriver d;
 	struct mDebuggerModule module;
@@ -86,6 +76,7 @@ struct GBVCLink {
 	struct GB* gb;
 	const struct VCGame* game;
 	struct UDSJoiner joiner;
+	struct UDSCable cable; // the part of the translation that does not need the emulator (uds-cable.c)
 
 	bool attachedDriver;
 	bool attachedModule;
@@ -97,31 +88,20 @@ struct GBVCLink {
 	uint32_t startMs;
 	bool fake; // between Link_fake_connection_status and Wireless_prompt
 	bool started; // the Pia session is up and the first unit has been sent
-	bool discardFirst; // the host's first unit (EF) is not a transfer
 
-	bool txPending; // a transfer is waiting for the peer's unit
-	uint8_t txByte;
 	unsigned txUnits;
 	unsigned rxUnits;
 
-	enum SyncPhase syncPhase;
-	unsigned syncSentN;
-	unsigned syncRecvN;
-	uint32_t syncTailMs;
-	unsigned syncTail;
 	enum HleKind hle;
-	bool menuSent;
-	uint32_t menuStartMs;
-	unsigned menuGot;
-	uint8_t menuBytes[3];
-	uint32_t syncStartMs;
-	int syncNybble;
 	uint16_t savedBC, savedDE, savedHL;
 
 	int lastRoom;
 	int lastSession;
 	int lastRadio;
 	uint32_t lastRadioStatsMs;
+	uint32_t lastHeartbeatMs;
+	uint32_t lastHookMs; // when a ROM hook last ran, and which
+	const char* lastHookName;
 	FILE* trace;
 };
 
@@ -206,26 +186,49 @@ static bool _ready(const struct GBVCLink* link) {
 	return link->started && link->joiner.sessionActive && link->joiner.session.state == UDS_STATE_JOINED;
 }
 
-static void _queueUnit(struct GBVCLink* link, uint8_t byte) {
+// The unit port the cable code (uds-cable.c) talks to: the joiner's Pia session, with the trace and counters of this driver.
+static bool _portReady(void* context) {
+	return _ready(context);
+}
+
+static bool _portQueue(void* context, uint8_t byte) {
+	struct GBVCLink* link = context;
 	if (!udsSessionQueueUnit(&link->joiner.session, byte)) {
 		_trace(link, "tx window full, byte %02X dropped", byte);
-		return;
+		return false;
 	}
 	_trace(link, "tx %02X", byte);
 	++link->txUnits;
+	return true;
 }
 
-static void _flush(struct GBVCLink* link) {
+static void _portFlush(void* context) {
+	struct GBVCLink* link = context;
 	udsSessionFlush(&link->joiner.session, link->joiner.nowMs);
 }
 
-static bool _popUnit(struct GBVCLink* link, uint8_t* byte) {
+static bool _portPop(void* context, uint8_t* byte) {
+	struct GBVCLink* link = context;
 	if (!udsSessionPopUnit(&link->joiner.session, byte)) {
 		return false;
 	}
 	_trace(link, "rx %02X", *byte);
 	++link->rxUnits;
 	return true;
+}
+
+static bool _portPeek(void* context, uint8_t* byte) {
+	struct GBVCLink* link = context;
+	return udsSessionPeekUnit(&link->joiner.session, byte);
+}
+
+static size_t _portWaiting(void* context) {
+	struct GBVCLink* link = context;
+	return udsSessionUnitsWaiting(&link->joiner.session);
+}
+
+static void _portTrace(void* context, const char* line) {
+	_trace(context, "%s", line);
 }
 
 static void _logStates(struct GBVCLink* link) {
@@ -271,11 +274,26 @@ static void _logStates(struct GBVCLink* link) {
 	}
 }
 
+// A line every 5 s in the trace, so a quiet stretch can be told from a trace that simply ended: where the ROM is, which hook
+// ran last and how long ago, whether a transfer is waiting, and the unit counts.
+static void _heartbeat(struct GBVCLink* link, uint32_t now) {
+	if (!link->trace || now - link->lastHeartbeatMs < 5000) {
+		return;
+	}
+	link->lastHeartbeatMs = now;
+	struct SM83Core* cpu = link->core->cpu;
+	_trace(link, "heartbeat: pc %02X:%04X map %02X linkstate %02X conn %02X, last hook %s %.1f s ago, %s, transfer %s, units sent %u received %u (%u waiting)",
+	       link->gb->memory.currentBank, cpu->pc, _read8(link, link->game->curMap), _read8(link, link->game->linkState),
+	       _read8(link, link->game->connectionStatus), link->lastHookName ? link->lastHookName : "none",
+	       link->lastHookName ? (now - link->lastHookMs) / 1000.0 : 0.0, link->started ? "link up" : "link down",
+	       link->cable.txPending ? "waiting" : "idle", link->txUnits, link->rxUnits,
+	       (unsigned) udsSessionUnitsWaiting(&link->joiner.session));
+}
+
 // Transfer completion -------------------------------------------------------------------------------------------------
 
 static void _finishTransfer(struct GBVCLink* link, uint8_t byte) {
 	struct GBSIO* sio = &link->gb->sio;
-	link->txPending = false;
 	sio->pendingSB = byte;
 	if (GBRegisterSCIsEnable(link->gb->memory.io[GB_REG_SC])) {
 		sio->remainingBits = 8;
@@ -289,37 +307,27 @@ static void _poll(struct mTiming* timing, void* context, uint32_t cyclesLate) {
 	uint32_t now = _nowMs() - link->startMs;
 	udsJoinerPoll(&link->joiner, now);
 	_logStates(link);
+	_heartbeat(link, now);
 
 	if (!link->started && udsJoinerReady(&link->joiner)) {
 		link->started = true;
-		link->discardFirst = true;
-		_queueUnit(link, GBVC_FIRST_UNIT_BYTE);
-		_flush(link);
-		_trace(link, "link up: first unit %02X sent", GBVC_FIRST_UNIT_BYTE);
+		udsCableBegin(&link->cable);
 		mLOG(GB_SIO, INFO, "Virtual Console: link up");
 	} else if (link->started && !_ready(link)) {
 		// The host went away (bye, silence). Let the game's pending transfer finish on an idle line.
 		link->started = false;
-		link->syncPhase = SYNC_IDLE;
 		mLOG(GB_SIO, INFO, "Virtual Console: link lost");
 		_trace(link, "link lost");
-		if (link->txPending) {
+		if (udsCableLost(&link->cable)) {
 			_finishTransfer(link, 0xFF);
 		}
 	}
 
 	if (link->started) {
 		uint8_t byte;
-		if (link->discardFirst && udsSessionUnitsWaiting(&link->joiner.session)) {
-			_popUnit(link, &byte);
-			link->discardFirst = false;
-			_trace(link, "host first unit %02X discarded", byte);
-		}
-		if (link->txPending && !link->discardFirst && link->hle == HLE_NONE && _popUnit(link, &byte)) {
-			_trace(link, "xfer tx %02X rx %02X", link->txByte, byte);
+		if (udsCablePoll(&link->cable, now, &byte)) {
 			_finishTransfer(link, byte);
 		}
-		_flush(link);
 	}
 
 	mTimingSchedule(timing, &link->event, GBVC_POLL_CYCLES - cyclesLate);
@@ -350,12 +358,7 @@ static uint8_t _driverWriteSC(struct GBSIODriver* driver, uint8_t value) {
 		// Take the transfer away from the built-in shifter; the poll finishes it when the peer's unit arrives.
 		mTimingDeschedule(&link->gb->timing, &sio->event);
 		sio->remainingBits = 0;
-		if (!link->txPending) {
-			link->txByte = link->gb->memory.io[GB_REG_SB];
-			link->txPending = true;
-			_queueUnit(link, link->txByte);
-			_flush(link);
-		}
+		udsCableTransfer(&link->cable, link->gb->memory.io[GB_REG_SB]);
 	}
 	return value;
 }
@@ -386,6 +389,8 @@ static void _saveRegs(struct GBVCLink* link) {
 	link->savedHL = cpu->hl;
 }
 
+// Serial_SyncAndExchangeNybble. The exchange itself is uds-cable.c's; what is left here is reading the nybble the ROM wants
+// to send and leaving the registers and RAM as the ROM's own routine would.
 static void _syncFinish(struct GBVCLink* link, int nybble) {
 	const struct VCGame* game = link->game;
 	struct SM83Core* cpu = link->core->cpu;
@@ -398,136 +403,35 @@ static void _syncFinish(struct GBVCLink* link, int nybble) {
 	cpu->a = nybble;
 	cpu->f.packed = 0x80;
 	_setPC(link, game->syncReturn);
-	link->syncPhase = SYNC_IDLE;
 	link->hle = HLE_NONE;
-	_trace(link, "sync done: nybble %X, %u host units followed past the first 12", nybble, link->syncTail);
-}
-
-// Serial_SyncAndExchangeNybble, as the ROM's own loops would run it against the host, one frame at a time:
-//   1. exchange 60|nybble units, one for each host unit, until a unit from the host is a 6x byte (the ROM's loop1: how long
-//      this lasts is how long the host takes to arrive; Azahar's host sent 164 units of 60 in one wait)
-//   2. five more 60|nybble and five 00 (the ROM's loop2 and loop3, which the VC shortens: 7 + 5 in a retail pair)
-//   3. keep answering the host's burst one unit at a time for as long as it is still sending sync units (00 or 6x), so that
-//      both sides leave the sync having sent the same number of units, whatever length the host used.
-// Every unit of the host's that is read is matched by one unit of ours, so the two streams stay paired.
-static void _syncSend(struct GBVCLink* link, uint8_t byte) {
-	_queueUnit(link, byte);
-	++link->syncSentN;
-}
-
-static bool _syncPop(struct GBVCLink* link, uint8_t* byte) {
-	if (link->syncRecvN >= link->syncSentN || link->discardFirst || !_popUnit(link, byte)) {
-		return false;
-	}
-	++link->syncRecvN;
-	return true;
 }
 
 static void _hookSync(struct GBVCLink* link) {
 	const struct VCGame* game = link->game;
 	uint32_t now = _nowMs() - link->startMs;
-	uint8_t byte;
+	int nybble;
 
-	if (link->syncPhase == SYNC_IDLE) {
+	if (link->hle != HLE_SYNC) {
 		_saveRegs(link);
 		link->hle = HLE_SYNC;
-		link->syncStartMs = now;
-		link->syncSentN = link->syncRecvN = 0;
-		link->syncTail = 0;
-		link->syncNybble = -1;
-		link->syncPhase = SYNC_WAIT;
-		_trace(link, "hook: nybble sync, link %s", _ready(link) ? "up" : "not up yet");
 	}
-
-	if (_ready(link)) {
-		uint8_t nybble = _read8(link, game->sendNybble) & 0x0F;
-		if (link->syncPhase == SYNC_WAIT) {
-			// Phase 1. One unit out for each unit in; nothing is read before it has been paired with one of ours.
-			unsigned guard;
-			for (guard = 0; guard < 400; ++guard) {
-				if (link->syncSentN == link->syncRecvN) {
-					_syncSend(link, 0x60 | nybble);
-				}
-				if (!_syncPop(link, &byte)) {
-					break;
-				}
-				if ((byte & 0xF0) == 0x60) {
-					link->syncNybble = byte & 0x0F;
-					break;
-				}
-			}
-			_flush(link);
-			if (link->syncNybble >= 0) {
-				unsigned i;
-				for (i = 0; i < GBVC_SYNC_SIXTIES; ++i) {
-					_syncSend(link, 0x60 | nybble);
-				}
-				for (i = 0; i < GBVC_SYNC_ZEROS; ++i) {
-					_syncSend(link, 0x00);
-				}
-				_flush(link);
-				link->syncPhase = SYNC_AFTER;
-				_trace(link, "sync: host answered %X after %u units; sending %d more %X and %d 00", link->syncNybble,
-				       link->syncRecvN, GBVC_SYNC_SIXTIES, nybble, GBVC_SYNC_ZEROS);
-			}
-		}
-		if (link->syncPhase == SYNC_AFTER) {
-			while (link->syncRecvN < link->syncSentN && _syncPop(link, &byte)) {
-			}
-			if (link->syncRecvN >= link->syncSentN) {
-				link->syncPhase = SYNC_TAIL;
-				link->syncTailMs = now;
-			}
-		}
-		if (link->syncPhase == SYNC_TAIL) {
-			// A unit that is not 00 or 6x belongs to what the host does next: leave it.
-			while (link->syncTail < GBVC_SYNC_TAIL_MAX && udsSessionPeekUnit(&link->joiner.session, &byte) &&
-			       (byte == 0x00 || (byte & 0xF0) == 0x60)) {
-				_syncSend(link, 0x00);
-				_syncPop(link, &byte);
-				++link->syncTail;
-				link->syncTailMs = now;
-			}
-			_flush(link);
-			bool another = udsSessionPeekUnit(&link->joiner.session, &byte);
-			// Done when the host has moved on (a different unit is waiting), or has been quiet for a moment.
-			if ((another && byte != 0x00 && (byte & 0xF0) != 0x60) || link->syncTail >= GBVC_SYNC_TAIL_MAX ||
-			    now - link->syncTailMs > GBVC_SYNC_TAIL_QUIET_MS) {
-				_syncFinish(link, link->syncNybble);
-				return;
-			}
-		}
-	}
-
-	if (now - link->syncStartMs > GBVC_SYNC_TIMEOUT_MS && link->syncPhase == SYNC_WAIT) {
-		// Nobody answered: the ROM's own way out is the counter at FFFF ("link closed because of inactivity").
+	enum UDSCableStatus status = udsCableSync(&link->cable, _read8(link, game->sendNybble), now, &nybble);
+	if (status == UDS_CABLE_TIMED_OUT) {
+		// The ROM's own way out is the counter at FFFF ("link closed because of inactivity").
 		_write8(link, game->unknownCounter, 0xFF);
 		_write8(link, game->unknownCounter + 1, 0xFF);
-		_trace(link, "sync timed out");
-		_syncFinish(link, 0xFF);
+	}
+	if (status != UDS_CABLE_PENDING) {
+		_syncFinish(link, nybble);
 		return;
 	}
-
 	_yield(link, game->syncEntry.addr);
 }
 
-// Serial_ExchangeLinkMenuSelection. The ROM exchanges three bytes per call (the first is discarded, the next two are kept)
-// and wants a "D0 class" byte in either kept slot. Which of the host's bytes lands in which slot depends on how the two
-// loops line up, and the host leaves the menu as soon as it sees our A press, so a missed byte is never repeated. Here a
-// call sends the selection three times and keeps the last D0-class byte of the three the host sent, in both slots, which
-// does not depend on the alignment. The host reads the same constant selection whichever of our units it looks at.
-static void _menuFinish(struct GBVCLink* link) {
+// Serial_ExchangeLinkMenuSelection (the exchange is uds-cable.c's).
+static void _menuFinish(struct GBVCLink* link, uint8_t first, uint8_t second) {
 	const struct VCGame* game = link->game;
 	struct SM83Core* cpu = link->core->cpu;
-	int valid = -1;
-	unsigned i;
-	for (i = 0; i < 3; ++i) {
-		if ((link->menuBytes[i] & 0xF0) == 0xD0) {
-			valid = link->menuBytes[i];
-		}
-	}
-	uint8_t first = valid >= 0 ? valid : link->menuBytes[1];
-	uint8_t second = valid >= 0 ? valid : link->menuBytes[2];
 	_write8(link, game->menuReceive, first);
 	_write8(link, game->menuReceive + 1, second);
 	cpu->bc = link->savedBC;
@@ -535,50 +439,21 @@ static void _menuFinish(struct GBVCLink* link) {
 	cpu->hl = link->savedHL;
 	_setPC(link, game->menuReturn);
 	link->hle = HLE_NONE;
-	_trace(link, "menu done: sent %02X, host sent %02X %02X %02X -> %02X %02X", _read8(link, game->menuSend),
-	       link->menuBytes[0], link->menuBytes[1], link->menuBytes[2], first, second);
 }
 
 static void _hookMenu(struct GBVCLink* link) {
 	const struct VCGame* game = link->game;
 	uint32_t now = _nowMs() - link->startMs;
+	uint8_t first, second;
 
 	if (link->hle != HLE_MENU) {
 		_saveRegs(link);
 		link->hle = HLE_MENU;
-		link->menuSent = false;
-		link->menuGot = 0;
-		link->menuStartMs = now;
 	}
-
-	if (_ready(link) && !link->menuSent) {
-		uint8_t selection = _read8(link, game->menuSend);
-		unsigned i;
-		for (i = 0; i < 3; ++i) {
-			_queueUnit(link, selection);
-		}
-		_flush(link);
-		link->menuSent = true;
-	}
-
-	if (_ready(link) && link->menuSent) {
-		uint8_t byte;
-		while (link->menuGot < 3 && !link->discardFirst && _popUnit(link, &byte)) {
-			link->menuBytes[link->menuGot++] = byte;
-		}
-		if (link->menuGot >= 3) {
-			_menuFinish(link);
-			return;
-		}
-	}
-
-	if (!_ready(link) && link->menuSent) {
-		// The link dropped in the middle of a call: give the ROM what an idle line gives.
-		link->menuBytes[0] = link->menuBytes[1] = link->menuBytes[2] = 0xFF;
-		_menuFinish(link);
+	if (udsCableMenu(&link->cable, _read8(link, game->menuSend), now, &first, &second) == UDS_CABLE_DONE) {
+		_menuFinish(link, first, second);
 		return;
 	}
-
 	_yield(link, game->menuEntry);
 }
 
@@ -597,13 +472,18 @@ static void _moduleEntered(struct mDebuggerModule* module, enum mDebuggerEntryRe
 	if (reason != DEBUGGER_ENTER_BREAKPOINT) {
 		return;
 	}
+	link->lastHookMs = _nowMs() - link->startMs;
 	if (info->pointId == link->fakeBeginId) {
+		link->lastHookName = "fake_connection_status";
 		_hookFakeBegin(link);
 	} else if (info->pointId == link->fakeEndId) {
+		link->lastHookName = "wireless_prompt";
 		_hookFakeEnd(link);
 	} else if (info->pointId == link->syncId) {
+		link->lastHookName = "nybble_sync";
 		_hookSync(link);
 	} else if (info->pointId == link->menuId) {
+		link->lastHookName = "link_menu";
 		_hookMenu(link);
 	}
 }
@@ -656,6 +536,16 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 	link->lastSession = -1;
 	link->lastRadio = -1;
 	link->fakeBeginId = link->fakeEndId = link->syncId = link->menuId = -1;
+	udsCableInit(&link->cable, &(struct UDSUnitPort) {
+		.context = link,
+		.ready = _portReady,
+		.queue = _portQueue,
+		.flush = _portFlush,
+		.pop = _portPop,
+		.peek = _portPeek,
+		.waiting = _portWaiting,
+		.trace = _portTrace,
+	});
 
 	const char* dir = getenv("MGBA_VCLINK_TRACE");
 	if (dir && *dir) {
@@ -750,6 +640,7 @@ void GBVCLinkDestroy(struct GBVCLink* link) {
 	}
 	udsJoinerClose(&link->joiner);
 	if (link->trace) {
+		_trace(link, "link stopped (units sent %u, received %u)", link->txUnits, link->rxUnits);
 		fclose(link->trace);
 	}
 	mLOG(GB_SIO, INFO, "Virtual Console: link stopped");
