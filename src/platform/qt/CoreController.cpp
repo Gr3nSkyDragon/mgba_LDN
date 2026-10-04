@@ -241,6 +241,7 @@ CoreController::CoreController(mCore* core, QObject* parent)
 }
 
 CoreController::~CoreController() {
+	stopVC();
 	endVideoLog();
 	stop();
 	disconnect();
@@ -1359,6 +1360,95 @@ void CoreController::setRFUCableWrapper(bool enabled) {
 	applyRFU();
 }
 
+// The "Virtual Console (Gen 1-2)" box: a Game Boy link cable signal inside a UDS wrapper (nothing to do with the GBA
+// wireless adapter above). Placeholder until the UDS wrapper (src/gb/sio/uds-*.c, see
+// doc/uds-wrapper-plan.md) is attached to the Game Boy core's link port; for now the choice is only recorded.
+void CoreController::setVCWrapper(bool enabled) {
+	if (m_vcWrapper == enabled) {
+		return;
+	}
+	m_vcWrapper = enabled;
+	qInfo() << "Virtual Console (Gen 1-2) wrapper" << (enabled ? "selected" : "deselected");
+	applyVC();
+}
+
+// The Virtual Console wrapper needs a Game Boy core, the box ticked and Wireless Adapter > Local (the only air it has so far:
+// the UDP pair to Azahar's test bridge, AZAHAR_UDS_BRIDGE). Like the RFU Cable Wrapper's wireless side it does not wait for
+// the game: the join starts at once and takes the first matching beacon, so it is up before the game opens its link.
+void CoreController::applyVC() {
+	const bool wanted = m_vcWrapper && platform() == mPLATFORM_GB && m_rfuRequestedBackend == QLatin1String("local");
+	if (!wanted) {
+		stopVC();
+		return;
+	}
+	if (m_vcJoiner) {
+		return;
+	}
+	m_vcJoiner = std::make_unique<UDSJoiner>();
+	uint16_t name[UDS_NAME_WORDS] = {'M', 'G', 'B', 'A'};
+	uint16_t listenPort, sendPort;
+	udsUdpPortsFromEnvironment(&listenPort, &sendPort);
+	if (!udsJoinerOpen(m_vcJoiner.get(), name, listenPort, sendPort)) {
+		LOG(QT, ERROR) << tr("Virtual Console: cannot listen on 127.0.0.1:%1 (is another mGBA using it?)").arg(listenPort);
+		m_vcJoiner.reset();
+		return;
+	}
+	LOG(QT, INFO) << tr("Virtual Console: waiting for Azahar's UDS bridge, listening on 127.0.0.1:%1, sending to %2")
+	                     .arg(listenPort).arg(sendPort);
+	m_vcLastRoom = -1;
+	m_vcLastSession = -1;
+	m_vcClock.start();
+	if (!m_vcTimer) {
+		m_vcTimer = new QTimer(this);
+		m_vcTimer->setInterval(5);
+		connect(m_vcTimer, &QTimer::timeout, this, &CoreController::pollVC);
+	}
+	m_vcTimer->start();
+}
+
+void CoreController::stopVC() {
+	if (m_vcTimer) {
+		m_vcTimer->stop();
+	}
+	if (m_vcJoiner) {
+		udsJoinerClose(m_vcJoiner.get());
+		m_vcJoiner.reset();
+		LOG(QT, INFO) << tr("Virtual Console: join stopped");
+	}
+}
+
+void CoreController::pollVC() {
+	if (!m_vcJoiner) {
+		return;
+	}
+	udsJoinerPoll(m_vcJoiner.get(), static_cast<uint32_t>(m_vcClock.elapsed()));
+	const UDSRoom& room = m_vcJoiner->room;
+	if (room.state != m_vcLastRoom) {
+		static const char* const names[] = {"scanning for a host", "authenticating", "associated, EAPoL start sent",
+		                                    "joined"};
+		m_vcLastRoom = room.state;
+		if (room.state == UDS_ROOM_SCAN) {
+			LOG(QT, INFO) << tr("Virtual Console: %1 (beacons seen: %2, packets received: %3)")
+			                     .arg(names[room.state]).arg(room.beaconsSeen).arg(room.packetsReceived);
+		} else if (room.state == UDS_ROOM_JOINED) {
+			LOG(QT, INFO) << tr("Virtual Console: joined Azahar's network %1 as node %2 (%3 nodes)")
+			                     .arg(room.host.networkId, 8, 16, QLatin1Char('0')).arg(room.host.nodeId)
+			                     .arg(room.host.connectedNodes);
+		} else {
+			LOG(QT, INFO) << tr("Virtual Console: %1 (network %2)").arg(names[room.state])
+			                     .arg(room.host.networkId, 8, 16, QLatin1Char('0'));
+		}
+	}
+	if (m_vcJoiner->sessionActive && m_vcJoiner->session.state != m_vcLastSession) {
+		static const char* const names[] = {"idle", "exchanging setup messages", "joined: game stream may start", "closed"};
+		m_vcLastSession = m_vcJoiner->session.state;
+		LOG(QT, INFO) << tr("Virtual Console: Pia session %1 (frames in %2, out %3)").arg(names[m_vcLastSession])
+		                     .arg(m_vcJoiner->session.framesReceived).arg(m_vcJoiner->session.framesSent);
+	} else if (!m_vcJoiner->sessionActive) {
+		m_vcLastSession = -1;
+	}
+}
+
 void CoreController::setRFUWrapperLogging(bool enabled) {
 	bool changed = m_rfuWrapperLogEnabled != enabled;
 	m_rfuWrapperLogEnabled = enabled;
@@ -1407,6 +1497,7 @@ void CoreController::setRFULogging(bool enabled) {
 void CoreController::setRFUBackend(const QString& requested) {
 	m_rfuRequestedBackend = rfuNormalizeBackend(requested);
 	applyRFU();
+	applyVC();
 }
 
 // Puts on the link port what the menu asks for: nothing, the adapter, or the cable wrapper, on the chosen backend

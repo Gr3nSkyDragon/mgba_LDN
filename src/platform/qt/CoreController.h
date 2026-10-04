@@ -8,11 +8,13 @@
 #include <QByteArray>
 #include <QFile>
 #include <QList>
+#include <QElapsedTimer>
 #include <QMutex>
 #include <QObject>
 
 #include <atomic>
 #include <QSize>
+#include <QTimer>
 
 #include "VFileDevice.h"
 
@@ -26,6 +28,7 @@
 
 #ifdef M_CORE_GB
 #include <mgba/internal/gb/sio/printer.h>
+#include <mgba/internal/gb/sio/uds-joiner.h>
 #endif
 #ifdef M_CORE_GBA
 #include <mgba/internal/gba/sio/dolphin.h>
@@ -218,6 +221,11 @@ public slots:
 	void setRFUCableWrapper(bool enabled);
 	void setRFUWrapperLogging(bool enabled);
 	bool rfuWrapperEnabled() const;
+	// Virtual Console (Gen 1-2): the Game Boy link cable carried over UDS to the 3DS VC. Not a wireless-adapter feature.
+	// For now it only runs the UDS join (an auto-joining UDSJoiner on the Local backend's UDP pair to Azahar) and logs its
+	// progress; nothing is attached to the Game Boy link port yet.
+	void setVCWrapper(bool enabled);
+	bool vcWrapperRequested() const { return m_vcWrapper; }
 	// The connection of the attached wireless adapter's backend, or else the RFU Cable Wrapper's wireless side, for the
 	// status menu. False when neither is attached. `backend` gets its name, `wrapper` whether it is the wrapper's.
 	bool rfuStatus(GBASIORFUBackendStatus* out, QString* backend, bool* wrapper) const;
@@ -398,6 +406,15 @@ private:
 	QString m_rfuWrapperConnection; // the connection the attached wrapper was started with
 	QByteArray m_rfuWrapperConnectionName;
 	bool m_rfuCableWrapper = false; // the menu's "Cable wrapper": m_rfuRequestedBackend drives the wrapper
+	bool m_vcWrapper = false; // the menu's "Virtual Console (Gen 1-2)"
+	void applyVC();
+	void pollVC();
+	void stopVC();
+	std::unique_ptr<UDSJoiner> m_vcJoiner;
+	QTimer* m_vcTimer = nullptr;
+	QElapsedTimer m_vcClock;
+	int m_vcLastRoom = -1;
+	int m_vcLastSession = -1;
 	bool m_rfuWrapperLogEnabled = false; // "Save adapter log" of the wrapper: <config dir>/rfu-wrapper-trace.log
 	bool m_rfuWrapperTraceHeld = false; // this controller holds a reference on the cable trace file
 	QByteArray m_eReaderData;

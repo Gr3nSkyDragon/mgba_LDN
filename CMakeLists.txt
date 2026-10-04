@@ -858,6 +858,31 @@ add_subdirectory(src/gba)
 add_subdirectory(src/sm83)
 add_subdirectory(src/util)
 
+# Unit test for the Virtual Console (UDS) wrapper's Pia codec and joiner session, run against frames from a real capture.
+option(BUILD_UDS_TEST "Build the UDS wrapper unit test (uds-test)" ON)
+if(BUILD_UDS_TEST)
+	add_executable(uds-test
+		src/gb/sio/uds-test.c
+		src/gb/sio/uds-pia.c
+		src/gb/sio/uds-session.c
+		src/util/md5.c)
+	target_include_directories(uds-test PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
+
+	# The same test for the Azahar bridge side, over real localhost sockets.
+	add_executable(uds-bridge-test
+		src/gb/sio/uds-bridge-test.c
+		src/gb/sio/uds-pia.c
+		src/gb/sio/uds-session.c
+		src/gb/sio/uds-room.c
+		src/gb/sio/uds-udp.c
+		src/gb/sio/uds-joiner.c
+		src/util/md5.c)
+	target_include_directories(uds-bridge-test PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
+	if(WIN32)
+		target_link_libraries(uds-bridge-test ws2_32)
+	endif()
+endif()
+
 if(USE_LDND)
 	add_definitions(-DUSE_LDND)
 	add_executable(ldnd-probe

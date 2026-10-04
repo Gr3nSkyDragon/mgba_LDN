@@ -93,11 +93,11 @@ Every UDS payload on channel 243 starts with a 24-byte header.
 | 0 | 2 | `01 01` constant |
 | 2 | 2 | little-endian, **frame length - 12** (96-byte frame: `54 00`) |
 | 4 | 6 | zeros |
-| 10 | 2 | message type (table below); constant for a given type |
+| 10 | 2 | little-endian **CRC-16/ARC** (poly 0xA001 reflected, init 0) of bytes 0 to 9. It looks like a "message type" because it depends only on `01`, the kind byte and the length field, so it is constant for a given frame length (identified 2026-10-04; matches all 22 distinct lengths seen) |
 | 12 | 4 | **Pia magic `32 AB 98 64`**, constant (every Pia datagram starts with it, see [pokeldn's Pia page](https://github.com/Decryptu/pokeldn/blob/main/docs/pia.md)) |
-| 16 | 1 | Pia version byte `01`. The `0x80` "encrypted" bit is clear, which matches the plaintext payload |
-| 17 | 1 | sender id byte, a **per-session** value for each side (`AA`/`2C`, `F7`/`BC`, `14`/`1E` in the three retail-host sessions; it equals the "station constant id" in the station info message). `00`/`01` in the first setup frames. Probably Pia's connection id |
-| 18 | 2 | big-endian **packet id**, per sender. Azahar's count runs 1, 2, 3 ... with no gaps (every frame, control included); the retail console's rises with gaps (3, 8, 10, 11, ...) whose cause is [unknown] |
+| 16 | 1 | `01`: the "encrypted" field of Pia up to 5.6 (1 = not encrypted, 2 = encrypted), per the [kinnay](https://github.com/kinnay/NintendoClients/wiki/Pia-Protocol) and [Pretendo](https://nintendo-wiki.pretendo.network/docs/pia/protocol) header tables. The layout here (this header, the 20-byte message header, an HMAC-MD5 tail) is that oldest Pia generation, so the VC titles run Pia 5.6 or earlier |
+| 17 | 1 | **connection id**: `00` (host) / `01` (joiner) in the setup frames, then each side's **station constant id** (`AA`/`2C`, `F7`/`BC`, `14`/`1E`, `90`/`3C` in four retail-host sessions; it equals the station constant id in the station info message) from the host's mesh state on. A joiner's clock sync request is sent as a "direct" frame with connection id `00` and packet id 0 |
+| 18 | 2 | big-endian **packet id**, per sender; `0` in every setup frame (before the mesh state), then counting from 1. Azahar's count runs 1, 2, 3 ... with no gaps (every frame, control included); the retail console's rises with gaps (3, 8, 10, 11, ...) whose cause is [unknown] |
 | 20 | 2 | big-endian **sender's clock in milliseconds** (16-bit, wraps every 65.5 s; ticks at 1000.0 per second against the log time) |
 | 22 | 2 | big-endian **sender's estimate of the peer's clock**, same units. The difference of the two halves is about -15,435 in Azahar's frames and +15,480 in the host's, so the pair is mirrored |
 
@@ -105,7 +105,7 @@ Bytes 0-11 (`01 01`, length, six zero bytes, message type) sit in front of the P
 The VC code does contain Pia: `Pia Send`, `Pia Receive`, `SyncClockProtocol`, `Mesh`, `BackgroundScheduler` strings and the magic as a literal in five places
 (`vc_work/Red/exefs/code.bin`). The pair of clocks at offset 20 fits Pia's clock-synchronisation protocol.
 
-The type id at offset 10 is constant for a given type and tracks the frame length (`5865` is always 76 bytes). Its derivation is [unknown].
+Bytes 10-11 are a CRC-16/ARC of bytes 0-9 (see the table), which is why `5865` is always 76 bytes.
 
 ## Message types [measured]
 
@@ -291,8 +291,9 @@ The joiner's view of the first 2 s:
 | system data (host, every 10 s) | the whole payload and the station table | only the stream index |
 | UDS beacon | comm ID `0x00171010`, node data fingerprint `0x8D33BB51`, key-derivation input `TRL_NETWORK` | network ID (`D7578A27`, `DA87CAB9`, `CD3E7254`) and the 16-byte application data (fingerprints `044C1228`, `E24F1E1C`, `77B29C94`) |
 
-- **The shared 32-bit profile value** is not the sender's tick: it differs between sessions but the host and joiner send the same number, so one side takes it from the other
-  (probably from the host's beacon application data, which also changes every session; the log only prints that data's fingerprint). It sits 1 to 10 s before the host's first ping on its clock, with no fixed offset.
+- **The shared 32-bit profile value** is not the sender's tick: it differs between sessions but the host and joiner send the same number. **It is bytes 4 to 7 of the host's
+  beacon application data, read little endian and written big endian** (found 2026-10-04: the 3DS XL's application data was `08 BA B3 23 36 D3 4E 8C 01 00 ...` and both profiles carried `8C 4E D3 36`).
+  A joiner therefore needs the beacon's application data before it can send its profile.
 - **The handshake order is not fixed.** The host's station info arrived at 0.15 s, 0.27 s and 1.25 s in the three sessions, and the joiner re-sent its first messages every 0.5 s until they were acknowledged.
   Implementation consequence: a peer has to keep re-sending unacknowledged setup messages and answer whatever arrives, not follow a script.
 - **Cadences are the same every time:** pings, clock sync requests and the joiner's keep-alive every 2.0 s; the host's keep-alive every 4.0 s (2.0 s in one session); system data every 10.0 s; the host answers 68 to 70 % of clock sync requests in all three.
@@ -473,7 +474,7 @@ Capture 1 timeline: Azahar's party `6f 95 4a 83 31 15` at 21.2 s; the host's `b0
 
 # Open questions
 
-- What the 8 "loss bits" (unit offsets 36 to 43) and the per-run 32-bit value (offsets 48 to 51) mean; where the shared profile value and the opening frame's 4-byte value come from; what the `06` / `01` byte in the profile means. (The 16-byte frame tail is solved: it is the HMAC.)
+- What the 8 "loss bits" (unit offsets 36 to 43) and the per-run 32-bit value (offsets 48 to 51) mean; where the opening frame's 4-byte value comes from (bytes 0 to 3 of the beacon application data is a guess); what the `06` / `01` byte in the profile means. (Solved: the 16-byte frame tail is the HMAC; the "type id" is a CRC; the shared profile value comes from the beacon.)
 - Which of the setup and keep-alive messages the VC actually requires: the pings, the clock sync, the station table, the profile contents, and what it does when one is missing.
 - Why Azahar fails as host (two different failures, see above) while the retail console as host works.
 - Who is the clock master on the VC: the host's `EF` first unit suggests the host, but nothing else in the stream distinguishes the roles.
