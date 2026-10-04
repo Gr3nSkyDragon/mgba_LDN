@@ -25,6 +25,8 @@
 #include <mgba/core/serialize.h>
 #include <mgba/core/version.h>
 #include <mgba/internal/gba/gba.h>
+#include <mgba/internal/gb/sio/uds-keyfile.h>
+#include <QFileInfo>
 
 #ifdef BUILD_SDL
 #define SDL_MAIN_HANDLED
@@ -244,6 +246,11 @@ SettingsView::SettingsView(ConfigController* controller, InputController* inputC
 		}
 	}
 #endif
+
+	connect(m_ui.udsKeyFileBrowse, &QPushButton::clicked, [this]() {
+		selectFile(m_ui.udsKeyFile, tr("Select 3DS UDS key file"), tr("Key files (*.txt);;All files (*)"));
+	});
+	connect(m_ui.udsKeyFile, &QLineEdit::textChanged, this, &SettingsView::updateUdsKeyStatus);
 
 #ifdef M_CORE_GBA
 	connect(m_ui.gbaBiosBrowse, &QPushButton::clicked, [this]() {
@@ -465,6 +472,54 @@ QString SettingsView::makePortablePath(const QString& path) {
 	return path;
 }
 
+// Checks the key file the way the wrapper will read it and says what it found. The key itself is never shown.
+void SettingsView::updateUdsKeyStatus() {
+	const QString path = m_ui.udsKeyFile->text().trimmed();
+	if (path.isEmpty()) {
+		m_ui.udsKeyStatus->setText(QString());
+		return;
+	}
+	uint8_t key[16];
+	QFileInfo info(path);
+	const QString resolved = info.isRelative() ? m_controller->configDir() + QLatin1Char('/') + path : path;
+	const UDSKeyStatus status = udsKeyFileLoad(resolved.toUtf8().constData(), key);
+	QString message = QString::fromUtf8(udsKeyStatusText(status));
+	if (status == UDS_KEY_OK_DERIVED) {
+		// The file only had KeyX and KeyY. Save the finished key as its own file in the config folder (the original is not
+		// touched) and point the setting at it, so the key is not made again and the original is not needed.
+		const QDir dir(m_controller->configDir());
+		QString target;
+		for (int i = 1; i < 100 && target.isEmpty(); ++i) {
+			const QString name = i == 1 ? QStringLiteral("uds_key.txt") : QStringLiteral("uds_key_%1.txt").arg(i);
+			const QString candidate = dir.filePath(name);
+			if (!QFileInfo::exists(candidate)) {
+				if (udsKeyFileWrite(candidate.toUtf8().constData(), key)) {
+					target = candidate;
+				}
+				break; // written, or the folder cannot be written to
+			}
+			uint8_t existing[16];
+			if (udsKeyStatusOk(udsKeyFileLoad(candidate.toUtf8().constData(), existing)) && !memcmp(existing, key, sizeof(key))) {
+				target = candidate; // an earlier run already made this key's file
+			}
+			memset(existing, 0, sizeof(existing));
+		}
+		if (!target.isEmpty()) {
+			m_ui.udsKeyFile->blockSignals(true);
+			m_ui.udsKeyFile->setText(makePortablePath(target));
+			m_ui.udsKeyFile->blockSignals(false);
+			saveSetting("vcwrapper.keyfile", m_ui.udsKeyFile);
+			m_controller->write();
+			message += tr(". The finished key was saved as %1 and this setting now points to that file instead of the original, which was not changed.")
+			               .arg(QDir::toNativeSeparators(target));
+		} else {
+			message += tr(". The finished key could not be saved in the config folder, so the original file is still used.");
+		}
+	}
+	memset(key, 0, sizeof(key));
+	m_ui.udsKeyStatus->setText(message);
+}
+
 void SettingsView::selectBios(QLineEdit* bios) {
 	selectFile(bios, tr("Select BIOS"));
 }
@@ -496,6 +551,7 @@ void SettingsView::updateConfig() {
 	saveSetting("gb.bios", m_ui.gbBios);
 	saveSetting("gbc.bios", m_ui.gbcBios);
 	saveSetting("sgb.bios", m_ui.sgbBios);
+	saveSetting("vcwrapper.keyfile", m_ui.udsKeyFile);
 	saveSetting("sgb.borders", m_ui.sgbBorders);
 	saveSetting("useBios", m_ui.useBios);
 	saveSetting("skipBios", m_ui.skipBios);
@@ -718,6 +774,8 @@ void SettingsView::reloadConfig() {
 	loadSetting("gb.bios", m_ui.gbBios);
 	loadSetting("gbc.bios", m_ui.gbcBios);
 	loadSetting("sgb.bios", m_ui.sgbBios);
+	loadSetting("vcwrapper.keyfile", m_ui.udsKeyFile);
+	updateUdsKeyStatus();
 	loadSetting("sgb.borders", m_ui.sgbBorders, true);
 	loadSetting("useBios", m_ui.useBios);
 	loadSetting("skipBios", m_ui.skipBios);

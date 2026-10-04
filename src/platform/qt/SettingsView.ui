@@ -1549,6 +1549,47 @@
          </property>
         </widget>
        </item>
+       <item row="6" column="0">
+        <widget class="QLabel" name="udsKeyLabel">
+         <property name="toolTip">
+          <string>3DS UDS data key (key slot 0x2D) for the Virtual Console (Gen 1-2) wrapper's real-radio mode. A file in the aes_keys.txt format: either a slot0x2DKeyN line, or slot0x2DKeyX and slot0x2DKeyY.</string>
+         </property>
+         <property name="text">
+          <string>3DS UDS key file:</string>
+         </property>
+        </widget>
+       </item>
+       <item row="6" column="1">
+        <layout class="QHBoxLayout" name="horizontalLayoutUdsKey">
+         <item>
+          <widget class="QLineEdit" name="udsKeyFile">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="udsKeyFileBrowse">
+           <property name="text">
+            <string>Browse</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item row="7" column="1">
+        <widget class="QLabel" name="udsKeyStatus">
+         <property name="text">
+          <string/>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
       </layout>
      </widget>
      <widget class="QWidget" name="paths">

@@ -858,6 +858,97 @@ add_subdirectory(src/gba)
 add_subdirectory(src/sm83)
 add_subdirectory(src/util)
 
+# Unit test for the Virtual Console (UDS) wrapper's Pia codec and joiner session, run against frames from a real capture.
+option(BUILD_UDS_TEST "Build the UDS wrapper unit test (uds-test)" ON)
+if(BUILD_UDS_TEST)
+	add_executable(uds-test
+		src/gb/sio/uds-test.c
+		src/gb/sio/uds-pia.c
+		src/gb/sio/uds-session.c
+		src/util/md5.c)
+	target_include_directories(uds-test PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
+
+	# The same test for the Azahar bridge side, over real localhost sockets.
+	add_executable(uds-bridge-test
+		src/gb/sio/uds-bridge-test.c
+		src/gb/sio/uds-pia.c
+		src/gb/sio/uds-session.c
+		src/gb/sio/uds-room.c
+		src/gb/sio/uds-udp.c
+		src/gb/sio/uds-joiner.c
+		src/gb/sio/uds-air-radio.c
+		src/gb/sio/uds-esp32.c
+		src/gb/sio/uds-ccmp.c
+		src/gb/sio/uds-keyfile.c
+		src/gba/sio/esp32/esp32-serial.c
+		src/util/md5.c)
+	target_include_directories(uds-bridge-test PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
+	if(WIN32)
+		target_link_libraries(uds-bridge-test ws2_32 setupapi)
+	endif()
+
+	# The key-file reader, with made-up values.
+	add_executable(uds-key-test
+		src/gb/sio/uds-key-test.c
+		src/gb/sio/uds-keyfile.c)
+	target_include_directories(uds-key-test PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
+
+	# AES, CCM, the data key and the 802.11 frame builders, against published vectors.
+	add_executable(uds-ccmp-test
+		src/gb/sio/uds-ccmp-test.c
+		src/gb/sio/uds-ccmp.c
+		src/util/md5.c)
+	target_include_directories(uds-ccmp-test PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
+
+	# The same code against frames Azahar logged (needs the user's key file and a log; see the file's header).
+	add_executable(uds-ccmp-golden
+		src/gb/sio/uds-ccmp-golden.c
+		src/gb/sio/uds-ccmp.c
+		src/gb/sio/uds-keyfile.c
+		src/util/md5.c)
+	target_include_directories(uds-ccmp-golden PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
+
+	# The serial framing of Azahar's ESP32 UDS radio board, no hardware needed.
+	add_executable(uds-esp32-test
+		src/gb/sio/uds-esp32-test.c
+		src/gb/sio/uds-esp32.c
+		src/gba/sio/esp32/esp32-serial.c)
+	target_include_directories(uds-esp32-test PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
+	if(WIN32)
+		target_link_libraries(uds-esp32-test setupapi)
+	endif()
+
+	# Joins a retail 3DS Game Boy VC host over the air and runs the Pia session (R3/R4 of the real-air stage).
+	add_executable(uds-air-probe
+		src/gb/sio/uds-air-probe.c
+		src/gb/sio/uds-joiner.c
+		src/gb/sio/uds-air-radio.c
+		src/gb/sio/uds-room.c
+		src/gb/sio/uds-session.c
+		src/gb/sio/uds-pia.c
+		src/gb/sio/uds-udp.c
+		src/gb/sio/uds-esp32.c
+		src/gb/sio/uds-ccmp.c
+		src/gb/sio/uds-keyfile.c
+		src/gba/sio/esp32/esp32-serial.c
+		src/util/md5.c)
+	target_include_directories(uds-air-probe PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
+	if(WIN32)
+		target_link_libraries(uds-air-probe setupapi ws2_32)
+	endif()
+
+	# Talks to the board: prints its firmware and the 3DS hosts it hears (R1/R2 of the real-air stage).
+	add_executable(uds-esp32-probe
+		src/gb/sio/uds-esp32-probe.c
+		src/gb/sio/uds-esp32.c
+		src/gb/sio/uds-room.c
+		src/gba/sio/esp32/esp32-serial.c)
+	target_include_directories(uds-esp32-probe PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
+	if(WIN32)
+		target_link_libraries(uds-esp32-probe setupapi)
+	endif()
+endif()
+
 if(USE_LDND)
 	add_definitions(-DUSE_LDND)
 	add_executable(ldnd-probe

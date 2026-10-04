@@ -940,6 +940,16 @@ void Window::gameStarted() {
 	m_controller->setRFUWrapperLogging(m_rfuLog);
 	m_controller->setRFUESP32Port(m_rfuEsp32Port);
 	m_controller->setRFUCableWrapper(m_rfuCableWrapper);
+	{
+		// The Virtual Console wrapper's real-radio mode reads the 3DS UDS key file named in Settings > BIOS (a relative path is
+		// relative to the config folder).
+		QString keyFile = m_config->getOption("vcwrapper.keyfile").trimmed();
+		if (!keyFile.isEmpty() && QFileInfo(keyFile).isRelative()) {
+			keyFile = ConfigController::configDir() + QLatin1Char('/') + keyFile;
+		}
+		m_controller->setVCKeyFile(keyFile);
+	}
+	m_controller->setVCWrapper(m_vcWrapper);
 	m_controller->setRFUBackend(m_rfuBackend);
 #endif
 	attachWidget(m_display.get());
@@ -1668,6 +1678,18 @@ void Window::setupMenu(QMenuBar* menubar) {
 			m_controller->setRFUCableWrapper(m_rfuCableWrapper);
 		}
 	}, this);
+	// Not part of the wireless adapter: a Game Boy (not GBA) link cable signal carried inside a UDS wrapper, so a Gen 1-2
+	// Pokemon game on the Game Boy core can trade with the 3DS Virtual Console release (doc/uds-wrapper-plan.md). It sits
+	// in this menu only because the menu is where the Cable wrapper box is. The label is a placeholder and, for now, the
+	// box only records the choice; nothing is attached. Saved as vcwrapper.enabled.
+	ConfigOption* vcWrapper = localOption("vcwrapper.enabled");
+	vcWrapper->addBoolean(tr("Virtual Console (Gen 1-2)"), &m_actions, "rfu");
+	vcWrapper->connect([this](const QVariant& value) {
+		m_vcWrapper = value.toBool();
+		if (m_controller) {
+			m_controller->setVCWrapper(m_vcWrapper);
+		}
+	}, this);
 	// Which board the ESP32 backend opens: the ones plugged in are listed (Refresh looks again), and Auto-detect takes the
 	// first of them. Per window like the rest; only the first window saves it.
 	m_actions.addMenu(tr("ESP32 board"), "rfuEsp32", "rfu");
@@ -1722,6 +1744,7 @@ void Window::setupMenu(QMenuBar* menubar) {
 	m_config->setOption("rfuwrap.backend", "off");
 	m_config->setOption("rfuwrap.log", 0);
 	cableWrapper->setValue(QVariant(savedOr("rfu.cableWrapper", "0").toInt() != 0));
+	vcWrapper->setValue(QVariant(savedOr("vcwrapper.enabled", "0").toInt() != 0));
 	rfuBackend->setValue(QVariant(savedOr("rfu.backend", "off")));
 	m_actions.setMenuVisible("rfuEsp32", m_rfuBackend == QLatin1String("esp32"));
 

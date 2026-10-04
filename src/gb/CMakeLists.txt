@@ -29,7 +29,17 @@ endif()
 
 set(SIO_FILES
 	sio/lockstep.c
-	sio/printer.c)
+	sio/printer.c
+	sio/uds-pia.c
+	sio/uds-session.c
+	sio/uds-room.c
+	sio/uds-udp.c
+	sio/uds-joiner.c
+	sio/uds-gblink.c
+	sio/uds-keyfile.c
+	sio/uds-ccmp.c
+	sio/uds-esp32.c
+	sio/uds-air-radio.c)
 
 set(EXTRA_FILES
 	extra/proxy.c)

@@ -86,7 +86,7 @@ Everything else waits forever. A stalled partner never causes a crash, but it ma
 
 # The cable club, from the receptionist to the table
 
-Hook names in brackets are the VC hooks that sit at the same place in the ROM. See [The 3DS Virtual Console link](vc_link.md).
+Hook names in brackets are the VC hooks that sit at the same place in the ROM. See [The 3DS Virtual Console link](vc_link.md); the addresses and what the mGBA wrapper does at each hook are in [How the mGBA wrapper uses the Game Boy link](#how-the-mgba-wrapper-uses-the-game-boy-link).
 
 ## 1. The receptionist (`CableClubNPC`)
 
@@ -262,6 +262,35 @@ three rounds (enter, after trade, after trade back).
 - **The Trade Center** has no clean exit [user-reported, not in the source I read]: the way out is the Reset entry that replaces Save in the start menu. A session therefore has no teardown exchange.
 - **Leaving the selection screen** is the `$6F` (Cancel) nybble. **[measured]** Every trade capture ends with a run of `6F` from both sides (4 to 7 exchanges).
 
+# How the mGBA wrapper uses the Game Boy link
+
+The wrapper (see [The 3DS Virtual Console link](vc_link.md#the-mgba-wrapper-a-game-boy-core-as-a-vc-joiner-measured-live)) leaves the ROM unmodified and runs its link code as it is. Only the places the VC itself replaces are hooked, with breakpoints at the pret `vc_hook` addresses;
+everything else (`Serial_ExchangeByte`, `Serial_ExchangeBytes`, `Serial_SendZeroByte`, the receptionist's text, the trade screen) runs natively on a serial device whose transfers are paired with the peer's units.
+Addresses are bank:address in the pret builds (`docs/hook_table`); a game is recognised by the first 11 characters of its header title.
+
+| routine | Red and Blue | Yellow | in the wrapper |
+|---|---|---|---|
+| `Link_fake_connection_status` | 01:7202 | 01:7077 | sets `hSerialConnectionStatus` to `$02`; serial transfers are not paired until the next hook |
+| `Wireless_prompt` | 01:7260 | 01:70D8 | ends that stretch |
+| `Serial_SyncAndExchangeNybble` (`Wireless_WaitLinkTransfer`) | 00:227F, `ret` at 00:22C2 | 00:20DB, `ret` at 00:211E | replaced: exchanges `60 + nybble` units with the host (see the VC page) and returns the host's nybble |
+| `Serial_ExchangeLinkMenuSelection` | 00:2247, `ret` at 00:226D | 00:20A3, `ret` at 00:20C9 | replaced: three selection units out, the last `D0`-class byte of three in |
+| `DelayFrame` | 00:20AF | 00:1E64 | used to wait: a hook that cannot finish pushes its own address and jumps here |
+
+| RAM | address (all three games) |
+|---|---|
+| `hSerialConnectionStatus` | `$FFAA` |
+| `wSerialExchangeNybbleSendData` / `wLinkMenuSelectionSendBuffer` (two bytes) | `$CC42` |
+| `wSerialExchangeNybbleReceiveData` | `$CC3E` |
+| `wSerialSyncAndExchangeNybbleReceiveData` / `wLinkMenuSelectionReceiveBuffer` (two bytes) | `$CC3D` |
+| `wUnknownSerialCounter` (16-bit) | `$CC47` |
+
+A hook that finishes sets the registers the ROM routine would leave (for the nybble sync: A = the nybble, B = 0, Z set; for both, BC, DE and HL as on entry) and continues at the routine's own `ret`.
+The other VC hooks (`Wireless_net_stop` / `Wireless_net_end` on the Cancel path, `Trade_save_game_end`, the battle exchanges and the 26-frame delays) are not needed for a trade and are not implemented. Yellow has the table
+above but was not tried; Gold, Silver and Crystal (`POKEMON_GLD`, `POKEMON_SLV`, `PM_CRYSTAL`) are recognised and refused.
+
+What a native transfer looks like to the ROM: the byte on the wire for transfer *k* is `rSB` when the transfer starts (the **previous** exchange's `hSerialSendData`: the sent byte lags one exchange, see the interrupt handler above),
+and the byte received is the peer's unit *k*. `$FE` from the peer means "no data" and `Serial_ExchangeByte` retries after a frame.
+
 # Measurement notes
 
 - **Phase landmarks in a byte stream.** Runs of `$FD` mark block starts: RN list (7 plus repeats), player block (6 plus repeats), patch lists (3 plus repeats).
@@ -284,8 +313,8 @@ three rounds (enter, after trade, after trade back).
 
 # Open questions
 
-- The 3 unexplained exchanges between the player block and the patch lists in the Virtual Console captures (and why the cartridge trace shows the same 427 span).
-- Which console is master when both ROMs reach the receptionist at once: on hardware the `$01`/`$02` handshake settles it. The Virtual Console has no such bytes on the wire;
-  its host sends a single `EF` as its first unit instead (see the VC page).
+- The 3 unexplained exchanges between the player block and the patch lists in the Virtual Console captures (and why the cartridge trace shows the same 427 span). **[inferred]** They come from the ROM's own exchange loop, not from the VC: the wrapper runs that loop natively and the VC accepts the stream.
+- Which console is master when both ROMs reach the receptionist at once: on hardware the `$01`/`$02` handshake settles it. The Virtual Console has no such bytes on the wire: its hook forces `hSerialConnectionStatus` to
+  `$02` on both consoles, and its host sends a single `EF` as its first unit (see the VC page). The mGBA wrapper does the same hook and trades.
 - The exact behaviour of `wUnknownSerialCounter2` in a real cable.
 - Everything for Gen 2, including the Time Capsule room and whether Gen 2 has a clean exit.

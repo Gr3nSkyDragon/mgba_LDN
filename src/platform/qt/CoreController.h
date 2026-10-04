@@ -8,11 +8,13 @@
 #include <QByteArray>
 #include <QFile>
 #include <QList>
+#include <QElapsedTimer>
 #include <QMutex>
 #include <QObject>
 
 #include <atomic>
 #include <QSize>
+#include <QTimer>
 
 #include "VFileDevice.h"
 
@@ -26,6 +28,7 @@
 
 #ifdef M_CORE_GB
 #include <mgba/internal/gb/sio/printer.h>
+#include <mgba/internal/gb/sio/uds-gblink.h>
 #endif
 #ifdef M_CORE_GBA
 #include <mgba/internal/gba/sio/dolphin.h>
@@ -218,6 +221,13 @@ public slots:
 	void setRFUCableWrapper(bool enabled);
 	void setRFUWrapperLogging(bool enabled);
 	bool rfuWrapperEnabled() const;
+	// Virtual Console (Gen 1-2): the Game Boy link cable carried over UDS to the 3DS VC. Not a wireless-adapter feature.
+	// Puts the Game Boy link driver (src/gb/sio/uds-gblink.c) on the core: a ghost joiner on the Local backend's UDP pair to
+	// Azahar, the ROM hooks, and the serial device. Needs a Game Boy core running Red, Blue or Yellow.
+	void setVCWrapper(bool enabled);
+	bool vcWrapperRequested() const { return m_vcWrapper; }
+	// The 3DS UDS key file the real-radio mode needs (Settings > BIOS), as a path the program can open.
+	void setVCKeyFile(const QString& path);
 	// The connection of the attached wireless adapter's backend, or else the RFU Cable Wrapper's wireless side, for the
 	// status menu. False when neither is attached. `backend` gets its name, `wrapper` whether it is the wrapper's.
 	bool rfuStatus(GBASIORFUBackendStatus* out, QString* backend, bool* wrapper) const;
@@ -398,6 +408,14 @@ private:
 	QString m_rfuWrapperConnection; // the connection the attached wrapper was started with
 	QByteArray m_rfuWrapperConnectionName;
 	bool m_rfuCableWrapper = false; // the menu's "Cable wrapper": m_rfuRequestedBackend drives the wrapper
+	bool m_vcWrapper = false; // the menu's "Virtual Console (Gen 1-2)"
+	void applyVC();
+	void stopVC();
+	GBVCLink* m_vcLink = nullptr;
+	bool m_vcLinkRadio = false; // what the running link was made for, to restart it when the choice changes
+	QString m_vcLinkPort;
+	QString m_vcLinkKey;
+	QString m_vcKeyFile;
 	bool m_rfuWrapperLogEnabled = false; // "Save adapter log" of the wrapper: <config dir>/rfu-wrapper-trace.log
 	bool m_rfuWrapperTraceHeld = false; // this controller holds a reference on the cable trace file
 	QByteArray m_eReaderData;
