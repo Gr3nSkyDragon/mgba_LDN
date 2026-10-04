@@ -28,7 +28,7 @@
 
 #ifdef M_CORE_GB
 #include <mgba/internal/gb/sio/printer.h>
-#include <mgba/internal/gb/sio/uds-joiner.h>
+#include <mgba/internal/gb/sio/uds-gblink.h>
 #endif
 #ifdef M_CORE_GBA
 #include <mgba/internal/gba/sio/dolphin.h>
@@ -222,8 +222,8 @@ public slots:
 	void setRFUWrapperLogging(bool enabled);
 	bool rfuWrapperEnabled() const;
 	// Virtual Console (Gen 1-2): the Game Boy link cable carried over UDS to the 3DS VC. Not a wireless-adapter feature.
-	// For now it only runs the UDS join (an auto-joining UDSJoiner on the Local backend's UDP pair to Azahar) and logs its
-	// progress; nothing is attached to the Game Boy link port yet.
+	// Puts the Game Boy link driver (src/gb/sio/uds-gblink.c) on the core: a ghost joiner on the Local backend's UDP pair to
+	// Azahar, the ROM hooks, and the serial device. Needs a Game Boy core running Red, Blue or Yellow.
 	void setVCWrapper(bool enabled);
 	bool vcWrapperRequested() const { return m_vcWrapper; }
 	// The connection of the attached wireless adapter's backend, or else the RFU Cable Wrapper's wireless side, for the
@@ -408,13 +408,8 @@ private:
 	bool m_rfuCableWrapper = false; // the menu's "Cable wrapper": m_rfuRequestedBackend drives the wrapper
 	bool m_vcWrapper = false; // the menu's "Virtual Console (Gen 1-2)"
 	void applyVC();
-	void pollVC();
 	void stopVC();
-	std::unique_ptr<UDSJoiner> m_vcJoiner;
-	QTimer* m_vcTimer = nullptr;
-	QElapsedTimer m_vcClock;
-	int m_vcLastRoom = -1;
-	int m_vcLastSession = -1;
+	GBVCLink* m_vcLink = nullptr;
 	bool m_rfuWrapperLogEnabled = false; // "Save adapter log" of the wrapper: <config dir>/rfu-wrapper-trace.log
 	bool m_rfuWrapperTraceHeld = false; // this controller holds a reference on the cable trace file
 	QByteArray m_eReaderData;

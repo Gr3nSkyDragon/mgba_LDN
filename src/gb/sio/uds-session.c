@@ -584,6 +584,14 @@ bool udsSessionPopUnit(struct UDSSession* session, uint8_t* byte) {
 	return true;
 }
 
+bool udsSessionPeekUnit(const struct UDSSession* session, uint8_t* byte) {
+	if (!session->recvCount) {
+		return false;
+	}
+	*byte = session->recvRing[session->recvHead];
+	return true;
+}
+
 size_t udsSessionUnitsWaiting(const struct UDSSession* session) {
 	return session->recvCount;
 }

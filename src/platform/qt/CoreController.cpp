@@ -241,7 +241,7 @@ CoreController::CoreController(mCore* core, QObject* parent)
 }
 
 CoreController::~CoreController() {
-	stopVC();
+	stopVC(); // while the core thread still runs: the link detaches from a live core
 	endVideoLog();
 	stop();
 	disconnect();
@@ -1372,81 +1372,35 @@ void CoreController::setVCWrapper(bool enabled) {
 	applyVC();
 }
 
-// The Virtual Console wrapper needs a Game Boy core, the box ticked and Wireless Adapter > Local (the only air it has so far:
-// the UDP pair to Azahar's test bridge, AZAHAR_UDS_BRIDGE). Like the RFU Cable Wrapper's wireless side it does not wait for
-// the game: the join starts at once and takes the first matching beacon, so it is up before the game opens its link.
+// The Virtual Console wrapper needs a Game Boy core running one of the known games, the box ticked and Wireless Adapter >
+// Local (the only air it has so far: the UDP pair to Azahar's test bridge, AZAHAR_UDS_BRIDGE). Like the RFU Cable Wrapper's
+// wireless side it does not wait for the game: the join starts at once and takes the first matching beacon, so it is up
+// before the game opens its link. The link is created and destroyed with the core stopped.
 void CoreController::applyVC() {
 	const bool wanted = m_vcWrapper && platform() == mPLATFORM_GB && m_rfuRequestedBackend == QLatin1String("local");
 	if (!wanted) {
 		stopVC();
 		return;
 	}
-	if (m_vcJoiner) {
+	if (m_vcLink) {
 		return;
 	}
-	m_vcJoiner = std::make_unique<UDSJoiner>();
-	uint16_t name[UDS_NAME_WORDS] = {'M', 'G', 'B', 'A'};
-	uint16_t listenPort, sendPort;
-	udsUdpPortsFromEnvironment(&listenPort, &sendPort);
-	if (!udsJoinerOpen(m_vcJoiner.get(), name, listenPort, sendPort)) {
-		LOG(QT, ERROR) << tr("Virtual Console: cannot listen on 127.0.0.1:%1 (is another mGBA using it?)").arg(listenPort);
-		m_vcJoiner.reset();
-		return;
+	Interrupter interrupter(this);
+	clearMultiplayerController();
+	uint16_t name[GBVC_NAME_WORDS] = {'M', 'G', 'B', 'A'};
+	m_vcLink = GBVCLinkCreate(m_threadContext.core, &m_debugger, name, 0, 0);
+	if (!m_vcLink) {
+		LOG(QT, ERROR) << tr("Virtual Console: could not start (see the log above)");
 	}
-	LOG(QT, INFO) << tr("Virtual Console: waiting for Azahar's UDS bridge, listening on 127.0.0.1:%1, sending to %2")
-	                     .arg(listenPort).arg(sendPort);
-	m_vcLastRoom = -1;
-	m_vcLastSession = -1;
-	m_vcClock.start();
-	if (!m_vcTimer) {
-		m_vcTimer = new QTimer(this);
-		m_vcTimer->setInterval(5);
-		connect(m_vcTimer, &QTimer::timeout, this, &CoreController::pollVC);
-	}
-	m_vcTimer->start();
 }
 
 void CoreController::stopVC() {
-	if (m_vcTimer) {
-		m_vcTimer->stop();
-	}
-	if (m_vcJoiner) {
-		udsJoinerClose(m_vcJoiner.get());
-		m_vcJoiner.reset();
-		LOG(QT, INFO) << tr("Virtual Console: join stopped");
-	}
-}
-
-void CoreController::pollVC() {
-	if (!m_vcJoiner) {
+	if (!m_vcLink) {
 		return;
 	}
-	udsJoinerPoll(m_vcJoiner.get(), static_cast<uint32_t>(m_vcClock.elapsed()));
-	const UDSRoom& room = m_vcJoiner->room;
-	if (room.state != m_vcLastRoom) {
-		static const char* const names[] = {"scanning for a host", "authenticating", "associated, EAPoL start sent",
-		                                    "joined"};
-		m_vcLastRoom = room.state;
-		if (room.state == UDS_ROOM_SCAN) {
-			LOG(QT, INFO) << tr("Virtual Console: %1 (beacons seen: %2, packets received: %3)")
-			                     .arg(names[room.state]).arg(room.beaconsSeen).arg(room.packetsReceived);
-		} else if (room.state == UDS_ROOM_JOINED) {
-			LOG(QT, INFO) << tr("Virtual Console: joined Azahar's network %1 as node %2 (%3 nodes)")
-			                     .arg(room.host.networkId, 8, 16, QLatin1Char('0')).arg(room.host.nodeId)
-			                     .arg(room.host.connectedNodes);
-		} else {
-			LOG(QT, INFO) << tr("Virtual Console: %1 (network %2)").arg(names[room.state])
-			                     .arg(room.host.networkId, 8, 16, QLatin1Char('0'));
-		}
-	}
-	if (m_vcJoiner->sessionActive && m_vcJoiner->session.state != m_vcLastSession) {
-		static const char* const names[] = {"idle", "exchanging setup messages", "joined: game stream may start", "closed"};
-		m_vcLastSession = m_vcJoiner->session.state;
-		LOG(QT, INFO) << tr("Virtual Console: Pia session %1 (frames in %2, out %3)").arg(names[m_vcLastSession])
-		                     .arg(m_vcJoiner->session.framesReceived).arg(m_vcJoiner->session.framesSent);
-	} else if (!m_vcJoiner->sessionActive) {
-		m_vcLastSession = -1;
-	}
+	Interrupter interrupter(this);
+	GBVCLinkDestroy(m_vcLink);
+	m_vcLink = nullptr;
 }
 
 void CoreController::setRFUWrapperLogging(bool enabled) {

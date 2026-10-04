@@ -149,6 +149,7 @@ void udsSessionFlush(struct UDSSession* session, uint32_t nowMs);
 
 // Units received from the host, in order. False when none is waiting.
 bool udsSessionPopUnit(struct UDSSession* session, uint8_t* byte);
+bool udsSessionPeekUnit(const struct UDSSession* session, uint8_t* byte); // the next unit, left in place
 size_t udsSessionUnitsWaiting(const struct UDSSession* session);
 
 // The 36-byte payload of a game-stream unit (a reliable-stream data record carrying one Game Boy serial byte).
