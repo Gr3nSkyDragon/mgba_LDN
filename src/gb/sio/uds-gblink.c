@@ -11,6 +11,7 @@
 #include <mgba/internal/gb/io.h>
 #include <mgba/internal/gb/sio/uds-cable.h>
 #include <mgba/internal/gb/sio/uds-joiner.h>
+#include <mgba/internal/gb/sio/uds-wire.h>
 #include <mgba/internal/sm83/sm83.h>
 
 #include <stdarg.h>
@@ -77,6 +78,10 @@ struct GBVCLink {
 	const struct VCGame* game;
 	struct UDSJoiner joiner;
 	struct UDSCable cable; // the part of the translation that does not need the emulator (uds-cable.c)
+	struct UDSWire wire; // wire mode: the permanent slave (uds-wire.c); then the ROM hooks and `cable` above are not used
+	bool wireMode;
+	int lastWirePhase;
+	unsigned wireExchanges;
 
 	bool attachedDriver;
 	bool attachedModule;
@@ -274,6 +279,8 @@ static void _logStates(struct GBVCLink* link) {
 	}
 }
 
+static const char* const kWirePhases[] = {"down", "role", "idle", "sync", "menu", "pass"};
+
 // A line every 5 s in the trace, so a quiet stretch can be told from a trace that simply ended: where the ROM is, which hook
 // ran last and how long ago, whether a transfer is waiting, and the unit counts.
 static void _heartbeat(struct GBVCLink* link, uint32_t now) {
@@ -282,6 +289,13 @@ static void _heartbeat(struct GBVCLink* link, uint32_t now) {
 	}
 	link->lastHeartbeatMs = now;
 	struct SM83Core* cpu = link->core->cpu;
+	if (link->wireMode) {
+		_trace(link, "heartbeat: pc %02X:%04X map %02X linkstate %02X conn %02X, wire %s, exchanges %u, units sent %u received %u (%u waiting)",
+		       link->gb->memory.currentBank, cpu->pc, _read8(link, link->game->curMap), _read8(link, link->game->linkState),
+		       _read8(link, link->game->connectionStatus), kWirePhases[link->wire.phase], link->wireExchanges, link->txUnits,
+		       link->rxUnits, (unsigned) udsSessionUnitsWaiting(&link->joiner.session));
+		return;
+	}
 	_trace(link, "heartbeat: pc %02X:%04X map %02X linkstate %02X conn %02X, last hook %s %.1f s ago, %s, transfer %s, units sent %u received %u (%u waiting)",
 	       link->gb->memory.currentBank, cpu->pc, _read8(link, link->game->curMap), _read8(link, link->game->linkState),
 	       _read8(link, link->game->connectionStatus), link->lastHookName ? link->lastHookName : "none",
@@ -331,6 +345,49 @@ static void _poll(struct mTiming* timing, void* context, uint32_t cyclesLate) {
 	}
 
 	mTimingSchedule(timing, &link->event, GBVC_POLL_CYCLES - cyclesLate);
+}
+
+// Wire mode: the cartridge is the master and the front end (uds-wire.c) is its slave ----------------------------------------
+
+static bool _wirePortReady(void* context) {
+	const struct GBVCLink* link = context;
+	return link->joiner.sessionActive && link->joiner.session.state == UDS_STATE_JOINED;
+}
+
+static void _wirePoll(struct mTiming* timing, void* context, uint32_t cyclesLate) {
+	struct GBVCLink* link = context;
+	uint32_t now = _nowMs() - link->startMs;
+	udsJoinerPoll(&link->joiner, now);
+	_logStates(link);
+	_heartbeat(link, now);
+	udsWirePoll(&link->wire, now);
+	if ((int) link->wire.phase != link->lastWirePhase) {
+		if (link->lastWirePhase < 0 || link->wire.phase == UDS_WIRE_ROLE || link->wire.phase == UDS_WIRE_DOWN) {
+			mLOG(GB_SIO, INFO, "Virtual Console: wire %s", kWirePhases[link->wire.phase]);
+		}
+		_trace(link, "wire phase: %s", kWirePhases[link->wire.phase]);
+		link->lastWirePhase = (int) link->wire.phase;
+	}
+	link->started = link->wire.phase != UDS_WIRE_DOWN;
+	mTimingSchedule(timing, &link->event, GBVC_POLL_CYCLES - cyclesLate);
+}
+
+// The cartridge started a transfer as master: its byte goes to the front end, the slave's reply is what the built-in shifter
+// will shift in. A transfer the cartridge arms as slave (external clock) is never clocked; the slave never clocks anything.
+static uint8_t _wireWriteSC(struct GBSIODriver* driver, uint8_t value) {
+	struct GBVCLink* link = (struct GBVCLink*) driver;
+	if ((value & 0x81) == 0x81) {
+		uint32_t now = _nowMs() - link->startMs;
+		uint8_t master = link->gb->memory.io[GB_REG_SB];
+		uint8_t reply = udsWirePreload(&link->wire);
+		link->gb->sio.pendingSB = reply;
+		udsWireExchanged(&link->wire, now, master);
+		++link->wireExchanges;
+		if (link->trace && link->wireExchanges <= 8000) {
+			_trace(link, "wire %02X -> %02X [%s]", master, reply, kWirePhases[link->wire.phase]);
+		}
+	}
+	return value;
 }
 
 // The serial device ---------------------------------------------------------------------------------------------------
@@ -523,7 +580,12 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 		     title);
 		return NULL;
 	}
-	if (!debugger) {
+	bool wire = config->wire;
+	const char* wireEnv = getenv("MGBA_VCLINK_WIRE");
+	if (wireEnv && *wireEnv && *wireEnv != '0') {
+		wire = true;
+	}
+	if (!wire && !debugger) {
 		mLOG(GB_SIO, ERROR, "Virtual Console: this build has no debugger, so the ROM hooks cannot be installed");
 		return NULL;
 	}
@@ -536,6 +598,20 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 	link->lastSession = -1;
 	link->lastRadio = -1;
 	link->fakeBeginId = link->fakeEndId = link->syncId = link->menuId = -1;
+	link->wireMode = wire;
+	link->lastWirePhase = -1;
+	if (wire) {
+		udsWireInit(&link->wire, &(struct UDSUnitPort) {
+			.context = link,
+			.ready = _wirePortReady,
+			.queue = _portQueue,
+			.flush = _portFlush,
+			.pop = _portPop,
+			.peek = _portPeek,
+			.waiting = _portWaiting,
+			.trace = _portTrace,
+		});
+	}
 	udsCableInit(&link->cable, &(struct UDSUnitPort) {
 		.context = link,
 		.ready = _portReady,
@@ -570,7 +646,20 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 	link->d.init = _driverInit;
 	link->d.deinit = _driverDeinit;
 	link->d.writeSB = _driverWriteSB;
-	link->d.writeSC = _driverWriteSC;
+	link->d.writeSC = wire ? _wireWriteSC : _driverWriteSC;
+
+	if (wire) {
+		GBSIOSetDriver(&link->gb->sio, &link->d);
+		link->attachedDriver = true;
+		link->event.context = link;
+		link->event.name = "GB VC wire";
+		link->event.callback = _wirePoll;
+		link->event.priority = 0x40;
+		mTimingSchedule(&link->gb->timing, &link->event, GBVC_POLL_CYCLES);
+		mLOG(GB_SIO, INFO, "Virtual Console: %s in wire mode (the ROM is the master of a link cable; no ROM hooks)", game->title);
+		_trace(link, "created for %s, wire mode", game->title);
+		return link;
+	}
 
 	if (!core->debugger) {
 		mDebuggerAttach(debugger, core);

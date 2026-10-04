@@ -337,3 +337,70 @@ master clocks) and `udsWireExchanged(now, byte)`. Phases DOWN, ROLE, IDLE, SYNC,
 3DS and a 3DS that never answers, and replays the first 99 recorded exchanges (`uds-wire-test-vectors.h`): the sync starts at exchange 4 and ends at 67 as in the recording,
 and the 3DS receives exactly the units its side of the sync produces on its own. Not yet: the link menu and the `fd` blocks as phases of their own (bulk buffering),
 a second sync in the room (needs the block context to tell it from data), the mGBA driver around it (step 4).
+
+### 9.3 Step 3 continued and step 4: menu, gaps, and wire mode in mGBA
+
+`uds-wire` now also has IDLE (between phases: 00 and FE are stale bytes), SYNC with the cartridge's own loops counted (loops 1 and 2 on 6x bytes, ten zeros in
+loop 3, the tenth stranded into the next burst), MENU and PASS, and a quiet gap (400 ms) that ends MENU and PASS (every sync in the recordings follows one).
+Rules taken from comparing a complete hook-wrapper trade (unit stream) with the cable recording (wire stream):
+
+* MENU: units only for Dx bytes (three per call, as the hook wrapper; the cycle's leading 00 is stale and held), replies are the 3DS's selection; the held 00
+  is sent as the final transfer when the menu ends; if the 3DS pressed first, its further units are answered with its choice (uds-cable's echo). At most
+  12 menu units go out ahead of the 3DS's.
+* SYNC end: a 6x starts the next sync, a Dx the menu, anything else raw exchange, which begins with the byte that preceded the sync (the hook wrapper's
+  `fe 00 00 fd...` after the first room sync, `00 00 00 fd...` after the second). The byte that ends the sync is an exchange like any other: zero bytes are
+  plain transfer starts and are not retried after FE, so dropping it would leave the 3DS a unit short.
+* After a gap that ended PASS, the first byte is the last byte of the block stranded by the lag, and is sent.
+
+Wire mode in mGBA (`MGBA_VCLINK_WIRE=1`, or `GBVCLinkConfig.wire`; `run-mgba-vc-wire.cmd`): `uds-gblink.c` installs no breakpoints and no debugger module. Its
+serial driver's `writeSC` takes a master start (`SC & 0x81 == 0x81`), asks the front end for the slave's byte, puts it in `pendingSB` for the built-in shifter and
+tells the front end the master's byte. The trace has every exchange as `wire master -> slave [phase]` plus the unit lines and a heartbeat. The hook mode is
+untouched and is the fallback. Open: blocks are still pass-through without bulk buffering; the first live runs decide whether that is enough.
+
+### 9.4 First live wire-mode run (2026-10-05, mGBA to Azahar, Blue)
+
+Role handshake, first sync, menu (3DS pressed first, echo armed), room, first sync in the room and the blocks all worked. The trade selection did not: Azahar sat on
+"Waiting" while the cartridge ran the whole trade animation alone. Cause, from `logs/vclink/vclink_1791131356.txt` and Azahar's stream by unit index: our units and the
+3DS's were equal in number, but the read position lagged the send position by a constant 14 to 15 units (the heartbeat's "(15 waiting)") from the menu on. The menu sent up
+to 12 units without reading the partners and the echo added more, so every later phase read the 3DS's units 15 positions late: the second nybble-2 sync was answered
+from an old nybble-0 unit after 5 units (the working hook trade waited 61), and the cartridge ran ahead of the 3DS. The 3DS's own sync bursts are sparse (a few 6x units, FE
+between) in the working trade as well, so the burst shape was not the problem.
+
+Fix: `readDebt`. Every unit sent without reading its partner (menu units, the held final 00, the stale unit injected at a sync's end, the stranded unit after a gap) adds
+one; the debt is paid by reading and dropping the 3DS's units as they arrive, before any other reader (the sync, pass-through replies, the echo) may read, and the echo
+arms only once it is paid. `uds-wire-test` has 69 checks. Not yet re-run live.
+
+### 9.5 Second live wire-mode run: the glitched trade menu (2026-10-05)
+
+With the read debt the menu and the first room sync were right (`received 137 (1 waiting)` at the end of the menu), but the cartridge's trade menu was corrupted. In a block
+the ROM runs with only the serial interrupt enabled, so `Serial_ExchangeByte` does not retry after FE: it returns it, and `Serial_ExchangeBytes` stores it. Every reply that was FE
+because the 3DS's next unit had not arrived yet was therefore stored as a data byte (the last byte of the patch lists was one), and each such exchange also left its unit's partner
+unread, which is where the 12-unit lag inside the blocks came from. Replying FE is only safe while the cartridge is ignoring replies (before the block's first fd).
+
+Block gate in `uds-wire`: in PASS the first fd of a block is held (FE, which the cartridge ignores) until the whole block is queued (17, 424 and 200 replies after that fd, the three blocks of an exchange
+in order; PASS starts at block 0); from the fd on every reply comes from the queue. If one is missing anyway the cartridge gets an FE as data, the underrun is counted, the unit's partner
+is owed and dropped when it arrives, so the stream does not shift. The debt is also paid synchronously when a reply is needed. Trace lines: `block N opens, M units queued`, `block N done (K replies were FE inside it)`.
+Checked offline by modelling what the cartridge stores from the 3DS's units in both the working hook trade and the glitched run: the random-number and player blocks have the same layout (7 and 5 leading fd) in both.
+
+### 9.6 Third live run: the block gate deadlocked (2026-10-05)
+
+The gate of 9.5 held the first fd of a block until the whole block was queued from the 3DS, and the retry rule withheld a unit when the cartridge repeated a byte. Together they
+stalled both consoles after the room sync: `sent 192 received 191 (2 waiting)` unchanged for 50 s while the cartridge made 700 exchanges a second. The 3DS's exchanges block until they
+have our unit, so it produces its next unit only when it has received one of ours; nothing of ours went out, so nothing of its arrived, so the gate never opened.
+
+Rewrite of PASS: it has its own receive buffer (`rx`, 1024). Every exchange of the cartridge sends a unit (while only waiting, at most `UDS_WIRE_PENDING_MAX` = 12 ahead of the units
+read; inside a block's data always), and the 3DS's units are read into the buffer as they arrive. The cartridge is answered from the buffer: FE while it is empty, the first fd of a
+block held until the buffer holds the whole block, then every byte at wire speed. The retry/outstanding rule is gone from PASS. An FE stored inside a block (buffer empty) is counted and the
+3DS's next unit dropped, so the block does not shift. `testBlockLoop` runs a cartridge model (ignore until fd, then store 17, 424 and 200 replies) against a 3DS that releases its
+next scripted unit only on receiving one of ours: all three blocks complete and are stored byte for byte. 86 checks.
+
+### 9.7 Fourth live run: block 1 never opened (2026-10-05)
+
+With the receive buffer, block 0 (random numbers) opened with 263 units buffered and finished with no FE inside it; block 1 (the player block) never opened. The 3DS had sent exactly its own
+424 units for it (a run of fd, then the data) and nothing after; the cartridge stores 424 replies after the fd that ends its ignoring, so its last stored byte is the first fd of the next
+block's preamble, which the 3DS produces only once it has received our player block. The gate waited for 425 units, so it held the fd, we sent nothing more (the cap), the 3DS produced nothing:
+the same circular wait as before, one unit later.
+
+Gate now needs `size` units. If the buffer is empty when only the block's last byte is missing, a stand-in is replied (fd for the player block, 00 otherwise) and the real unit dropped when it arrives
+(`block N: the last byte was not there yet, filled in`). `testBlockLoop` now uses a 3DS that creates the random-number and player blocks at once on our first unit and withholds the next block until it
+has received 470 of ours; with the old gate it stops after one block, as in the live run (checked by restoring it). `testLastByte` covers the stand-in. 107 checks.
