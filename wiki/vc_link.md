@@ -6,14 +6,14 @@ nav_order: 2
 
 # The 3DS Virtual Console link, and what runs on it
 
-Measured from five captures, all Azahar (VC Red, `uds-real` branch) against a retail 3DS (VC Red) over the air. In three of them the retail console hosts and
+Measured from six captures of retail 3DS consoles and Azahar (VC Red, `uds-real` branch) over the air, and from live traces of the mGBA wrapper (last section). Five captures are Azahar against a retail 3DS (VC Red). In three of them the retail console hosts and
 Azahar joins, and each trades one Pokémon and trades it back; in the other two Azahar hosts and the retail console joins (neither completed).
 Logs are in `logs/azahar/`: `azahar_log_original_trade_20261003.txt` (SHA-256 `18c6b5ef...`), `azahar_log_prev_launch_20261003-1924.txt`,
 `azahar_log_repeat_trade_20261003.txt`, `azahar_log_roleswap_host_20261003.txt`, `azahar_log_roleswap_host2_20261003.txt` (each with a `.sha256`). Reproduce with
 `docs/azahar/azahar_log_to_jsonl.py`, `pia_messages.py`, `verify_vc_hmac.py` and `align_azahar_mgba.py`. The Game Boy side is on
 [The Game Boy link](gb_link.md). Tags as there: **[measured]**, **[src]** (pret source or the VC hook table), **[unknown]**.
 
-Unless a section says otherwise, a number comes from the first capture and a statement held in every capture. Other games (Blue, Yellow, Gen 2), a retail-to-retail capture and battles are not captured yet.
+Unless a section says otherwise, a number comes from the first capture and a statement held in every capture. The sixth capture is a passive sniff of a retail 3DS XL hosting VC Red and a retail 2DS joining (2026-10-04, `azahar_log_sniff_retail_20261004.txt`); the wrapper's traces are `logs/vclink/` and `logs/azahar/azahar_log_vclink_*`. Yellow, Gen 2 and battles are not captured yet.
 
 # What the VC is
 
@@ -56,8 +56,8 @@ Top to bottom, for one Game Boy byte:
 | 802.11 | beacons with the Nintendo vendor element, association, EAPOL 4-way handshake, CCMP-encrypted data frames | Wi-Fi chip; in Azahar `uds_real` (ldnd or ESP32) | the beacon/association/EAPOL lines; not the frames themselves |
 
 - **The capture sits between Pia and UDS.** Azahar's `UDS DATA TRACE` lines are the payload the app hands to UDS `SendTo` (and what `PullPacket` returns). That payload is a Pia datagram, so the log shows Pia's header and tail but not 802.11.
-- **Two separate protections.** The air is encrypted with CCMP. Its key is derived from the UDS passphrase (`TRL_NETWORK`) **and the 3DS's own UDS key** (AES key slot 0x2D, which Azahar takes from your key dump): AES-CTR of `MD5(passphrase)` with a counter of `MD5(host MAC, comm ID, id, network ID)`. Pia then adds its own HMAC-MD5 tag (fixed key `PokemonSIO`) at the end of each datagram. A peer that is not the VC must satisfy both.
-- **Bytes 0-11 of the frame** (`01 01`, length, six zeros, message type) come before the Pia magic. Which layer writes them is [unknown].
+- **Two separate protections.** The air is encrypted with CCMP. Its key is derived from the UDS passphrase (`TRL_NETWORK`) **and the 3DS's UDS data key** (AES key slot 0x2D: the same on every console, built into Azahar's key table or read from its `aes_keys.txt`, and a file the user supplies to mGBA): AES-CTR of `MD5(passphrase)` with a counter of `MD5(host MAC, comm ID, id, network ID)`. Pia then adds its own HMAC-MD5 tag (fixed key `PokemonSIO`) at the end of each datagram. A peer that is not the VC must satisfy both.
+- **Bytes 0-11 of the frame** are `01`, the frame kind, the length minus 12 (little-endian), six zeros and a CRC-16/ARC (little-endian) of the first ten bytes; they come before the Pia magic. Which layer writes them is [unknown].
 
 # The UDS session
 
@@ -472,13 +472,109 @@ Capture 1 timeline: Azahar's party `6f 95 4a 83 31 15` at 21.2 s; the host's `b0
 7. After the trade, steps 5 and 6 repeat.
 8. Keep-alive and ack frames run throughout, and for about 40 s after the last data.
 
+# The mGBA wrapper: a Game Boy core as a VC joiner [measured, live]
+
+The Game Boy core of this mGBA fork (`uds-wrapper` branch of mgba_LDN) can act as the **joiner** of a VC trade: Pokémon Red or Blue in mGBA trades with Azahar's VC (over a localhost bridge) and with
+a **retail 3DS** (over the air, through an ESP32 board). Hosting is not implemented (Azahar hosting is unsolved, see [Role swap](#role-swap-azahar-hosting-measured-2-captures-neither-completed)). Yellow has its addresses in the
+table below but has not been tried; Gen 2 is recognised and refused. **[user-reported]** a trade completes on the Azahar bridge (repeated twice, the Trade Center left by resetting, as on a cable) and with a retail 3DS ("everything works", 2026-10-04); the trade-back and Yellow are untested.
+
+Menu: **Wireless Adapter > ESP32** plus the **Virtual Console (Gen 1-2)** box is the real radio; **Wireless Adapter > Local** plus the box is the Azahar bridge. The 3DS UDS key file is set under Settings > BIOS.
+
+## Layers
+
+| layer | file (`src/gb/sio/`) | what it does |
+|---|---|---|
+| L4 Game Boy side | `uds-gblink.c` | a serial-port driver for the Game Boy core plus ROM hooks (breakpoints through the debugger): makes the ROM believe it is on a cable with the VC |
+| L3 Pia | `uds-pia.c`, `uds-session.c` | the frame codec (prefix CRC, HMAC tail), the joiner's setup handshake, pings, clock sync, keep-alive, the reliable unit stream (windows of 25, re-sends) |
+| L2 UDS link | `uds-room.c` | beacon parsing, authentication, association, EAPoL start and reply, SecureData on channel 243, the channel-3 keep-alive |
+| L1 air | `uds-udp.c` (bridge) or `uds-air-radio.c`, `uds-esp32.c`, `uds-ccmp.c`, `uds-keyfile.c` (radio) | datagrams to Azahar, or real 802.11 frames through the board |
+
+The bridge is Azahar's `uds_bridge.cpp` (environment variable `AZAHAR_UDS_BRIDGE`): one UDP datagram per `WifiPacket` on 127.0.0.1, Azahar listening on port N (default 45710) and sending to N + 1, mGBA the reverse.
+A datagram is `UDSB`, version 1, packet type, channel, reserved, transmitter MAC, destination MAC, then the body: plaintext, no 802.11 header, no CCMP.
+
+## What is encrypted [measured]
+
+| layer | encrypted? |
+|---|---|
+| beacons, authentication, association | no. The beacon's node list is "encrypted" with a fixed module key that Azahar knows; the network info and the 16 bytes of application data are plain |
+| data frames (EAPoL and everything after) | **yes, CCMP** (AES-CCM, 8-byte tag) with a per-network key |
+| the UDS SecureData header (channel, node ids, sequence) | yes, it is inside the CCMP payload |
+| Pia on channel 243 | **no**: the header's "encrypted" field is 1 (not encrypted) for Pia up to 5.6, and the Game Boy bytes decode in the clear |
+| the Pia tail | an HMAC-MD5 with the fixed key `PokemonSIO`: it authenticates, it does not hide anything |
+
+## The data key [measured]
+
+`key = MD5("TRL_NETWORK\0") xor AES(slot 0x2D key, MD5(counter))`, where `counter` is 16 bytes: comm ID (little-endian), network ID (little-endian), host MAC, the network info's `id` byte as a 16-bit little-endian value.
+The slot 0x2D key is the same on every 3DS and is a Nintendo secret, so mGBA never ships it: the user supplies a file (`slot0x2DKeyN=...`, or `slot0x2DKeyX` and `slot0x2DKeyY`, from which the key is made with the
+3DS key generator) and Settings > BIOS > "3DS UDS key file" points at it. **Check:** with the key from Azahar, all 1,181 `TX MPDU` lines of the 2026-10-03 trade log decrypt to the logged plaintext and rebuild
+byte for byte (`uds-ccmp-golden`), and the association request frame is identical.
+
+CCMP frame, as Azahar builds and reads it: 24-byte 802.11 header, 8-byte CCMP header (`PN0 PN1 00 20 PN2 PN3 PN4 PN5`), ciphertext, 8-byte tag. Nonce = priority `00`, the transmitter address (A2), the 6-byte packet number
+big-endian. AAD = frame control `& 0xC78F`, A1, A2, A3, sequence control `& 0x000F` (22 bytes). Frame control `0x4008` plus the DS bits: a joiner's frames to the host are unicast **ToDS** (A1 = BSSID, A2 = joiner, A3 = host),
+the host's game frames are **broadcast no-DS**, its EAPoL frames **FromDS**. A joiner's data goes out at 11 Mbit/s, management frames at the board's default rate.
+
+## The beacon's network info [measured]
+
+Vendor element (tag 221, OUI `00:1F:32`, type 21). Offsets are in the element body: `[4..7]` comm ID (big-endian), `[8]` id, `[9]` update counter, `[10..11]` attributes, `[12..15]` network ID (big-endian), `[16]` nodes, `[17]` max nodes,
+`[0x33]` application data size, `[0x34..]` application data. The SSID is eight zero bytes; the network ID appears as eight upper-case hex digits in the association request's SSID. The `id` byte is part of the key's counter.
+
+## Joining a retail host over the air [measured]
+
+The ESP32 board runs Azahar's `esp32-uds-bridge` firmware (a dumb radio; the GB-Link LDN firmware speaks a different framing and does not answer). Its serial framing is `version, type, seq, flags, length, payload, CRC-32`,
+COBS-coded; mGBA implements it from that description (`uds-esp32.c`, 635 checks in `uds-esp32-test`). The board resets when its USB port opens and takes a few seconds to boot, so the radio opens without blocking and sends Hello until it answers.
+Start carries an optional flags byte: bit 0 starts the hardware with a decoy MAC (first octet xor 02), as Azahar does, so frames for the emulated address reach the capture path. The hardware then does not acknowledge them, the host
+retransmits, and received frames are filtered by packet number (13 repeats in a 20-second hold).
+
+First live join, retail 3DS XL hosting VC (host `B8:AE:6E:A8:D0:10`, channel 6, 293 beacons in 30 s, about one every 102.4 ms):
+
+| t | event |
+|---|---|
+| 0.47 s | beacon heard, authentication request sent |
+| 0.52 s | the host's authentication reply, association request, association response, EAPoL start sent |
+| 0.55 s | EAPoL reply: **node 2 of 2** |
+| 0.67 s | Pia setup done: "game stream may start" (6 frames in, 10 out) |
+| 0.67 to 20.7 s | link held; no send failures, nothing dropped for decryption |
+
+After the host is chosen the radio tunes to its channel and watches its address; with no host it hops channels 1, 6 and 11 every 0.4 s. A host that is silent for 6 s is dropped and scanning resumes.
+
+## How the ROM is made to talk to the VC [measured]
+
+The VC patches the ROM at pret's `vc_hook` points (see the table on [The Game Boy link](gb_link.md#how-the-mgba-wrapper-uses-the-game-boy-link)). On the wire there is **one unit per serial transfer**, carrying the byte on the line; both consoles are the
+internal-clock side, so the *k*-th unit of each console pairs with the *k*-th of the other. The wrapper does the same and hooks only what the VC replaces:
+
+- **Receptionist.** At `Link_fake_connection_status` the status byte is forced to "internal clock" and serial transfers up to `Wireless_prompt` are not paired with the peer (the handshake bytes `01` / `02` never reach the wire).
+- **First unit.** The joiner's first unit (index -2001) is `00`; the host's first unit `EF` is read and discarded.
+- **Nybble sync (`Serial_SyncAndExchangeNybble`).** Replaced by a loop that sends `60|nybble` and reads one host unit for each, until a host unit is `6x` (how long that takes is how long the host takes to arrive: Azahar's host sent 164 `60`s
+  in a row), then five more `60|nybble` and five `00`, then answers the host's remaining `00`/`6x` units one at a time so that both sides leave the sync having sent the same number. The length of a sync is not fixed:
+  12 units between two retail consoles (`60`×7 `00`×5 and `60`×8 `00`×4), 16 from Azahar's host (`60`×13 `00`×3), more while one side waits.
+- **Link menu (`Serial_ExchangeLinkMenuSelection`).** The ROM exchanges three bytes per call, discards the first and keeps the other two, and needs a `D0`-class byte in one of them. Which of the host's bytes lands where depends on how the two loops line up,
+  and the host leaves the menu as soon as it sees our `D4`, so a missed byte is never repeated: with the ROM's own code mGBA pressed A, the host followed, and mGBA then waited forever for a `D0` that had already gone by. The wrapper
+  sends the selection three times and keeps the last `D0`-class byte of the host's three, in both slots; the host sees a constant selection whichever of our units it reads.
+- **Everything else runs as the ROM's own code** on the serial device: a transfer started with the internal clock queues a unit and finishes, after the normal eight-bit shift time, when the peer's unit arrives. This includes the RN list, the player block,
+  the patch lists and the trade selection. The 3-unit lead and the extra units the VC's bulk hooks produce are **[inferred]** to be properties of the ROM's own exchange loop, since the native loop is accepted by the VC without them being built.
+- **Waiting.** A hook that must wait for the peer returns to the game through `DelayFrame` (it pushes the hook's own address and jumps to `DelayFrame`), so the game keeps running frames, and times out after 20 s with the ROM's own "link closed because of inactivity" path.
+
+**What the VC does when it has nothing to send [measured, partly inferred].** The ROM's byte `$FE` means "no data"; `Serial_ExchangeByte` retries after a frame when it receives it. The VC does not seem to block a transfer until the peer starts its own: the host's streams
+contain long runs of `FE` (88 to 221 in a row while the other side was elsewhere) and of `00` retries, so transfers complete with `FE` when the peer has nothing. **Tried and rejected:** answering every host unit that has no unit of ours with the serial
+register's value. It made the host's last menu exchange retry forever on `FE` and stalled the menu; the wrapper only ever sends units for transfers its own ROM starts or for a hook that is running.
+
+## Tools
+
+- `MGBA_VCLINK_TRACE=<dir>` writes `vclink_<time>.txt`: room and session states, every ROM hook, every unit sent (`tx`) and received (`rx`) with the time in milliseconds, and on the radio counters every 5 s. `run-mgba-vc.cmd` sets it.
+- `uds-esp32-probe` prints the board's firmware and the 3DS hosts it hears; `uds-air-probe <key file>` joins a host and runs the Pia session. `uds-bridge-test`, `uds-test` (354 checks), `uds-ccmp-test`, `uds-ccmp-golden`, `uds-key-test`, `uds-esp32-test`
+  need no console.
+- `docs/azahar/azahar_log_to_jsonl.py` turns an Azahar log into the same unit streams for comparison with the mGBA trace.
+
 # Open questions
 
 - What the 8 "loss bits" (unit offsets 36 to 43) and the per-run 32-bit value (offsets 48 to 51) mean; where the opening frame's 4-byte value comes from (bytes 0 to 3 of the beacon application data is a guess); what the `06` / `01` byte in the profile means. (Solved: the 16-byte frame tail is the HMAC; the "type id" is a CRC; the shared profile value comes from the beacon.)
-- Which of the setup and keep-alive messages the VC actually requires: the pings, the clock sync, the station table, the profile contents, and what it does when one is missing.
+- Which of the setup and keep-alive messages the VC actually requires: the pings, the clock sync, the station table, the profile contents, and what it does when one is missing. (The wrapper sends the set the retail 2DS sent and trades with both Azahar and a retail host, so that set is enough.)
 - Why Azahar fails as host (two different failures, see above) while the retail console as host works.
-- Who is the clock master on the VC: the host's `EF` first unit suggests the host, but nothing else in the stream distinguishes the roles.
-- Whether the comm ID, application data and `PokemonSIO` are shared across the Game Boy VC titles (H3, H4). Only Red was captured.
+- Whether `EF`, the host's first unit, is a role marker. The ROM does not send it, and the wrapper reads and discards it. Clocking is settled: after the receptionist hook both consoles are the internal-clock side.
+- Whether the comm ID, application data and `PokemonSIO` are shared across all Game Boy VC titles (H3, H4). Red and Blue trade with the wrapper using comm ID `0x00171010` and `PokemonSIO`; Yellow and Gen 2 are untested.
 - How a session ends. Gen 1 has no clean way out of the Trade Center (you leave by choosing Reset), so no teardown exchange exists in any capture; Gen 2 may differ.
 - Battles (`Wireless_start_exchange` and friends); only trades were captured.
-- What a retail host does with a retail joiner at the table (a retail-to-retail capture with the passive sniffer is planned).
+- What the VC does when a transfer finds no unit from the peer: the long runs of `FE` and `00` in the host's streams suggest it completes the transfer with `FE` and lets the ROM retry, but this is inferred, not read from the code.
+- How the wrapper behaves when the emulator is paused: the link is polled from the emulation thread, so a paused core stops answering and the host will time it out after about 10 s.
+- Whether a retail host ever deauthenticates a first join attempt (Azahar's logs show it once); the wrapper has not seen it.
+- Gen 2: the key, the comm ID, the unit layout and the selection bytes (`$70` range) are all unmeasured.
