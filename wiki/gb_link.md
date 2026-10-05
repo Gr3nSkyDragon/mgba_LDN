@@ -6,12 +6,14 @@ nav_order: 1
 
 # The Game Boy link, and what runs on it
 
-Read out of [pret/pokered](https://github.com/pret/pokered) (commit `d2704a6`) and measured from mGBA traces of a Red cartridge
-ROM linked to a Blue cartridge ROM (`logs/gbtrace_20261003-154856.jsonl`, `src/gb/linktrace.c`). Every claim is tagged:
+Read out of [pret/pokered](https://github.com/pret/pokered) (commit `d2704a6`), measured from mGBA link traces of a Red cartridge
+ROM linked to a Blue cartridge ROM (the tracer is `src/gb/linktrace.c`; one capture had Red as master and each side pressing first),
+and, for the permanent-slave behaviour at the end, measured live with the wrapper trading against a 3DS (Azahar and retail). Every claim is tagged:
 
 - **[src]** read from the pret source, with `file:line` where it helps.
 - **[measured]** seen in a trace.
 - **[unknown]** not yet established.
+- **[inferred]** follows from the source or from several measurements but was not observed directly.
 - **[user-reported]** stated by the person running the captures, not found in the source or a trace.
 
 Only Gen 1 (Red/Blue) is covered. Yellow is the same code apart from the constants noted in the last section. Gen 2 is listed as
@@ -74,15 +76,20 @@ The two bytes `$01` and `$02` swapped at the start decide who is the master.
 
 ## The slave never knows it is waiting
 
-`Serial_ExchangeByte` [`home/serial.asm:88-170`] loops until `hSerialReceivedNewData` is set. Two counters inside it are the only
-timeouts in the byte layer:
+`Serial_ExchangeByte` [`home/serial.asm:88-170`] loops until `hSerialReceivedNewData` is set. What it does with a stalled partner depends on
+which interrupts are enabled (`rIE`):
 
-- `wUnknownSerialCounter` (16-bit): decremented while the byte received is `$FE`, set to `$FFFF` when it reaches zero. This is
-  the "link inactive" detector. The cable club sets it to `$0300` before the "Please wait" sync (below).
-- `wUnknownSerialCounter2` (16-bit, reloaded `$0050`): only counts while `rIE` enables serial and nothing else. Its exact purpose
-  is [unknown].
+- **Two counters.** `wUnknownSerialCounter` (16-bit) is decremented each time the byte received is `$FE` and set to `$FFFF` when it reaches
+  zero: the "link inactive" detector. The cable club sets it to `$0300` before the "Please wait" sync (below). `wUnknownSerialCounter2`
+  (16-bit, reloaded to `$5000`) counts down only while `rIE` enables serial and nothing else, which is the state inside
+  `Serial_ExchangeBytes`; when it runs out (about 20,000 polls) the wait ends and the stale received byte is returned. **[src]**
+  So a block exchange has a timeout and the other waits do not.
+- **`$FE` is retried, or it is data.** When the received byte is `$FE` the routine returns it as it is if `rIE` is serial only (the block
+  exchanges); in every other state it reloads the byte to send, waits a frame (`DelayFrame`) and exchanges again. **[src]** The consequence for
+  anything that plays the partner: `$FE` is "no data, ask again" in the nybble syncs and the link menu, and it is stored as a data byte
+  inside a block.
 
-Everything else waits forever. A stalled partner never causes a crash, but it makes the game sit in a polling loop.
+Apart from those, everything waits forever: a stalled partner never causes a crash, but it makes the game sit in a polling loop.
 
 # The cable club, from the receptionist to the table
 
@@ -194,8 +201,10 @@ preamble by however many exchanges a console waited for its partner.
 
 Counting the preamble gives the full 424-byte span. **[measured]** In the first Azahar capture the block run begins `fd×6 a7 a8 b1 ae 50 00×6 06 ...` (trainer
 "hiro", count 6) with the species list `6f 95 4a 83 31 15 ff`. In the Virtual Console captures the span from the first `fd` of the block run to the first `fd` of the patch-list run
-is 427 exchanges every time, 3 more than the 424-byte block; the 3 extra exchanges sit between the two blocks (`50 ff ff` on one side) and their origin is [unknown]. See
-[measurement notes](#measurement-notes).
+is 427 exchanges every time, 3 more than the 424-byte block, and the master's run of `fd` in front of the player block is 9 long, not 6. **[inferred]** That is
+`Serial_ExchangeBytes` at work: the exchange that ends the sender's ignoring, and the repeats before the partner's `fd` arrives, are sent as well as the preamble, and
+the receiver stores 424 replies after the first `fd` it sees, so the 424th stored byte is the first `fd` of the next block. The receiver skips leading `fd` bytes when it unpacks the block
+(`cable_club.asm:152-180`), so a few extra only cost the last few bytes of the block; many more (18 in one live run) cut into the party data. See [measurement notes](#measurement-notes).
 
 ### The 44-byte party mon struct
 
@@ -264,9 +273,48 @@ three rounds (enter, after trade, after trade back).
 
 # How the mGBA wrapper uses the Game Boy link
 
-The wrapper (see [The 3DS Virtual Console link](vc_link.md#the-mgba-wrapper-a-game-boy-core-as-a-vc-joiner-measured-live)) leaves the ROM unmodified and runs its link code as it is. Only the places the VC itself replaces are hooked, with breakpoints at the pret `vc_hook` addresses;
-everything else (`Serial_ExchangeByte`, `Serial_ExchangeBytes`, `Serial_SendZeroByte`, the receptionist's text, the trade screen) runs natively on a serial device whose transfers are paired with the peer's units.
-Addresses are bank:address in the pret builds (`docs/hook_table`); a game is recognised by the first 11 characters of its header title.
+The wrapper (see [The 3DS Virtual Console link](vc_link.md#the-mgba-wrapper-a-game-boy-core-as-a-vc-joiner-measured-live)) leaves the ROM unmodified. It has two ways of
+working, and the first is the one the project moved towards: a Game Boy core is only a stand-in for a cartridge.
+
+## Wire mode: a cartridge as master, the wrapper as a permanent slave
+
+Selected with the environment variable `MGBA_VCLINK_WIRE=1`. mGBA calls the wrapper at one place only: when the ROM starts a serial transfer (a write of `$81` to `rSC`). The wrapper is
+told the byte the master clocked out and answers with the byte the slave shifts back; it has no debugger, no breakpoints and no knowledge of ROM addresses (a heartbeat reads a few
+RAM bytes for the log, nothing more). The same code (`uds-wire.c`, `uds-cable.c`) can sit behind a pin-level front end on a microcontroller. **[measured]** Trades complete against Azahar and a retail 3DS, Red and Blue.
+
+The cartridge is always the master and the 3DS side is always the slave: the wrapper offers `$02` to the master's `$01` and never drives the clock. A real master cannot be paused, and a slave's
+reply is loaded before the master clocks, so the reply to exchange *i* depends on bytes up to *i*-1 and on what the 3DS has delivered by then. What that forces, **[measured]**:
+
+| phase | what the master does | what the wrapper does |
+|---|---|---|
+| role | the receptionist loop offers `$01` every frame | replies `$02`, then `00`, then `FE`; no unit goes to the 3DS (the VC has no role bytes) |
+| idle | stale `00` / `FE` bytes between phases | drops them; a `6x` starts a sync, a `Dx` a menu, anything else a raw exchange |
+| sync | `Serial_SyncAndExchangeNybble`: `60+n` until a `6x` reply, ten more, ten zero bytes (the tenth is stranded into the next burst) | the cartridge's loop counts are fixed and the 3DS's burst is another length, so the 3DS side of the sync runs by itself and the cartridge is given synthetic replies that end its loops with the 3DS's nybble |
+| menu | three exchanges per call, `00 d d d` from a master; the slave's matching cycle is `fe d d 00` | one unit per `Dx` byte, replies the 3DS's selection; if the 3DS pressed A first, its further menu units are answered with its choice (the echo) until it has been quiet for 600 ms |
+| gap | no exchange for 400 ms | ends a menu or a block exchange; the first byte afterwards is the byte stranded by the lag and is sent as a unit |
+| blocks | three blocks per cycle, 17, 424 and 200 replies stored after an `fd` | see below |
+
+Rules that fell out of the source and the live runs:
+
+- **The slave's data lags one exchange.** The byte set for exchange *n* is shifted out in *n*+1, so every phase starts with a stale byte and ends with one stranded in the shift register.
+- **Replies must never run dry inside a block.** The cartridge stores `size` replies after the `fd` that ends its ignoring and, with only the serial interrupt enabled, an `FE` is stored as data,
+  not retried. So the first `fd` of a block is held back (`FE`) until the whole block has been received from the 3DS, and a reply is never missing inside it. If only the last byte is missing it is
+  filled in, and the 3DS's matching unit is dropped later.
+- **Units are index-paired, so a block must start at the same index on both sides.** The wrapper's unit *k* is what the 3DS receives in its exchange *k*. The 3DS stores 17, 424 or 200 bytes after the first
+  `fd` it sees, so the cartridge's block has to begin exactly where the 3DS's own begins. Padding units sent while the cartridge waits (one `fd` per retry at first) displaced the cartridge's
+  random-number list by 25 positions; the 3DS started its player block inside the padding and read a random number as the first byte of the name, giving a different garbled trade menu every run.
+- **While the cartridge waits for a block, run in lockstep.** A retry after `FE` (same byte, previous exchange unanswered) is not a new exchange and sends nothing; the `fd` the cartridge repeats goes out only
+  as the 3DS's matching unit arrives. Bytes that are real data (the tail of the previous block, stale bytes) always go out.
+- **The random-number list is the exception.** The 3DS produces its list one unit per unit of ours, and the cartridge is held until the list is buffered, so only the wrapper can supply the units that
+  let the 3DS finish it. Once the 3DS's list starts the wrapper sends `fd` for its remaining 17 positions and drops the cartridge's own list units. The list has no consequence for a trade (in the hook mode's trades the cartridge sent 37 to 44 `fd` in front of its list, so the 3DS's copy was `fd` too, and
+  they work), and the player block then begins at the right index. The 3DS produces the player and patch blocks in one burst after its first `fd`.
+- **`FF` is an idle line.** While the Pia session is not up the cartridge sees no partner.
+
+## Hook mode (the earlier design, kept as the fallback)
+
+The ROM runs its link code as it is and only the places the VC itself replaces are hooked, with breakpoints at the pret `vc_hook` addresses; everything else (`Serial_ExchangeByte`, `Serial_ExchangeBytes`,
+`Serial_SendZeroByte`, the receptionist's text, the trade screen) runs natively on a serial device whose transfers are paired with the peer's units. Because the emulator can stop the ROM at a hook, nothing
+has to be buffered ahead, which is exactly what a real cartridge could not allow. Addresses are bank:address in the pret builds; a game is recognised by the first 11 characters of its header title.
 
 | routine | Red and Blue | Yellow | in the wrapper |
 |---|---|---|---|
@@ -289,7 +337,7 @@ The other VC hooks (`Wireless_net_stop` / `Wireless_net_end` on the Cancel path,
 above but was not tried; Gold, Silver and Crystal (`POKEMON_GLD`, `POKEMON_SLV`, `PM_CRYSTAL`) are recognised and refused.
 
 What a native transfer looks like to the ROM: the byte on the wire for transfer *k* is `rSB` when the transfer starts (the **previous** exchange's `hSerialSendData`: the sent byte lags one exchange, see the interrupt handler above),
-and the byte received is the peer's unit *k*. `$FE` from the peer means "no data" and `Serial_ExchangeByte` retries after a frame.
+and the byte received is the peer's unit *k*. `$FE` from the peer means "no data"; `Serial_ExchangeByte` retries after a frame outside a block exchange and stores it inside one (see above).
 
 # Measurement notes
 
@@ -299,7 +347,7 @@ and the byte received is the peer's unit *k*. `$FE` from the peer means "no data
   plus the trade selection that follows them). The player-block 427 is 424 plus 3 unexplained exchanges before the patch-list preamble.
 - **Round count.** Entering the room, and each completed trade, repeat the RN list / party / patch-list sequence.
 - **The mGBA tracer** records both players' bytes in `hex` (sent) and `rx` (received) per hardware transfer, plus variable and
-  buffer markers; see `docs/lua/gen1_hooks.txt` for the marker addresses (`ram` lines).
+  buffer markers.
 
 # Yellow, Gold, Silver, Crystal
 
@@ -313,8 +361,10 @@ and the byte received is the peer's unit *k*. `$FE` from the peer means "no data
 
 # Open questions
 
-- The 3 unexplained exchanges between the player block and the patch lists in the Virtual Console captures (and why the cartridge trace shows the same 427 span). **[inferred]** They come from the ROM's own exchange loop, not from the VC: the wrapper runs that loop natively and the VC accepts the stream.
 - Which console is master when both ROMs reach the receptionist at once: on hardware the `$01`/`$02` handshake settles it. The Virtual Console has no such bytes on the wire: its hook forces `hSerialConnectionStatus` to
-  `$02` on both consoles, and its host sends a single `EF` as its first unit (see the VC page). The mGBA wrapper does the same hook and trades.
-- The exact behaviour of `wUnknownSerialCounter2` in a real cable.
+  `$02` on both consoles, and its host sends a single `EF` as its first unit (see the VC page). The hook mode does the same; the wire mode instead keeps the cartridge as master and answers its handshake itself.
+- Whether the timing of a real cartridge on a microcontroller (a reply window of about a millisecond) holds up: wire mode has run only against an emulated cartridge, where the wrapper reacts in real time but the ROM
+  runs at emulated speed.
+- Whether a real console's `wUnknownSerialCounter2` timeout (block exchanges give up after about 20,000 polls) is ever reached in a trade; it was not seen.
+- Whether a GB-Link adapter's Game Boy mode can carry wire mode. Its public firmware lists that mode (`0x02`) as an SPI passthrough, so the byte-level rules above would have to live on the board or the host; untested.
 - Everything for Gen 2, including the Time Capsule room and whether Gen 2 has a clean exit.
