@@ -16,8 +16,8 @@ and, for the permanent-slave behaviour at the end, measured live with the wrappe
 - **[inferred]** follows from the source or from several measurements but was not observed directly.
 - **[user-reported]** stated by the person running the captures, not found in the source or a trace.
 
-Only Gen 1 (Red/Blue) is covered. Yellow is the same code apart from the constants noted in the last section. Gen 2 is listed as
-a to-do at the end.
+The walk-through below is Gen 1 (Red/Blue). Yellow is the same code apart from the constants noted in the last section, and Gen 2 (Gold, Silver,
+Crystal) uses the same byte layer with the differences listed there; the mail block, which only Gen 2 has, is described with the wrapper.
 
 # The hardware link
 
@@ -203,8 +203,14 @@ Counting the preamble gives the full 424-byte span. **[measured]** In the first 
 "hiro", count 6) with the species list `6f 95 4a 83 31 15 ff`. In the Virtual Console captures the span from the first `fd` of the block run to the first `fd` of the patch-list run
 is 427 exchanges every time, 3 more than the 424-byte block, and the master's run of `fd` in front of the player block is 9 long, not 6. **[inferred]** That is
 `Serial_ExchangeBytes` at work: the exchange that ends the sender's ignoring, and the repeats before the partner's `fd` arrives, are sent as well as the preamble, and
-the receiver stores 424 replies after the first `fd` it sees, so the 424th stored byte is the first `fd` of the next block. The receiver skips leading `fd` bytes when it unpacks the block
-(`cable_club.asm:152-180`), so a few extra only cost the last few bytes of the block; many more (18 in one live run) cut into the party data. See [measurement notes](#measurement-notes).
+the receiver stores 424 replies after the first `fd` it sees, so the 424th stored byte is the first `fd` of the next block. See [measurement notes](#measurement-notes).
+
+**How much misalignment a block survives [src, measured].** The receiver stores a fixed number of replies, then skips leading control bytes (`fd`, and in Gen 2
+also `00` and `FE`, `Link_FindFirstNonControlCharacter_SkipZero`) and copies the data from the first other byte. Whatever arrives in front of the partner's data
+therefore pushes the end of the data out of the stored window: only the last bytes of the block are lost, which are the **sixth Pokemon's nickname**. The window
+has 9 spare bytes (6 preamble + 3 padding), so up to 9 extra units in front are harmless and each one beyond that costs a byte from the end. **[measured]** A
+Gen 2 trade whose party block reached the 3DS 11 units late kept exactly two letters of the sixth nickname ("Letterbomb" arrived as "Le" followed by zeros, the
+cleared buffer); 18 extra units in an earlier live run cut into the OT names as well.
 
 ### The 44-byte party mon struct
 
@@ -280,7 +286,9 @@ working, and the first is the one the project moved towards: a Game Boy core is 
 
 This is the default mode (the environment variable `MGBA_VCLINK_WIRE=0` selects hook mode instead). mGBA calls the wrapper at one place only: when the ROM starts a serial transfer (a write of `$81` to `rSC`). The wrapper is
 told the byte the master clocked out and answers with the byte the slave shifts back; it has no debugger, no breakpoints and no knowledge of ROM addresses (a heartbeat reads a few
-RAM bytes for the log, nothing more). The same code (`uds-wire.c`, `uds-cable.c`) can sit behind a pin-level front end on a microcontroller. **[measured]** Trades complete against Azahar and a retail 3DS, Red and Blue.
+RAM bytes for the log, nothing more). The same code (`uds-wire.c`, `uds-cable.c`) can sit behind a pin-level front end on a microcontroller. **[measured]** Trades complete against Azahar and a retail 3DS (Red and Blue),
+and against Azahar for Gold with Silver (Trade Center, with mail held by the traded Pokemon in both directions and a full-length sixth nickname) and through the Time Capsule (a Gen 2 game with a
+Gen 1 game, with each generation on either emulator).
 
 The cartridge is always the master and the 3DS side is always the slave: the wrapper offers `$02` to the master's `$01` and never drives the clock. A real master cannot be paused, and a slave's
 reply is loaded before the master clocks, so the reply to exchange *i* depends on bytes up to *i*-1 and on what the 3DS has delivered by then. What that forces, **[measured]**:
@@ -300,21 +308,54 @@ Rules that fell out of the source and the live runs:
 - **Replies must never run dry inside a block.** The cartridge stores `size` replies after the `fd` that ends its ignoring and, with only the serial interrupt enabled, an `FE` is stored as data,
   not retried. So the first `fd` of a block is held back (`FE`) until the whole block has been received from the 3DS, and a reply is never missing inside it. If only the last byte is missing it is
   filled in, and the 3DS's matching unit is dropped later.
-- **Units are index-paired, so a block must start at the same index on both sides.** The wrapper's unit *k* is what the 3DS receives in its exchange *k*. The 3DS stores 17, 424 or 200 bytes after the first
-  `fd` it sees, so the cartridge's block has to begin exactly where the 3DS's own begins. Padding units sent while the cartridge waits (one `fd` per retry at first) displaced the cartridge's
-  random-number list by 25 positions; the 3DS started its player block inside the padding and read a random number as the first byte of the name, giving a different garbled trade menu every run.
-- **While the cartridge waits for a block, run in lockstep.** A retry after `FE` (same byte, previous exchange unanswered) is not a new exchange and sends nothing; the `fd` the cartridge repeats goes out only
-  as the 3DS's matching unit arrives. Bytes that are real data (the tail of the previous block, stale bytes) always go out.
-- **The random-number list is the exception.** The 3DS produces its list one unit per unit of ours, and the cartridge is held until the list is buffered, so only the wrapper can supply the units that
-  let the 3DS finish it. Once the 3DS's list starts the wrapper sends `fd` for its remaining 17 positions and drops the cartridge's own list units. The list has no consequence for a trade (in the hook mode's trades the cartridge sent 37 to 44 `fd` in front of its list, so the 3DS's copy was `fd` too, and
-  they work), and the player block then begins at the right index. The 3DS produces the player and patch blocks in one burst after its first `fd`.
+- **Units are index-paired, so a block must start where the 3DS's window starts.** Both unit streams count from the session's first unit, and the wrapper's unit *k* is paired with the 3DS's
+  unit *k*. The 3DS receives one unit behind what it sends: for a block whose first preamble `fd` it sends at position *T*, it stores our units *T*-1 to *T*-1+size-1, then unpacks them as
+  described under the player block. So the cartridge's block has to begin at *T*-1, exactly as the 3DS's own began in its stream. Two ways this went wrong:
+  padding units sent while the cartridge waited (one `fd` per retry at first) displaced the cartridge's random-number list by 25 positions, and the 3DS read a random number as the first byte of the
+  name (a different garbled trade menu every run); later, a fixed cover of 17 `fd` for the 3DS's random-number list put the party block 11 units late and cut the sixth nickname.
+- **The wrapper counts positions instead of guessing them.** It counts every unit it sends and receives in the session, which gives the exact position of its next unit and of every 3DS unit in its
+  buffer. While the cartridge waits for a block it sends `fd`, and these are padding: one goes out only when the wrapper is not ahead of what the 3DS has delivered (the 3DS never waits on a unit
+  that has not been sent, so nothing stalls), never past the end of the 3DS's random-number list while that list runs, and never past *T*-1 once the 3DS's next block can be seen in the buffer. When
+  the cartridge's ignoring ends (on the 3DS's first preamble `fd`, at position *T*), the wrapper fills up to *T*-1 with `fd`, or, if it is already past it, leaves out that many of the cartridge's own
+  preamble `fd` (up to 6 for the player block, 3 for the patch lists). Bytes that are real data (the tail of the previous block, stale bytes) always go out, once.
+- **The random-number list.** The 3DS's list can run ahead of ours (8 units in a Gen 2 trade) or be paced by our units, and the cartridge is held until the list is buffered. Its contents have no
+  consequence for a trade (in the hook mode's trades the cartridge sent 37 to 44 `fd` in front of its list, so the 3DS's copy was `fd` too, and they work), so the cartridge's own list units are not
+  sent; `fd` padding stands in for them. The 3DS produces the player and patch blocks in one burst once it has our units up to its own block.
 - **`FF` is an idle line.** While the Pia session is not up the cartridge sees no partner.
 - **Gen 2** (the game table says so; Gen 1 never takes these paths): syncs in the `$70` and `$80` ranges are syncs too, and each sync's replies use the range the
-  cartridge started it in (a 3DS still in another range is ignored, as the ROM's own code does); after the patch lists the Trade Center's **mail block** is
-  carried with every exchange sending its unit (an `FE` is stored there, so none is a retry; a live run that suppressed them left the 3DS's mail exchange
-  29 units short and stalled both games) and a `00` stand-in for a reply that is not there yet, the real unit being dropped when it arrives. When the host's game
+  cartridge started it in (a 3DS still in another range is ignored, as the ROM's own code does); the room confirm (`Link_EnsureSync`) is answered `FE` until a real
+  selection of the 3DS's has arrived, because it ends on any reply in the `$Dx` range (an assumed `$D0` let a Gen 2 cartridge walk into the Time Capsule while the
+  Gen 1 game on the 3DS was still at its menu). After the patch lists the Trade Center's **mail block** is carried with every exchange sending its unit (an `FE` is
+  stored there, so none is a retry; a live run that suppressed them left the 3DS's mail exchange 29 units short and stalled both games). The mail needs its own
+  stand-ins, see the [mail block](#the-mail-block-gen-2-trade-center) below. When the host's game
   leaves the room its VC sends a short end-of-session record on the system stream; the wrapper answers with its own, then leaves the network as a 3DS joiner does and
   does not rejoin for six seconds. The host's VC closes the network about five seconds after its own record whatever the partner does.
+
+### The mail block (Gen 2 Trade Center)
+
+**Layout [src: pret `ram/wram.asm`, `engine/link/link.asm`].** 390 bytes: 5 × `$20` preamble (`SERIAL_MAIL_PREAMBLE_BYTE`), then the six mail messages of 33
+bytes (two 16-character lines and a line break, one per party slot, empty slots included), the six metadata records of 14 bytes (author name 10, author ID 2,
+species 1, mail type 1), and a 103-byte patch set (the 1-based positions of metadata bytes that were `$FE` and were sent as `$FF`; mostly padding). Message
+bytes that were `$FE` are sent as `$21` and turned back on receipt.
+
+**How the receiver reads it [src].** It does not count from the start: it scans the stored 390 bytes for the first `$20`, skips the whole run of `$20` and `FE`,
+and copies from the first other byte. A `$20` run of any length is therefore harmless, but bytes that are missing or shifted after it land in the wrong
+message or metadata field, and a missing metadata record shows as the wrong mail picture (a solid colour when the type is zero).
+
+**The timing problem [measured].** The mail exchange ends its ignoring on the first reply of any value and stores every reply after it, `FE` included, so the
+cartridge cannot be held. The 3DS sends its whole mail block in one burst about 50 ms after it receives our first mail unit; a cartridge clocking about 1.5
+exchanges per millisecond is then roughly 115 replies ahead of it. In front of the 3DS's `$20` run there are also about 11 units left over from its patch lists.
+
+**What the wrapper does.** Units in front of the 3DS's own `$20` run are leftovers and are dropped. Until the 3DS's mail arrives, each reply is a `$20`
+stand-in and no real unit is dropped, so the 3DS's stream is served whole and in order behind a longer `$20` run (the approach the
+[PokemonGB_Online_Trades_and_Battles](https://github.com/Lorenzooone/PokemonGB_Online_Trades_and_Battles) project uses: it answers `$20` while it waits).
+Once the mail data has started, a reply that is not there yet is a `00` and the real unit is dropped when it arrives, so the rest stays aligned. The cost is
+at the end: the stored window ends as many bytes early as there were stand-ins, which falls in the patch set's padding and, with about 115 late, the last
+dozen bytes (the sixth party slot's mail metadata).
+
+Two earlier versions failed, which shows why each part is needed. `00` stand-ins with the real units dropped replaced the head of the 3DS's mail (the first
+message) with zeros. `$20` stand-ins that took the first leftover zero for the start of the mail data fell back to `00` stand-ins too early: the first message
+was lost and the rest shifted by 16 bytes, so the received mail showed the wrong text and a blank picture.
 
 ## Hook mode (the earlier design, kept as the fallback)
 
@@ -350,7 +391,8 @@ and the byte received is the peer's unit *k*. `$FE` from the peer means "no data
 - **Phase landmarks in a byte stream.** Runs of `$FD` mark block starts: RN list (7 plus repeats), player block (6 plus repeats), patch lists (3 plus repeats).
   Run lengths vary because a sender repeats its first byte while it waits for the partner's preamble (see `Serial_ExchangeBytes`).
 - **Span from first `$FD` of a block to the first `$FD` of the next** is 17-18 (RN), 427 (player block), and 253-404 (patch lists
-  plus the trade selection that follows them). The player-block 427 is 424 plus 3 unexplained exchanges before the patch-list preamble.
+  plus the trade selection that follows them). The player-block 427 is 424 plus 3 unexplained exchanges before the patch-list preamble. **[measured]** In the
+  3DS's own Gen 2 stream each block is followed by one extra unit before the next block's preamble (list, one unit, player block; padding, one unit, patch lists).
 - **Round count.** Entering the room, and each completed trade, repeat the RN list / party / patch-list sequence.
 - **The mGBA tracer** records both players' bytes in `hex` (sent) and `rx` (received) per hardware transfer, plus variable and
   buffer markers.
@@ -370,7 +412,8 @@ and the byte received is the peer's unit *k*. `$FE` from the peer means "no data
     messages, metadata, patch set). The mail is exchanged by a plain `ExchangeBytes` with **no preamble check**: the first reply of any value ends the ignoring
     and every reply after it is stored, `FE` included. Battles have three blocks.
   - **Exit:** `WaitForOtherPlayerToExit` is a fixed sequence of transfers and delays (no waiting for the partner); the VC hooks its end (`Wireless_term_exit`).
-- **Time Capsule [user-reported]:** a Gen 2 game exchanges Gen 1 mons with a Gen 1 game; an Azahar Gold to mGBA Yellow trade through the Time Capsule worked (2026-10-05).
+- **Time Capsule [user-reported]:** a Gen 2 game exchanges Gen 1 mons with a Gen 1 game; Azahar Gold with mGBA Yellow, and a Gen 2 game on mGBA with a Gen 1
+  game on Azahar, both traded (2026-10-05). The second needed the room-confirm rule in the wire-mode list.
 
 # Open questions
 
@@ -380,4 +423,6 @@ and the byte received is the peer's unit *k*. `$FE` from the peer means "no data
   runs at emulated speed.
 - Whether a real console's `wUnknownSerialCounter2` timeout (block exchanges give up after about 20,000 polls) is ever reached in a trade; it was not seen.
 - Whether a GB-Link adapter's Game Boy mode can carry wire mode. Its public firmware lists that mode (`0x02`) as an SPI passthrough, so the byte-level rules above would have to live on the board or the host; untested.
-- Gen 2 is tested only in the Trade Center (Gold with Silver) and through the Time Capsule (Gold with Yellow); Crystal, battles and the mail block with real mail are not.
+- Gen 2 is tested in the Trade Center (Gold with Silver, mail included) and through the Time Capsule (Gold with Yellow); Crystal and battles are not. Mail held
+  by the sixth party slot of the 3DS's player may still lose its metadata (see the mail block).
+- Gen 1 uses the same block alignment as Gen 2 but has not been retested since it changed; a long nickname on the sixth Pokemon is the check.

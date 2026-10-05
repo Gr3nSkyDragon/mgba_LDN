@@ -11,7 +11,7 @@ Five captures are Azahar against a retail 3DS (VC Red). In three of them the ret
 the other two Azahar hosts and the retail console joins (neither completed). The sixth is a passive sniff of a retail 3DS XL hosting VC Red and a retail 2DS joining.
 The Game Boy side is on [The Game Boy link](gb_link.md). Tags as there: **[measured]**, **[src]** (pret source or the VC hook table), **[unknown]**.
 
-Unless a section says otherwise, a number comes from the first capture and a statement held in every capture. Yellow, Gen 2 and battles are not captured yet.
+Unless a section says otherwise, a number comes from the first capture and a statement held in every capture. Gen 2 is measured only through Azahar's own log; Yellow and battles are not captured yet.
 
 # What the VC is
 
@@ -74,7 +74,7 @@ From the Azahar log, times relative to the first data frame:
 
 - **Roles.** The retail host is **UDS node 1**, the joiner node 2. Max 2 players.
 - **Comm ID `0x00171010`.** The title ID is `0004000000171000` (the data folder name of Red); the comm ID shares its upper bits with the title ID.
-  Whether Blue, Yellow and Gold/Silver/Crystal share it is [unknown] (H3).
+  It is not shared: each title's comm ID is its title ID plus `0x10` (Gold `0x00172610`, Silver `0x00172710` when Azahar hosts them) [measured]; Blue, Yellow and Crystal are [unknown].
 - **Application data.** 16 bytes in the beacon. Its contents, and whether the VC checks them on join, are [unknown] (H4).
 - The beacon, association and EAPOL are standard UDS and are handled by the platform, not by the VC.
 
@@ -477,7 +477,7 @@ a **retail 3DS** (over the air, through an ESP32 board). It does so in either of
 cartridge and knows nothing of the emulator (see [How the mGBA wrapper uses the Game Boy link](gb_link.md#how-the-mgba-wrapper-uses-the-game-boy-link)). Hosting is not implemented (Azahar hosting is unsolved,
 see [Role swap](#role-swap-azahar-hosting-measured-2-captures-neither-completed)). Yellow has its addresses in the table on the Game Boy page. Gen 2 (Gold, Silver, Crystal) runs in wire mode.
 **[user-reported]** Trades complete in wire mode against the Azahar bridge and against a retail 3DS (2026-10-05), and did in hook mode on both before that (the Trade Center left by resetting, as on a cable).
-**[user-reported]** Gen 2 trades work between Gold and Silver, and a Gold to Yellow trade through the Time Capsule worked (2026-10-05). When the client's game leaves the Gen 2 trade room first, the host's VC waits about five seconds after its own end-of-session record and then closes the network ("communication lost"); retail consoles do the same, so it is the VC's behaviour. The trade-back, Crystal, battles and a real cartridge are untested.
+**[user-reported]** Gen 2 trades work between Gold and Silver, and a Gold to Yellow trade through the Time Capsule worked (2026-10-05). When the client's game leaves the Gen 2 trade room first, the host's VC waits about five seconds after its own end-of-session record and then closes the network ("communication lost"); retail consoles do the same, so it is the VC's behaviour. Gold with Silver trades mail in both directions and the full sixth nickname (2026-10-05, after the mail and block-alignment fixes on the Game Boy page). The trade-back, Crystal, battles and a real cartridge are untested.
 
 Menu: **Wireless Adapter > ESP32** plus the **Virtual Console (Gen 1-2)** box is the real radio; **Wireless Adapter > Local** plus the box is the Azahar bridge. The 3DS UDS key file is set under Settings > BIOS. Wire mode is
 the default (no setting needed); the environment variable `MGBA_VCLINK_WIRE=0` selects the older hook mode, which carries Gen 1 only.
@@ -571,16 +571,20 @@ permanent slave was measured against the 3DS behaviour in the next section.
 
 - **One for one.** The 3DS's exchange *k* sends its unit and then waits for ours of the same index; the next exchange does not start before it arrives. Indexed over time in Azahar's log of a wire-mode trade, the host's highest stream index is ahead of ours by 0 or 1 at nearly every sample.
   This is why the runs of `FE` (88 to 221 in a row, with `00` pairs between) in the host's stream are its idle exchanges, completed at the rate our units arrive; and why a wrapper that stops sending units, even for a good reason, stops the 3DS within one exchange.
-- **Except the blocks.** After the first `fd` it sees, the 3DS produces its player block (424 units) and its patch lists (200) all at once: the host's highest index jumped from 206 to 632 within a quarter of a second, and again by 200 for the patch lists.
-  Its random-number list is not produced that way but one unit per unit of ours (a run in which the wrapper sent nothing while it waited for the list stalled with the 3DS three numbers in).
-- **What the 3DS stores.** After the first `fd` in the units it receives, it stores 17, 424 or 200 of the following units. Unit *k* of ours is what its exchange *k* receives, so our blocks have to start at the index where its blocks start (see the Game Boy page).
+- **Except the blocks.** The 3DS produces its player block (424 units in Gen 1, 450 in Gen 2) and its patch lists (200) all at once: the host's highest index jumped from 206 to 632 within a quarter of a second, and again by 200 for the patch lists.
+  Its random-number list is paced by our units (a run in which the wrapper sent nothing while it waited for the list stalled with the 3DS three numbers in), though it can be ahead of ours by several units when it starts (8 in a Gen 2 trade).
+  The Gen 2 Trade Center's mail block (390) is also one burst, about 50 ms after the 3DS receives our first mail unit.
+- **What the 3DS stores.** For a block whose first preamble `fd` it sends at stream position *T*, it stores our units from *T*-1 on (it receives one unit behind what it sends), 17, 424 or 450, or 200 of them, and then
+  unpacks them as the ROM does: skip the leading control bytes, copy the data. **[measured]** In a Gen 2 trade the 3DS's own stream was its list (7 `fd`, 10 numbers), one other unit, then 6 `fd` from *T*, its
+  name at *T*+6, data, 3 bytes of padding and one more unit. With our party block 11 units late, the window ended two bytes into our sixth nickname, and exactly those two letters arrived. So our blocks have to start
+  at *T*-1 (see the Game Boy page for how the wrapper places them).
 - **Delivery.** Decoding Azahar's packets and de-duplicating by index gave exactly the units the mGBA trace shows as sent and received, no gaps and no extras (855 and 856 units in one run), so a corrupt trade screen was an alignment problem and not loss.
 - **`$FE` from the wrapper.** Answering a 3DS unit that has no unit of ours with the serial register's value was tried in hook mode and made the host's last menu exchange retry forever on `FE`, so the wrapper only sends units for transfers its own ROM starts, for a hook that is running or, in wire mode, for the exchanges described on the Game Boy page.
 
 ## Tools
 
 - `MGBA_VCLINK_TRACE=<dir>` writes `vclink_<time>.txt`: room and session states, every ROM hook (hook mode) or every exchange and phase change (wire mode), every unit sent (`tx`) and received (`rx`) with the time in milliseconds, and a heartbeat every 5 s. `MGBA_VCLINK_WIRE=0` selects hook mode (wire mode is the default).
-- `uds-esp32-probe` prints the board's firmware and the 3DS hosts it hears; `uds-air-probe <key file>` joins a host and runs the Pia session. `uds-wire-test` (110 checks: role, sync, menu, blocks, a replay of recorded cable exchanges and a closed loop against a model 3DS), `uds-cable-test` (51), `uds-bridge-test`, `uds-test` (354 checks), `uds-ccmp-test`, `uds-ccmp-golden`, `uds-key-test`, `uds-esp32-test`
+- `uds-esp32-probe` prints the board's firmware and the 3DS hosts it hears; `uds-air-probe <key file>` joins a host and runs the Pia session. `uds-wire-test` (134 checks: role, sync, menu, blocks, the mail block, a replay of recorded cable exchanges, a closed loop against a model 3DS, and the Gen 2 player block against the 3DS's measured stream and window), `uds-cable-test` (51), `uds-bridge-test`, `uds-test` (354 checks), `uds-ccmp-test`, `uds-ccmp-golden`, `uds-key-test`, `uds-esp32-test`
   need no console.
 - Azahar's own log holds the 3DS's side: every `UDS DATA TRACE RX QUEUE` / `TX GAME` line carries the full Pia payload of one packet. Splitting the payload into messages and keeping the protocol-`30`, 36-byte ones gives the unit
   streams in each direction (stream index at message offset 28, big-endian; the byte at offset 44), which can be compared unit for unit with the mGBA trace and lined up by index. That is how the block-alignment problem on the Game Boy page was found.
@@ -591,11 +595,13 @@ permanent slave was measured against the 3DS behaviour in the next section.
 - Which of the setup and keep-alive messages the VC actually requires: the pings, the clock sync, the station table, the profile contents, and what it does when one is missing. (The wrapper sends the set the retail 2DS sent and trades with both Azahar and a retail host, so that set is enough.)
 - Why Azahar fails as host (two different failures, see above) while the retail console as host works.
 - Whether `EF`, the host's first unit, is a role marker. The ROM does not send it, and the wrapper reads and discards it. Clocking is settled for the hook mode: after the receptionist hook both consoles are the internal-clock side. In wire mode the cartridge is the master and the 3DS side the slave, and that also trades.
-- Whether the comm ID, application data and `PokemonSIO` are shared across all Game Boy VC titles (H3, H4). Red and Blue trade with the wrapper using comm ID `0x00171010` and `PokemonSIO`; Yellow and Gen 2 are untested.
-- How a session ends. Gen 1 has no clean way out of the Trade Center (you leave by choosing Reset), so no teardown exchange exists in any capture; Gen 2 may differ.
+- Whether the comm ID, application data and `PokemonSIO` are shared across all Game Boy VC titles (H3, H4). The comm ID is the title ID plus `0x10` (Red `0x00171010`, Gold `0x00172610`, Silver `0x00172710`), so it is not shared;
+  the wrapper matches a family (`0x00171xxx` for Gen 1, `0x00172xxx` for Gen 2). Red, Blue, Gold and Silver trade with `PokemonSIO`; Crystal is untested.
+- How a session ends. Gen 1 has no clean way out of the Trade Center (you leave by choosing Reset), so no teardown exchange exists in any capture. Gen 2 has one: the host's VC sends a short end-of-session record on the
+  system stream when its game leaves the room, and closes the network about five seconds after it (see the Game Boy page).
 - Battles (`Wireless_start_exchange` and friends); only trades were captured.
 - Why the 3DS produces its player and patch blocks in one burst but paces its random-number list one unit per unit of ours (both measured, see above); the cause is not known.
 - A real cartridge on hardware: wire mode has only run with an emulated cartridge.
 - How the wrapper behaves when the emulator is paused: the link is polled from the emulation thread, so a paused core stops answering and the host will time it out after about 10 s.
 - Whether a retail host ever deauthenticates a first join attempt (Azahar's logs show it once); the wrapper has not seen it.
-- Gen 2: the key, the comm ID, the unit layout and the selection bytes (`$70` range) are all unmeasured.
+- Gen 2 on a retail console: Gen 2 trades were measured only against Azahar over its local bridge, where no radio encryption is involved (the unit layout and the Pia layer are Gen 1's). A retail Gen 2 host over the air is untested.
