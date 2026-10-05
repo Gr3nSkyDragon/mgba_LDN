@@ -66,8 +66,8 @@ static const struct VCGame sGames[] = {
 	{"POKEMON YEL", {1, 0x7077}, {1, 0x70D8}, {0, 0x20DB}, 0x211E, 0x1E64, 0xCC42, 0xCC3E, 0xCC3D, 0xCC47, 0xFFAA, 0x20A3, 0x20C9, 0xCC42, 0xCC3D, 0xD35D, 0xD12A},
 };
 
-// Gen 2 has different link code (the room is chosen by a nybble sync in the $70 range, there is no Dx menu, and a mail block follows
-// the patch lists), so only the wire mode, which hooks nothing, is offered for it and only as an experiment: its entries carry just the
+// Gen 2 has different link code (the syncs use the 60, 70 or 80 range by link mode, the room is confirmed by a $D0+room exchange
+// (Link_EnsureSync) instead of the Gen 1 menu, and a mail block follows the patch lists), so only the wire mode, which hooks nothing, carries it: its entries carry just the
 // addresses the heartbeat reads (wMapNumber, wLinkMode, hSerialConnectionStatus; Gold and Silver share a layout) and the family of the
 // comm ids of the titles' networks (00172610 and 00172710 have been seen from Azahar hosting Gold or Silver).
 static const struct VCGame sGen2Games[] = {
@@ -581,10 +581,12 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 	}
 	char title[VC_TITLE_KEY + 1];
 	_headerTitle(core, title);
-	bool wire = config->wire;
+	// Wire mode (the ROM is a cartridge on a link cable, nothing is hooked) is the default: it carries Red, Blue, Yellow and Gen 2.
+	// MGBA_VCLINK_WIRE=0 selects the older hook mode (Gen 1 only), which needs the debugger.
+	bool wire = true;
 	const char* wireEnv = getenv("MGBA_VCLINK_WIRE");
-	if (wireEnv && *wireEnv && *wireEnv != '0') {
-		wire = true;
+	if (wireEnv && *wireEnv) {
+		wire = *wireEnv != '0';
 	}
 	const struct VCGame* game = _findGame(core, title);
 	if (!game) {
@@ -592,10 +594,9 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 		for (i = 0; i < sizeof(sGen2Games) / sizeof(sGen2Games[0]); ++i) {
 			if (strncmp(title, sGen2Games[i].title, VC_TITLE_KEY) == 0) {
 				if (!wire) {
-					mLOG(GB_SIO, WARN, "Virtual Console: Gen 2 (%s) works only in wire mode (MGBA_VCLINK_WIRE=1), and only as an experiment", title);
+					mLOG(GB_SIO, WARN, "Virtual Console: Gen 2 (%s) works only in wire mode, which is the default (is MGBA_VCLINK_WIRE set to 0?)", title);
 					return NULL;
 				}
-				mLOG(GB_SIO, WARN, "Virtual Console: Gen 2 (%s) is experimental: the wire front end was written for Red and Blue", title);
 				game = &sGen2Games[i];
 				break;
 			}

@@ -278,7 +278,7 @@ working, and the first is the one the project moved towards: a Game Boy core is 
 
 ## Wire mode: a cartridge as master, the wrapper as a permanent slave
 
-Selected with the environment variable `MGBA_VCLINK_WIRE=1`. mGBA calls the wrapper at one place only: when the ROM starts a serial transfer (a write of `$81` to `rSC`). The wrapper is
+This is the default mode (the environment variable `MGBA_VCLINK_WIRE=0` selects hook mode instead). mGBA calls the wrapper at one place only: when the ROM starts a serial transfer (a write of `$81` to `rSC`). The wrapper is
 told the byte the master clocked out and answers with the byte the slave shifts back; it has no debugger, no breakpoints and no knowledge of ROM addresses (a heartbeat reads a few
 RAM bytes for the log, nothing more). The same code (`uds-wire.c`, `uds-cable.c`) can sit behind a pin-level front end on a microcontroller. **[measured]** Trades complete against Azahar and a retail 3DS, Red and Blue.
 
@@ -309,6 +309,12 @@ Rules that fell out of the source and the live runs:
   let the 3DS finish it. Once the 3DS's list starts the wrapper sends `fd` for its remaining 17 positions and drops the cartridge's own list units. The list has no consequence for a trade (in the hook mode's trades the cartridge sent 37 to 44 `fd` in front of its list, so the 3DS's copy was `fd` too, and
   they work), and the player block then begins at the right index. The 3DS produces the player and patch blocks in one burst after its first `fd`.
 - **`FF` is an idle line.** While the Pia session is not up the cartridge sees no partner.
+- **Gen 2** (the game table says so; Gen 1 never takes these paths): syncs in the `$70` and `$80` ranges are syncs too, and each sync's replies use the range the
+  cartridge started it in (a 3DS still in another range is ignored, as the ROM's own code does); after the patch lists the Trade Center's **mail block** is
+  carried with every exchange sending its unit (an `FE` is stored there, so none is a retry; a live run that suppressed them left the 3DS's mail exchange
+  29 units short and stalled both games) and a `00` stand-in for a reply that is not there yet, the real unit being dropped when it arrives. When the host's game
+  leaves the room its VC sends a short end-of-session record on the system stream; the wrapper answers with its own, then leaves the network as a 3DS joiner does and
+  does not rejoin for six seconds. The host's VC closes the network about five seconds after its own record whatever the partner does.
 
 ## Hook mode (the earlier design, kept as the fallback)
 
@@ -334,7 +340,7 @@ has to be buffered ahead, which is exactly what a real cartridge could not allow
 
 A hook that finishes sets the registers the ROM routine would leave (for the nybble sync: A = the nybble, B = 0, Z set; for both, BC, DE and HL as on entry) and continues at the routine's own `ret`.
 The other VC hooks (`Wireless_net_stop` / `Wireless_net_end` on the Cancel path, `Trade_save_game_end`, the battle exchanges and the 26-frame delays) are not needed for a trade and are not implemented. Yellow has the table
-above but was not tried; Gold, Silver and Crystal (`POKEMON_GLD`, `POKEMON_SLV`, `PM_CRYSTAL`) are recognised and refused.
+above but was not tried. Gold, Silver and Crystal (`POKEMON_GLD`, `POKEMON_SLV`, `PM_CRYSTAL`) are recognised and refused in hook mode: they run in wire mode only.
 
 What a native transfer looks like to the ROM: the byte on the wire for transfer *k* is `rSB` when the transfer starts (the **previous** exchange's `hSerialSendData`: the sent byte lags one exchange, see the interrupt handler above),
 and the byte received is the peer's unit *k*. `$FE` from the peer means "no data"; `Serial_ExchangeByte` retries after a frame outside a block exchange and stores it inside one (see above).
@@ -353,11 +359,18 @@ and the byte received is the peer's unit *k*. `$FE` from the peer means "no data
 
 - **Yellow [src]:** same protocol and constants as Red/Blue. Its VC build keeps the 10-frame nybble delays where Red/Blue use 26
   (`IF DEF(_RED_VC) || DEF(_BLUE_VC)`).
-- **Gen 2 [unknown, not yet read or measured here]:** from the public GB-Link trade client
-  ([GB-Link/gb-pokemon-web](https://github.com/GB-Link/gb-pokemon-web), GPLv3, used only as a reference): selections use the `$70` range
-  instead of `$60`, the party structs are 48 bytes, there are 4 sections instead of 3 (mail is the fourth), and eggs exist. None
-  of that is confirmed against pret or a trace yet.
-- **Time Capsule [unknown]:** exchanges Gen 1 mons with Gen 2; depends on the same byte layer.
+- **Gen 2 [src: pret pokegold and pokecrystal; measured]:** the byte layer (`Serial_ExchangeByte`, `Serial_ExchangeBytes`, `$FD`/`$FE`, the preamble and
+  the retry rule) is the same code as Gen 1. The link layer differs:
+  - **Nybble syncs:** one exchange per frame, `$60`+n in the Time Capsule and before a link mode is chosen, `$70`+n in the Trade Center, `$80`+n in the
+    Colosseum (`LinkTransfer`); the loop structure (loop until a valid reply, ten more, ten zero bytes) is Gen 1's. A reply in another range is ignored.
+  - **Room choice:** the receptionist's choice is confirmed by `Link_EnsureSync`, which sends `$D0`+room (`$D1` Trade Center, `$D2` Colosseum) twice per call and
+    reads the partner's; there is no cursor menu. **[measured]** `d1 d1` and `d2 d2` on the wire.
+  - **Blocks:** the random-number list (17), the party block (450 bytes: 6 preamble, 11 name, count, 6 species, terminator, 2-byte id, 6 × 48-byte structs, 6 OT
+    names, 6 nicknames, 3 padding) and the patch lists (200), as in Gen 1, then in the Trade Center a **fourth block, the mail** (390 bytes: 5 × `$20` preamble,
+    messages, metadata, patch set). The mail is exchanged by a plain `ExchangeBytes` with **no preamble check**: the first reply of any value ends the ignoring
+    and every reply after it is stored, `FE` included. Battles have three blocks.
+  - **Exit:** `WaitForOtherPlayerToExit` is a fixed sequence of transfers and delays (no waiting for the partner); the VC hooks its end (`Wireless_term_exit`).
+- **Time Capsule [user-reported]:** a Gen 2 game exchanges Gen 1 mons with a Gen 1 game; an Azahar Gold to mGBA Yellow trade through the Time Capsule worked (2026-10-05).
 
 # Open questions
 
@@ -367,4 +380,4 @@ and the byte received is the peer's unit *k*. `$FE` from the peer means "no data
   runs at emulated speed.
 - Whether a real console's `wUnknownSerialCounter2` timeout (block exchanges give up after about 20,000 polls) is ever reached in a trade; it was not seen.
 - Whether a GB-Link adapter's Game Boy mode can carry wire mode. Its public firmware lists that mode (`0x02`) as an SPI passthrough, so the byte-level rules above would have to live on the board or the host; untested.
-- Everything for Gen 2, including the Time Capsule room and whether Gen 2 has a clean exit.
+- Gen 2 is tested only in the Trade Center (Gold with Silver) and through the Time Capsule (Gold with Yellow); Crystal, battles and the mail block with real mail are not.

@@ -804,6 +804,43 @@ static void testBlockLoop(void) {
 	CHECK(runs == 2 && runLen[0] <= 2 && runLen[1] <= 2, "and sent few fd in front of the player and patch blocks (%u runs: %u, %u)", runs, runLen[0], runLen[1]);
 }
 
+// Gen 2's Link_EnsureSync (the room confirm, $D0+room, and the Time Capsule's $D4) ends as soon as a reply is in the D range, so the
+// cartridge must not be handed an assumed D0 while the 3DS has not selected anything: it is told FE and keeps asking until a real selection
+// of the 3DS's arrives (a Gen 2 game in a Time Capsule trade walked on at once and left a Gen 1 game stuck at its menu).
+static void testGen2Menu(void) {
+	struct Sim sim;
+	bringToSyncDone(&sim, 0x00);
+	sim.host.head = sim.host.tail;
+	sim.wire.readDebt = 0;
+	udsWireSetGeneration(&sim.wire, 2);
+	unsigned i;
+	bool allFe = true;
+	exchange(&sim, 0xD4);
+	CHECK(sim.wire.phase == UDS_WIRE_MENU && !sim.wire.menuHostKnown, "a Dx byte starts the menu with no selection of the 3DS's known");
+	for (i = 0; i < 12; ++i) {
+		allFe = allFe && exchange(&sim, 0xD4) == 0xFE;
+		wait(&sim, 16);
+	}
+	CHECK(allFe, "the Gen 2 cartridge is told FE while the 3DS has selected nothing");
+	hostPush(&sim.host, 0xFE);
+	hostPush(&sim.host, 0xD0);
+	hostPush(&sim.host, 0xFE);
+	hostPush(&sim.host, 0xFE);
+	hostPush(&sim.host, 0xD4);
+	hostPush(&sim.host, 0xFE);
+	uint8_t reply = 0xFE;
+	for (i = 0; i < 30 && reply == 0xFE; ++i) {
+		reply = exchange(&sim, 0xD4);
+		wait(&sim, 16);
+	}
+	CHECK(sim.wire.menuHostKnown && (reply & 0xF0) == 0xD0, "and when a selection of the 3DS's is read it is passed on (%02X)", reply);
+
+	// Gen 1 is unchanged: the menu answers D0 from the start.
+	bringToSyncDone(&sim, 0x00);
+	exchange(&sim, 0xD0);
+	CHECK(exchange(&sim, 0xD0) == 0xD0, "in Gen 1 the cartridge is told D0 at once");
+}
+
 // Gen 2's fourth block, the Trade Center's mail: a plain ExchangeBytes, so the first reply of any value ends the ignoring and every reply after
 // it is stored, FE included. Every exchange is a real one (none is a retry) and must send its unit, or the 3DS's own mail exchange is left
 // short of units and never gets to its trade menu (a live run lost 29 and stalled both games); a reply that is not there yet is a stand-in
@@ -926,6 +963,7 @@ int main(void) {
 	testRole();
 	testSync();
 	testGen2Sync();
+	testGen2Menu();
 	testMail();
 	testMenu();
 	testPass();

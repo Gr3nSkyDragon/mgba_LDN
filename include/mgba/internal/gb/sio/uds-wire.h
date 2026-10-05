@@ -93,6 +93,7 @@ struct UDSWire {
 
 	// menu
 	uint8_t menuHost; // the 3DS's selection, as the cartridge is told it
+	bool menuHostKnown; // a selection of the 3DS's has been read (Gen 2: until then the cartridge is told FE, see udsWirePreload)
 	bool pendingZero; // a 00 is held: stale byte of the next cycle, or the final transfer
 	bool hostPress; // the 3DS has pressed A or B (and the cartridge has been told)
 	bool cartPress;

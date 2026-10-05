@@ -475,12 +475,12 @@ Capture 1 timeline: Azahar's party `6f 95 4a 83 31 15` at 21.2 s; the host's `b0
 The Game Boy core of this mGBA fork (branch `mgba-ldn` of mgba_LDN) can act as the **joiner** of a VC trade: Pokémon Red or Blue in mGBA trades with Azahar's VC (over a localhost bridge) and with
 a **retail 3DS** (over the air, through an ESP32 board). It does so in either of two modes: **hook mode**, which stops the ROM at the places the VC patches, and **wire mode**, which treats the ROM as a retail
 cartridge and knows nothing of the emulator (see [How the mGBA wrapper uses the Game Boy link](gb_link.md#how-the-mgba-wrapper-uses-the-game-boy-link)). Hosting is not implemented (Azahar hosting is unsolved,
-see [Role swap](#role-swap-azahar-hosting-measured-2-captures-neither-completed)). Yellow has its addresses in the table on the Game Boy page but has not been tried; Gen 2 is recognised and refused.
+see [Role swap](#role-swap-azahar-hosting-measured-2-captures-neither-completed)). Yellow has its addresses in the table on the Game Boy page. Gen 2 (Gold, Silver, Crystal) runs in wire mode.
 **[user-reported]** Trades complete in wire mode against the Azahar bridge and against a retail 3DS (2026-10-05), and did in hook mode on both before that (the Trade Center left by resetting, as on a cable).
-The trade-back, Yellow, Gen 2, battles and a real cartridge are untested.
+**[user-reported]** Gen 2 trades work between Gold and Silver, and a Gold to Yellow trade through the Time Capsule worked (2026-10-05). When the client's game leaves the Gen 2 trade room first, the host's VC waits about five seconds after its own end-of-session record and then closes the network ("communication lost"); retail consoles do the same, so it is the VC's behaviour. The trade-back, Crystal, battles and a real cartridge are untested.
 
 Menu: **Wireless Adapter > ESP32** plus the **Virtual Console (Gen 1-2)** box is the real radio; **Wireless Adapter > Local** plus the box is the Azahar bridge. The 3DS UDS key file is set under Settings > BIOS. Wire mode is
-switched on with the environment variable `MGBA_VCLINK_WIRE=1`; there is no menu entry for it yet.
+the default (no setting needed); the environment variable `MGBA_VCLINK_WIRE=0` selects the older hook mode, which carries Gen 1 only.
 
 ## Layers
 
@@ -579,7 +579,7 @@ permanent slave was measured against the 3DS behaviour in the next section.
 
 ## Tools
 
-- `MGBA_VCLINK_TRACE=<dir>` writes `vclink_<time>.txt`: room and session states, every ROM hook (hook mode) or every exchange and phase change (wire mode), every unit sent (`tx`) and received (`rx`) with the time in milliseconds, and a heartbeat every 5 s. `MGBA_VCLINK_WIRE=1` selects wire mode.
+- `MGBA_VCLINK_TRACE=<dir>` writes `vclink_<time>.txt`: room and session states, every ROM hook (hook mode) or every exchange and phase change (wire mode), every unit sent (`tx`) and received (`rx`) with the time in milliseconds, and a heartbeat every 5 s. `MGBA_VCLINK_WIRE=0` selects hook mode (wire mode is the default).
 - `uds-esp32-probe` prints the board's firmware and the 3DS hosts it hears; `uds-air-probe <key file>` joins a host and runs the Pia session. `uds-wire-test` (110 checks: role, sync, menu, blocks, a replay of recorded cable exchanges and a closed loop against a model 3DS), `uds-cable-test` (51), `uds-bridge-test`, `uds-test` (354 checks), `uds-ccmp-test`, `uds-ccmp-golden`, `uds-key-test`, `uds-esp32-test`
   need no console.
 - Azahar's own log holds the 3DS's side: every `UDS DATA TRACE RX QUEUE` / `TX GAME` line carries the full Pia payload of one packet. Splitting the payload into messages and keeping the protocol-`30`, 36-byte ones gives the unit

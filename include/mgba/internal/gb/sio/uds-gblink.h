@@ -53,7 +53,7 @@ struct GBVCLinkConfig {
 	uint16_t sendPort;
 	const char* portName; // radio: the board's serial port, NULL or empty to find it
 	const char* keyPath; // radio: the 3DS UDS key file (Settings > BIOS)
-	bool wire; // the ROM is the master of a link cable and a front end is its slave (uds-wire.c), with no ROM hooks; also MGBA_VCLINK_WIRE=1
+	bool wire; // unused: wire mode (the ROM is the master of a link cable and a front end is its slave, uds-wire.c, no ROM hooks) is the default; MGBA_VCLINK_WIRE=0 selects the hook mode
 };
 
 struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, const uint16_t name[GBVC_NAME_WORDS],

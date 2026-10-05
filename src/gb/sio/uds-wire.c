@@ -59,6 +59,7 @@ static void _payDebt(struct UDSWire* wire) {
 		--wire->readDebt;
 		if (wire->menuEra && _isMenu(host)) {
 			wire->menuHost = host;
+			wire->menuHostKnown = true;
 			if (host & 0x0C) {
 				wire->hostPress = true;
 			}
@@ -225,6 +226,13 @@ uint8_t udsWirePreload(struct UDSWire* wire) {
 		}
 		return UDS_WIRE_NO_DATA;
 	case UDS_WIRE_MENU:
+		// Gen 1's menu loops until someone presses A, so an assumed D0 does no harm there. Gen 2's Link_EnsureSync is a rendezvous that
+		// returns as soon as a reply is in the D range: an assumed D0 ended it before the 3DS's game had reached its own menu (a Gen 1 game
+		// in a Time Capsule trade), the Gen 2 game walked on and the 3DS waited at its menu for ever. Until a selection of the 3DS's has been
+		// read the cartridge is told it has no data and goes on asking, as on a cable with no partner.
+		if (wire->gen2 && !wire->menuHostKnown) {
+			return UDS_WIRE_NO_DATA;
+		}
 		return wire->menuHost;
 	case UDS_WIRE_PASS:
 		_drain(wire); // a block cannot wait for the next poll
@@ -396,6 +404,7 @@ static void _enterMenu(struct UDSWire* wire) {
 	wire->menuEra = true;
 	wire->echoWanted = false;
 	wire->menuHost = 0xD0;
+	wire->menuHostKnown = false;
 	wire->outstanding = false;
 	wire->preloadHost = false;
 }
