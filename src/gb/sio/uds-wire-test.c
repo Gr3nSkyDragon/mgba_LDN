@@ -573,14 +573,15 @@ static void testPass(void) {
 	CHECK(sim.host.sentCount == base2 + 2 && sim.host.sent[base2 + 1] == 0x44, "a different byte after FE is a new exchange and is sent");
 	exchange(&sim, 0xFD);
 	exchange(&sim, 0xFD);
-	CHECK(sim.host.sentCount == base2 + 3, "an fd repeated while waiting is sent once");
+	// fd is the cartridge waiting for a block: padding, sent only while we are not ahead of the 3DS's stream (we are, by two).
+	CHECK(sim.host.sentCount == base2 + 2, "an fd while waiting is not sent ahead of the 3DS (%u)", sim.host.sentCount - base2);
 
 	// The 3DS's units arrive: they are read into the buffer and delivered in order.
 	hostPush(&sim.host, 0xB1);
 	hostPush(&sim.host, 0xB2);
 	hostPush(&sim.host, 0xB3);
 	reply = exchange(&sim, 0x33);
-	CHECK(reply == 0xB1 && sim.host.head == sim.host.tail && sim.wire.rxCount == 2 && sim.host.sentCount == base2 + 4,
+	CHECK(reply == 0xB1 && sim.host.head == sim.host.tail && sim.wire.rxCount == 2 && sim.host.sentCount == base2 + 3,
 	      "when the 3DS's units arrive they are read at once, the first is the reply and the exchange is sent (%02X)", reply);
 	reply = exchange(&sim, 0x33);
 	CHECK(reply == 0xB2, "in order");
@@ -801,7 +802,117 @@ static void testBlockLoop(void) {
 	}
 	// The random-number list is covered by fd and the cartridge's own units for it dropped, so the player and patch blocks are the
 	// two runs that end in the test cartridge's first data byte.
-	CHECK(runs == 2 && runLen[0] <= 2 && runLen[1] <= 2, "and sent few fd in front of the player and patch blocks (%u runs: %u, %u)", runs, runLen[0], runLen[1]);
+	CHECK(runs <= 2 && runLen[0] <= 2 && runLen[1] <= 2, "and sent few fd in front of the player and patch blocks (%u runs: %u, %u)", runs, runLen[0], runLen[1]);
+}
+
+// The Gen 2 player block against a 3DS that behaves as the Azahar log of a trade shows, and a cartridge that runs pret's
+// Serial_ExchangeBytes (while ignoring it re-sends its block's first byte; on an fd reply it sends the whole block from its first byte,
+// storing a reply per byte). Measured in that trade: the 3DS's random-number list (7 fd, 10 numbers) arrived 8 units ahead of ours, then
+// one other unit, then its player block in one burst: 6 fd, 441 bytes of data, 3 of padding and one more unit. It stores our units from
+// one before its own first preamble fd for 450 units, skips fd and 00, and copies 441 bytes. With our block 11 units late the last 9
+// bytes (the sixth nickname but its first two letters) fell outside that window.
+static void testPlayerBlockWindow(void) {
+	struct Sim sim;
+	bringToPassClean(&sim);
+	udsWireSetGeneration(&sim.wire, 2);
+	unsigned r0 = sim.wire.recvUnits + (sim.host.tail - sim.host.head); // the position of the 3DS's next scripted unit
+	int sentToPos = (int) sim.wire.sentUnits - (int) sim.host.sentCount; // our position = host.sentCount + this
+	unsigned n = 0, i;
+	// releaseAt counts our units the 3DS has received; a unit at our position p has been received once host.sentCount > p - sentToPos.
+#define AT_POS(p) ((unsigned) ((int) (p) - sentToPos))
+	for (i = 0; i < 8; ++i) { // what came before the list
+		sim.host.script[n] = 0x00;
+		sim.host.releaseAt[n++] = 0;
+	}
+	unsigned listStart = r0 + n;
+	for (i = 0; i < 17; ++i) { // the list, 8 ahead of ours
+		sim.host.script[n] = i < 7 ? 0xFD : (uint8_t) (0x10 + i);
+		sim.host.releaseAt[n] = AT_POS(listStart + i - 8);
+		++n;
+	}
+	unsigned p3 = r0 + n;
+	sim.host.script[n] = 0x00;
+	sim.host.releaseAt[n++] = AT_POS(p3 - 1);
+	unsigned t = r0 + n; // the 3DS's first preamble fd
+	uint8_t hostBlock[451];
+	for (i = 0; i < 451; ++i) {
+		hostBlock[i] = i < 6 ? 0xFD : i < 447 ? (uint8_t) (0x80 + (i * 3) % 0x4F) : 0x00;
+		sim.host.script[n] = hostBlock[i];
+		sim.host.releaseAt[n++] = AT_POS(p3); // the burst, once the 3DS has our unit in front of its block
+	}
+	unsigned t2 = r0 + n; // its patch lists: once it has our whole player block
+	for (i = 0; i < 201; ++i) {
+		sim.host.script[n] = i < 3 ? 0xFD : (uint8_t) (i < 13 ? 0x00 : 0xFF);
+		sim.host.releaseAt[n++] = AT_POS(t - 1 + 450);
+	}
+	sim.host.scriptLen = n;
+	sim.host.scriptPos = 0;
+	sim.host.reactive = true;
+
+	// The cartridge: its three blocks, as Gen2ToGen2LinkComms lays them out.
+	static const unsigned kSize[3] = {17, 450, 200};
+	uint8_t blocks[3][450];
+	for (i = 0; i < 17; ++i) {
+		blocks[0][i] = i < 7 ? 0xFD : (uint8_t) (0x40 + i);
+	}
+	for (i = 0; i < 450; ++i) {
+		blocks[1][i] = i < 6 ? 0xFD : i < 447 ? (uint8_t) (0x81 + (i * 7) % 0x4D) : 0x00;
+	}
+	for (i = 0; i < 200; ++i) {
+		blocks[2][i] = i < 3 ? 0xFD : (uint8_t) (i < 13 ? 0x00 : 0xFF);
+	}
+	unsigned partyStart = 0, patchStart = 0, b, exchanges = 0;
+	bool partyStored = true;
+	for (b = 0; b < 3; ++b) {
+		uint8_t reply;
+		do {
+			reply = exchange(&sim, blocks[b][0]);
+			wait(&sim, 1);
+			++exchanges;
+		} while (reply != 0xFD && exchanges < 20000);
+		for (i = 0; i < kSize[b] && exchanges < 20000; ++i) {
+			if (i == 0) {
+				unsigned at = sim.wire.sentUnits; // the position the block's first byte will take
+				if (b == 1) {
+					partyStart = at;
+				} else if (b == 2) {
+					patchStart = at;
+				}
+			}
+			reply = exchange(&sim, blocks[b][i]);
+			wait(&sim, 1);
+			++exchanges;
+			if (b == 1 && i < 450) {
+				partyStored = partyStored && reply == hostBlock[i + 1];
+			}
+		}
+	}
+	CHECK(exchanges < 20000, "the three blocks complete (%u exchanges)", exchanges);
+	CHECK(partyStored, "the cartridge stored the 3DS's player block from its second preamble fd on");
+	// Where our blocks went (the cartridge may have left preamble fd out; what counts is where the data begins).
+	unsigned ourName = 0;
+	for (i = 0; i < sim.host.sentCount; ++i) {
+		unsigned pos = (unsigned) ((int) i + sentToPos);
+		if (pos >= partyStart && sim.host.sent[i] == blocks[1][6] && !ourName) {
+			ourName = pos;
+		}
+	}
+	CHECK(ourName == t + 5, "our name goes out one unit before the 3DS's own name, as its window needs (ours %d from it)", (int) ourName - (int) (t + 6));
+	// The 3DS's window: our units from t-1, 450 of them; skip fd and 00, then 441 bytes must be our data.
+	uint8_t window[450];
+	for (i = 0; i < 450; ++i) {
+		int idx = (int) (t - 1 + i) - sentToPos;
+		window[i] = idx >= 0 && (unsigned) idx < sim.host.sentCount ? sim.host.sent[idx] : 0x00;
+	}
+	unsigned skip = 0;
+	while (skip < 450 && (window[skip] == 0xFD || window[skip] == 0x00 || window[skip] == 0xFE)) {
+		++skip;
+	}
+	bool whole = skip + 441 <= 450 && !memcmp(&window[skip], &blocks[1][6], 441);
+	CHECK(whole, "and the 3DS's window holds all 441 bytes of our data, the last nickname included (data from %u)", skip);
+	// The patch lists the same way: ours start one unit before the 3DS's first preamble fd.
+	CHECK(patchStart == t2 - 1, "and the patch lists start one unit before the 3DS's (ours %d from it)", (int) patchStart - (int) (t2 - 1));
+#undef AT_POS
 }
 
 // Gen 2's Link_EnsureSync (the room confirm, $D0+room, and the Time Capsule's $D4) ends as soon as a reply is in the D range, so the
@@ -970,6 +1081,7 @@ int main(void) {
 	testGen2Sync();
 	testGen2Menu();
 	testMail();
+	testPlayerBlockWindow();
 	testMenu();
 	testPass();
 	testBlocks(NULL);

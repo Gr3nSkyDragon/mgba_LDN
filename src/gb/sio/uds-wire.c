@@ -89,9 +89,63 @@ static uint8_t _rxTake(struct UDSWire* wire) {
 	return byte;
 }
 
+// The port the cable and the wire use counts every unit of the session in both directions (see _headPosition).
+static bool _countReady(void* context) {
+	struct UDSWire* wire = context;
+	return wire->inner.ready(wire->inner.context);
+}
+
+static bool _countQueue(void* context, uint8_t byte) {
+	struct UDSWire* wire = context;
+	if (!wire->inner.queue(wire->inner.context, byte)) {
+		return false;
+	}
+	++wire->sentUnits;
+	return true;
+}
+
+static void _countFlush(void* context) {
+	struct UDSWire* wire = context;
+	wire->inner.flush(wire->inner.context);
+}
+
+static bool _countPop(void* context, uint8_t* byte) {
+	struct UDSWire* wire = context;
+	if (!wire->inner.pop(wire->inner.context, byte)) {
+		return false;
+	}
+	++wire->recvUnits;
+	return true;
+}
+
+static bool _countPeek(void* context, uint8_t* byte) {
+	struct UDSWire* wire = context;
+	return wire->inner.peek(wire->inner.context, byte);
+}
+
+static size_t _countWaiting(void* context) {
+	struct UDSWire* wire = context;
+	return wire->inner.waiting(wire->inner.context);
+}
+
+static void _countTrace(void* context, const char* line) {
+	struct UDSWire* wire = context;
+	wire->inner.trace(wire->inner.context, line);
+}
+
 void udsWireInit(struct UDSWire* wire, const struct UDSUnitPort* port) {
 	memset(wire, 0, sizeof(*wire));
-	udsCableInit(&wire->cable, port);
+	wire->inner = *port;
+	udsCableInit(&wire->cable, &(struct UDSUnitPort) {
+		.context = wire,
+		.ready = _countReady,
+		.queue = _countQueue,
+		.flush = _countFlush,
+		.pop = _countPop,
+		.peek = _countPeek,
+		.waiting = _countWaiting,
+		.trace = port->trace ? _countTrace : NULL,
+	});
 	wire->phase = UDS_WIRE_DOWN;
 	wire->hostNybble = -1;
 	wire->menuHost = 0xD0;
@@ -148,6 +202,7 @@ void udsWirePoll(struct UDSWire* wire, uint32_t nowMs) {
 	if (wire->phase == UDS_WIRE_DOWN) {
 		if (!wire->begun) {
 			udsCableBegin(&wire->cable);
+			wire->sentUnits = wire->recvUnits = 0; // a new session: both streams count from their first unit
 			wire->begun = true;
 			wire->readDebt = 0;
 			wire->phase = UDS_WIRE_ROLE;
@@ -297,6 +352,63 @@ static void _blockStored(struct UDSWire* wire) {
 	}
 }
 
+// Stream positions. Both streams count from their first unit (the 3DS's EF and our first unit are both index -2001), and unit k of
+// ours is paired with unit k of the 3DS's: sentUnits is the position our next unit takes, and the unit at the head of the receive
+// buffer is the 3DS's unit number recvUnits - rxCount.
+static unsigned _headPosition(const struct UDSWire* wire) {
+	return wire->recvUnits - wire->rxCount;
+}
+
+// While the cartridge waits for a block it sends fd, and they go out only as padding the 3DS needs: never more than one unit ahead
+// of what the 3DS has delivered (its exchanges are paced by ours; it never waits on one we have not sent), and once the 3DS's own
+// block can be seen in the buffer, never past the position our block must start at (see _alignBlock).
+static bool _padAllowed(const struct UDSWire* wire) {
+	if (wire->sentUnits > wire->recvUnits) {
+		return false;
+	}
+	if (wire->rnCovered && wire->blockIndex % UDS_WIRE_BLOCKS == 0) {
+		// The 3DS's list is under way (it runs ahead of ours), and its player block comes after the list's last position: stop there.
+		return wire->sentUnits < wire->rnListEnd;
+	}
+	if (wire->blockIndex % UDS_WIRE_BLOCKS != 0 && !wire->blockStoring && !wire->mailMode) {
+		unsigned i;
+		for (i = 0; i < wire->rxCount; ++i) {
+			if (wire->rx[(wire->rxHead + i) % UDS_WIRE_RX] == 0xFD) {
+				return wire->sentUnits + 1 < _headPosition(wire) + i;
+			}
+		}
+	}
+	return true;
+}
+
+// The cartridge's ignoring has just ended on the 3DS's first preamble fd of a block (player block or patch lists), at position T.
+// The 3DS's block is preamble fd, then data: the player block 6 fd, 441 bytes (name, party, IDs, structs, OT names, nicknames) and 3 of
+// padding, 450 in all; the patch lists 3 fd and 197. Its exchanges receive one unit behind what they send, so it stores our units T-1
+// to T+448 (measured: with our block 11 late the nickname of the sixth Pokemon kept exactly two letters, the last two our window left
+// it), skips the fd and copies 441 bytes from the first other one. The cartridge's block (the same layout) must therefore start at
+// T-1, as the 3DS's own did in its stream: what we have sent up to here is padding, so fill up to T-1 with fd, or, if we are already
+// past it, leave out as many of the cartridge's own preamble fd as that.
+static void _alignBlock(struct UDSWire* wire) {
+	struct UDSUnitPort* port = &wire->cable.port;
+	unsigned t = _headPosition(wire) - 1; // the unit just taken
+	unsigned target = t ? t - 1 : 0;
+	unsigned preamble = wire->blockIndex % UDS_WIRE_BLOCKS == 1 ? UDS_WIRE_PREAMBLE : UDS_WIRE_PATCH_PREAMBLE;
+	if (wire->sentUnits <= target) {
+		unsigned fill = target - wire->sentUnits;
+		unsigned i;
+		for (i = 0; i < fill; ++i) {
+			port->queue(port->context, 0xFD);
+		}
+		wire->blockDrop = 0;
+		_trace(wire, "block %u: the 3DS's starts at unit %u; ours starts at %u after %u fd of padding", wire->blockIndex, t, target, fill);
+	} else {
+		unsigned late = wire->sentUnits - target;
+		wire->blockDrop = late < preamble ? late : preamble;
+		_trace(wire, "block %u: the 3DS's starts at unit %u; ours would start %u late, leaving out %u of its preamble fd%s", wire->blockIndex, t, late,
+		       wire->blockDrop, late > preamble ? " (STILL LATE: the end of the block is lost)" : "");
+	}
+}
+
 // Units are index-paired with the 3DS's: our unit k is what the 3DS receives in its exchange k, so a block we send must begin at
 // the index where the 3DS's own block begins, or its ignoring phase ends too early and it stores the wrong bytes (padding fds 25
 // positions ahead of its block put our random numbers where its player block started, and the trade menu showed garbage).
@@ -349,31 +461,38 @@ static void _pass(struct UDSWire* wire, uint32_t nowMs, uint8_t byte) {
 		_blockStored(wire);
 	}
 	if (!storing && !wire->mailMode && !wire->rnCovered && wire->blockIndex % UDS_WIRE_BLOCKS == 0 && wire->rxCount && wire->rx[wire->rxHead] == 0xFD) {
-		// The 3DS's random-number list is starting (its first fd is next in line). Its exchanges are paced by our units: it
-		// needs one for each of the list's 18 positions (the fd that ends its ignoring, seven of preamble, ten numbers) and, with
-		// the cartridge held until the list is buffered, only we can supply them. The list is of no consequence (the hook wrapper's
-		// trades leave the 3DS's all fd), so cover the rest of it with fd and drop the cartridge's own units for it; the player
-		// block's first unit is then the next one, which is where the 3DS's player block begins.
-		unsigned i;
-		for (i = 0; i < UDS_WIRE_RN_POSITIONS - 1; ++i) {
-			port->queue(port->context, 0xFD);
-		}
+		// The 3DS's random-number list is starting (its first fd is next in line). The list is of no consequence (the hook wrapper's
+		// trades leave the 3DS's all fd), so the cartridge's own units for it are not sent: fd stand in for them, as many as the 3DS
+		// needs to go on (see _padAllowed), so that the stream stays level with the 3DS's for the player block that follows.
 		wire->rnCovered = true;
+		wire->rnListEnd = _headPosition(wire) + UDS_WIRE_RN_POSITIONS - 1; // its 7 fd and 10 numbers
 		wire->rnSuppress = true;
 		wire->rnSeenFd = false;
 		wire->rnNumbers = 0;
-		_trace(wire, "block %u: the 3DS's list starts; covered it with %u fd and dropping the cartridge's own", wire->blockIndex, UDS_WIRE_RN_POSITIONS - 1);
+		_trace(wire, "block %u: the 3DS's list starts (units: %u received, %u sent); dropping the cartridge's own", wire->blockIndex, wire->recvUnits, wire->sentUnits);
 	}
-	if (wire->rnSuppress) {
-		// The cartridge's own list (fd preamble, then ten numbers, all below fd) has been covered: its units are not sent.
+	if (opening && wire->blockIndex % UDS_WIRE_BLOCKS != 0) {
+		_alignBlock(wire); // the cartridge's ignoring fd: the units in front of its block are decided there
+	} else if (wire->rnSuppress) {
+		// The cartridge's own list (fd preamble, then ten numbers, all below fd) is not sent.
 		if (byte == 0xFD) {
 			wire->rnSeenFd = true;
 		} else if (wire->rnSeenFd && ++wire->rnNumbers >= UDS_WIRE_RN_NUMBERS) {
 			wire->rnSuppress = false;
 		}
+		if (_padAllowed(wire)) {
+			port->queue(port->context, 0xFD);
+		}
+	} else if (storing && wire->blockDrop && byte == 0xFD) {
+		--wire->blockDrop; // a preamble fd of a block that would otherwise start late (see _alignBlock)
 	} else if (storing || wire->mailMode) {
 		port->queue(port->context, byte);
-	} else if (!retry && (byte != 0xFD || wire->pending < UDS_WIRE_PENDING_MAX)) {
+	} else if (byte == 0xFD) {
+		// The cartridge waits for a block, sending fd: they are padding, sent only as the 3DS needs them (see _padAllowed).
+		if (_padAllowed(wire)) {
+			port->queue(port->context, 0xFD);
+		}
+	} else if (!retry) {
 		port->queue(port->context, byte);
 		++wire->pending;
 	}
@@ -392,6 +511,7 @@ static void _enterPass(struct UDSWire* wire) {
 	wire->blockRemaining = 0;
 	wire->blockUnderruns = 0;
 	wire->blockSkip = 0;
+	wire->blockDrop = 0;
 	wire->mailMode = false;
 	wire->mailData = wire->mailPre = false;
 	wire->rnCovered = wire->rnSuppress = false;

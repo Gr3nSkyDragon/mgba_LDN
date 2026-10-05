@@ -70,6 +70,9 @@ enum UDSWireSyncPart {
 
 struct UDSWire {
 	struct UDSCable cable; // the unit port, the 3DS side of the sync and the menu echo
+	struct UDSUnitPort inner; // the caller's port; the cable's own counts the units that pass through it
+	unsigned sentUnits; // units sent and received in this session; both streams count from their first unit and are index-paired
+	unsigned recvUnits;
 
 	enum UDSWirePhase phase;
 	bool begun; // this session's first unit has been sent (once per link-up, so a sync timeout does not start another)
@@ -117,9 +120,11 @@ struct UDSWire {
 	bool mailData; // the mail block's first byte after the $20 run has been served (before it, late replies are $20 and nothing is dropped)
 	bool rnCovered; // the 3DS's random-number list has been covered with fd (see _pass)
 	bool rnSuppress; // the cartridge's own list's units are being dropped
+	unsigned rnListEnd; // the stream position just after the 3DS's list
 	bool rnSeenFd;
 	unsigned rnNumbers; // its numbers seen so far
 	unsigned blockSkip; // units to drop from the buffer so that an FE stored as data does not shift the block
+	unsigned blockDrop; // the cartridge's preamble fd left out so that its block starts where the 3DS's window does
 	bool preloadFill; // the reply loaded is a stand-in for the block's last byte, which the 3DS has not produced yet
 
 	// PASS has its own receive buffer. The 3DS only produces its next unit once it has ours (its exchanges block), so every
@@ -136,6 +141,8 @@ struct UDSWire {
 #define UDS_WIRE_BLOCKS 3
 #define UDS_WIRE_RN_POSITIONS 18 // the list's exchanges on the 3DS: the fd that ends its ignoring, seven of preamble, ten numbers
 #define UDS_WIRE_RN_NUMBERS 10
+#define UDS_WIRE_PREAMBLE 6 // fd in front of the player block (SERIAL_PREAMBLE_LENGTH)
+#define UDS_WIRE_PATCH_PREAMBLE 3 // fd in front of the patch lists (SERIAL_PATCH_PREAMBLE_LENGTH)
 
 #define UDS_WIRE_MAIL_PREAMBLE_BYTE 0x20 // opens the Gen 2 mail block (five of them from a game; the receiver accepts a run of any length)
 
