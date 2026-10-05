@@ -85,7 +85,7 @@ static void onRx(void* context, const struct UDSEsp32Rx* rx) {
 	}
 	printf("host %02X:%02X:%02X:%02X:%02X:%02X  channel %u  rssi %d dBm  comm id %08X  network id %08X%s\n", transmitter[0], transmitter[1],
 	       transmitter[2], transmitter[3], transmitter[4], transmitter[5], rx->channel, rx->rssi, host.commId, host.networkId,
-	       host.commId == UDS_PIA_COMM_ID ? "  (Game Boy Virtual Console)" : "");
+	       ((host.commId & 0xFFFFF000u) == 0x00171000u || (host.commId & 0xFFFFF000u) == 0x00172000u) ? "  (Game Boy Virtual Console)" : "");
 	printf("     application data (%u bytes, first 16):", host.appDataSize);
 	for (i = 0; i < 16; ++i) {
 		printf(" %02X", host.appData[i]);

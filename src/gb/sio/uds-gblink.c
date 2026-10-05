@@ -51,7 +51,14 @@ struct VCGame {
 	uint16_t menuReceive; // wLinkMenuSelectionReceiveBuffer (two bytes)
 	uint16_t curMap; // wCurMap, for the trace heartbeat only
 	uint16_t linkState; // wLinkState, likewise
+	bool gen2; // the wire front end recognises the 70 and 80 syncs
+	uint32_t commFamily; // the upper part of the WLAN communication id of the title's UDS network (see VC_COMM_MASK); 0 is the Gen 1 titles'
 };
+
+// The comm id is the title id plus 0x10 (Red 00171000 advertises 00171010) and so differs between versions: Azahar hosting Gold or
+// Silver advertised both 00172610 and 00172710. Titles of one generation share all but the low 12 bits.
+#define VC_COMM_MASK 0xFFFFF000u
+#define VC_GEN1_COMM_FAMILY 0x00171000u
 
 static const struct VCGame sGames[] = {
 	{"POKEMON RED", {1, 0x7202}, {1, 0x7260}, {0, 0x227F}, 0x22C2, 0x20AF, 0xCC42, 0xCC3E, 0xCC3D, 0xCC47, 0xFFAA, 0x2247, 0x226D, 0xCC42, 0xCC3D, 0xD35E, 0xD12B},
@@ -59,8 +66,15 @@ static const struct VCGame sGames[] = {
 	{"POKEMON YEL", {1, 0x7077}, {1, 0x70D8}, {0, 0x20DB}, 0x211E, 0x1E64, 0xCC42, 0xCC3E, 0xCC3D, 0xCC47, 0xFFAA, 0x20A3, 0x20C9, 0xCC42, 0xCC3D, 0xD35D, 0xD12A},
 };
 
-// Recognised, but there is no Gen 2 driver yet (different link code and a different key, see the plan's open questions).
-static const char* const sGen2Titles[] = {"POKEMON_GLD", "POKEMON_SLV", "PM_CRYSTAL"};
+// Gen 2 has different link code (the room is chosen by a nybble sync in the $70 range, there is no Dx menu, and a mail block follows
+// the patch lists), so only the wire mode, which hooks nothing, is offered for it and only as an experiment: its entries carry just the
+// addresses the heartbeat reads (wMapNumber, wLinkMode, hSerialConnectionStatus; Gold and Silver share a layout) and the family of the
+// comm ids of the titles' networks (00172610 and 00172710 have been seen from Azahar hosting Gold or Silver).
+static const struct VCGame sGen2Games[] = {
+	{.title = "POKEMON_GLD", .connectionStatus = 0xFFCD, .curMap = 0xDA01, .linkState = 0xD042, .commFamily = 0x00172000, .gen2 = true},
+	{.title = "POKEMON_SLV", .connectionStatus = 0xFFCD, .curMap = 0xDA01, .linkState = 0xD042, .commFamily = 0x00172000, .gen2 = true},
+	{.title = "PM_CRYSTAL", .connectionStatus = 0xFFCB, .curMap = 0xDCB6, .linkState = 0xC2DC, .commFamily = 0x00172000, .gen2 = true},
+};
 
 // What the hooked ROM routine is doing. While one is active the serial device does not pair transfers.
 enum HleKind {
@@ -567,23 +581,30 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 	}
 	char title[VC_TITLE_KEY + 1];
 	_headerTitle(core, title);
-	const struct VCGame* game = _findGame(core, title);
-	if (!game) {
-		size_t i;
-		for (i = 0; i < sizeof(sGen2Titles) / sizeof(sGen2Titles[0]); ++i) {
-			if (strncmp(title, sGen2Titles[i], VC_TITLE_KEY) == 0) {
-				mLOG(GB_SIO, WARN, "Virtual Console: Gen 2 (%s) is not supported yet, only Red, Blue and Yellow", title);
-				return NULL;
-			}
-		}
-		mLOG(GB_SIO, WARN, "Virtual Console: this game is not one the wrapper knows (header title \"%s\"; Red, Blue and Yellow are)",
-		     title);
-		return NULL;
-	}
 	bool wire = config->wire;
 	const char* wireEnv = getenv("MGBA_VCLINK_WIRE");
 	if (wireEnv && *wireEnv && *wireEnv != '0') {
 		wire = true;
+	}
+	const struct VCGame* game = _findGame(core, title);
+	if (!game) {
+		size_t i;
+		for (i = 0; i < sizeof(sGen2Games) / sizeof(sGen2Games[0]); ++i) {
+			if (strncmp(title, sGen2Games[i].title, VC_TITLE_KEY) == 0) {
+				if (!wire) {
+					mLOG(GB_SIO, WARN, "Virtual Console: Gen 2 (%s) works only in wire mode (MGBA_VCLINK_WIRE=1), and only as an experiment", title);
+					return NULL;
+				}
+				mLOG(GB_SIO, WARN, "Virtual Console: Gen 2 (%s) is experimental: the wire front end was written for Red and Blue", title);
+				game = &sGen2Games[i];
+				break;
+			}
+		}
+		if (!game) {
+			mLOG(GB_SIO, WARN, "Virtual Console: this game is not one the wrapper knows (header title \"%s\"; Red, Blue and Yellow are)",
+			     title);
+			return NULL;
+		}
 	}
 	if (!wire && !debugger) {
 		mLOG(GB_SIO, ERROR, "Virtual Console: this build has no debugger, so the ROM hooks cannot be installed");
@@ -611,6 +632,7 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 			.waiting = _portWaiting,
 			.trace = _portTrace,
 		});
+		udsWireSetGeneration(&link->wire, game->gen2 ? 2 : 1);
 	}
 	udsCableInit(&link->cable, &(struct UDSUnitPort) {
 		.context = link,
@@ -641,6 +663,19 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 		mLOG(GB_SIO, ERROR, "Virtual Console: cannot listen for Azahar's UDS bridge (is another mGBA using the port?)");
 		GBVCLinkDestroy(link);
 		return NULL;
+	}
+
+	link->joiner.leaveWithHost = game->gen2;
+
+	// On the radio only hosts of this generation's titles are joined (the beacon carries the comm id, which differs between versions).
+	// The Azahar bridge has one possible host, so it is joined whatever title it runs: any version can be tested against any other.
+	if (config->air == GBVC_AIR_BRIDGE) {
+		link->joiner.room.wantCommId = 0;
+		_trace(link, "bridge: joining whatever Azahar hosts");
+	} else {
+		link->joiner.room.wantCommId = game->commFamily ? game->commFamily : VC_GEN1_COMM_FAMILY;
+		link->joiner.room.wantCommMask = VC_COMM_MASK;
+		_trace(link, "looking for a host with comm id %08X/%08X", (unsigned) link->joiner.room.wantCommId, (unsigned) link->joiner.room.wantCommMask);
 	}
 
 	link->d.init = _driverInit;

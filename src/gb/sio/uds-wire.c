@@ -23,8 +23,9 @@ static void _trace(struct UDSWire* wire, const char* format, ...) {
 	wire->cable.port.trace(wire->cable.port.context, line);
 }
 
-static bool _isSync(uint8_t byte) {
-	return (byte & 0xF0) == 0x60;
+static bool _isSync(const struct UDSWire* wire, uint8_t byte) {
+	uint8_t high = byte & 0xF0;
+	return high == 0x60 || (wire->gen2 && (high == 0x70 || high == 0x80));
 }
 
 static bool _isMenu(uint8_t byte) {
@@ -93,6 +94,11 @@ void udsWireInit(struct UDSWire* wire, const struct UDSUnitPort* port) {
 	wire->phase = UDS_WIRE_DOWN;
 	wire->hostNybble = -1;
 	wire->menuHost = 0xD0;
+	wire->syncHigh = 0x60;
+}
+
+void udsWireSetGeneration(struct UDSWire* wire, int generation) {
+	wire->gen2 = generation == 2;
 }
 
 static void _menuEnd(struct UDSWire* wire) {
@@ -178,6 +184,7 @@ void udsWirePoll(struct UDSWire* wire, uint32_t nowMs) {
 		_menuEnd(wire);
 	} else if (wire->phase == UDS_WIRE_PASS && nowMs - wire->lastExchangeMs > UDS_WIRE_GAP_MS) {
 		wire->phase = UDS_WIRE_IDLE;
+		wire->mailMode = false;
 		wire->strandedPending = true;
 		wire->outstanding = false;
 		wire->preloadHost = false;
@@ -205,7 +212,7 @@ uint8_t udsWirePreload(struct UDSWire* wire) {
 		}
 		switch (wire->syncPart) {
 		case UDS_WIRE_SYNC_LOOPS12:
-			return 0x60 | wire->hostNybble;
+			return wire->syncHigh | wire->hostNybble;
 		case UDS_WIRE_SYNC_LOOP3:
 			return wire->zeros < UDS_WIRE_LOOP3_ZEROS ? 0x00 : UDS_WIRE_NO_DATA;
 		case UDS_WIRE_SYNC_DONE:
@@ -226,6 +233,12 @@ uint8_t udsWirePreload(struct UDSWire* wire) {
 			--wire->blockSkip;
 		}
 		if (!wire->rxCount) {
+			if (wire->mailMode) {
+				// The mail block's replies are all stored, and its first reply, whatever it is, ends the ignoring: an FE would be stored as
+				// data like any other. Stand in with 00 (what mail data mostly is); the real unit is dropped when it arrives.
+				wire->preloadFill = true;
+				return 0x00;
+			}
 			if (wire->blockStoring && wire->blockRemaining == 1) {
 				// The last byte the cartridge stores is the first unit of the next block (the 3DS's player block is one unit short of what
 				// the cartridge stores), which the 3DS produces only after it has received our block. Stand in for it with what it will be;
@@ -236,7 +249,7 @@ uint8_t udsWirePreload(struct UDSWire* wire) {
 			return UDS_WIRE_NO_DATA;
 		}
 		host = wire->rx[wire->rxHead];
-		if (!wire->blockStoring && host == 0xFD) {
+		if (!wire->blockStoring && !wire->mailMode && host == 0xFD) {
 			// The cartridge is ignoring replies until an fd; once it has one it stores what follows, and a reply that is not there
 			// is stored as FE. Hold the fd (the cartridge ignores FE and goes on sending fd) until the whole block is in the buffer,
 			// so that every byte after it can be served.
@@ -262,6 +275,9 @@ static void _blockStored(struct UDSWire* wire) {
 		if (wire->blockIndex % UDS_WIRE_BLOCKS == 1) {
 			wire->rnCovered = false; // the list of the next cycle is covered afresh
 		}
+		if (wire->gen2 && wire->blockIndex % UDS_WIRE_BLOCKS == 0) {
+			wire->mailMode = true; // the patch lists were the third block; in the Trade Center a fourth follows
+		}
 	}
 }
 
@@ -278,13 +294,14 @@ static void _pass(struct UDSWire* wire, uint32_t nowMs, uint8_t byte) {
 	bool storing = wire->blockStoring;
 	bool opening = false;
 	bool answered = false;
-	bool retry = wire->outstanding && wire->outstandingByte == byte && !wire->preloadHost && !wire->preloadFill;
+	// (Not in the mail block: there an FE is stored, so every exchange is a real one and sends its unit.)
+	bool retry = !wire->mailMode && wire->outstanding && wire->outstandingByte == byte && !wire->preloadHost && !wire->preloadFill;
 	if (wire->preloadHost && wire->rxCount) {
 		uint8_t host = _rxTake(wire);
 		answered = true;
 		if (storing) {
 			_blockStored(wire);
-		} else if (host == 0xFD) {
+		} else if (host == 0xFD && !wire->mailMode) {
 			// This fd ends the cartridge's ignoring: the replies after it are the block.
 			opening = true;
 			wire->blockStoring = true;
@@ -295,7 +312,9 @@ static void _pass(struct UDSWire* wire, uint32_t nowMs, uint8_t byte) {
 		}
 	} else if (wire->preloadFill) {
 		++wire->blockSkip; // the real unit that this stood in for
-		_trace(wire, "block %u: the last byte was not there yet, filled in", wire->blockIndex);
+		if (storing) {
+			_trace(wire, "block %u: the last byte was not there yet, filled in", wire->blockIndex);
+		}
 		_blockStored(wire);
 	} else if (storing) {
 		// No unit in the buffer inside the data: the cartridge stores an FE. The block is damaged by that one byte; the 3DS's
@@ -304,7 +323,7 @@ static void _pass(struct UDSWire* wire, uint32_t nowMs, uint8_t byte) {
 		++wire->blockSkip;
 		_blockStored(wire);
 	}
-	if (!storing && !wire->rnCovered && wire->blockIndex % UDS_WIRE_BLOCKS == 0 && wire->rxCount && wire->rx[wire->rxHead] == 0xFD) {
+	if (!storing && !wire->mailMode && !wire->rnCovered && wire->blockIndex % UDS_WIRE_BLOCKS == 0 && wire->rxCount && wire->rx[wire->rxHead] == 0xFD) {
 		// The 3DS's random-number list is starting (its first fd is next in line). Its exchanges are paced by our units: it
 		// needs one for each of the list's 18 positions (the fd that ends its ignoring, seven of preamble, ten numbers) and, with
 		// the cartridge held until the list is buffered, only we can supply them. The list is of no consequence (the hook wrapper's
@@ -327,14 +346,14 @@ static void _pass(struct UDSWire* wire, uint32_t nowMs, uint8_t byte) {
 		} else if (wire->rnSeenFd && ++wire->rnNumbers >= UDS_WIRE_RN_NUMBERS) {
 			wire->rnSuppress = false;
 		}
-	} else if (storing) {
+	} else if (storing || wire->mailMode) {
 		port->queue(port->context, byte);
 	} else if (!retry && (byte != 0xFD || wire->pending < UDS_WIRE_PENDING_MAX)) {
 		port->queue(port->context, byte);
 		++wire->pending;
 	}
 	// The exchange that got FE is retried by the cartridge a frame later with the same byte.
-	wire->outstanding = !storing && !opening && !answered && !wire->preloadFill;
+	wire->outstanding = !storing && !opening && !answered && !wire->preloadFill && !wire->mailMode;
 	wire->outstandingByte = byte;
 	port->flush(port->context);
 }
@@ -348,6 +367,7 @@ static void _enterPass(struct UDSWire* wire) {
 	wire->blockRemaining = 0;
 	wire->blockUnderruns = 0;
 	wire->blockSkip = 0;
+	wire->mailMode = false;
 	wire->rnCovered = wire->rnSuppress = false;
 	wire->rxHead = wire->rxCount = 0;
 	wire->pending = 0;
@@ -356,6 +376,8 @@ static void _enterPass(struct UDSWire* wire) {
 static void _startSync(struct UDSWire* wire, uint32_t nowMs, uint8_t byte, uint8_t stale) {
 	wire->phase = UDS_WIRE_SYNC;
 	wire->cartNybble = byte & 0x0F;
+	wire->syncHigh = byte & 0xF0;
+	udsCableSetSyncHigh(&wire->cable, wire->syncHigh);
 	wire->hostNybble = -1;
 	wire->syncDone = false;
 	wire->syncPart = UDS_WIRE_SYNC_LOOPS12;
@@ -399,7 +421,7 @@ static void _idle(struct UDSWire* wire, uint32_t nowMs, uint8_t byte) {
 		return;
 	}
 	wire->idleZeroSent = true;
-	if (_isSync(byte)) {
+	if (_isSync(wire, byte)) {
 		_startSync(wire, nowMs, byte, wire->lastMaster);
 	} else if (_isMenu(byte)) {
 		_enterMenu(wire);
@@ -423,7 +445,7 @@ static void _syncByte(struct UDSWire* wire, uint32_t nowMs, uint8_t byte) {
 			if (++wire->zeros >= UDS_WIRE_LOOP3_ZEROS) {
 				wire->syncPart = UDS_WIRE_SYNC_DONE;
 			}
-		} else if (_isSync(byte)) {
+		} else if (_isSync(wire, byte)) {
 			wire->syncPart = UDS_WIRE_SYNC_LOOPS12;
 			wire->zeros = 0;
 		}
@@ -432,7 +454,7 @@ static void _syncByte(struct UDSWire* wire, uint32_t nowMs, uint8_t byte) {
 		if (!wire->syncDone) {
 			return; // the 3DS side is still finishing; the cartridge keeps getting FE and retrying
 		}
-		if (_isSync(byte)) {
+		if (_isSync(wire, byte)) {
 			_startSync(wire, nowMs, byte, 0x00);
 		} else if (_isMenu(byte)) {
 			_enterMenu(wire);

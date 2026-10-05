@@ -88,6 +88,7 @@ struct UDSSession {
 	int hostSequenceCount;
 	bool hostStationInfo;
 	bool hostProfile;
+	bool hostLeaving; // the host sent its end-of-session message on the system stream (a 36-byte record, seen when its game leaves the room)
 
 	uint8_t pendingPong[2][16]; // pongs owed for the pings in the frame being processed; sent once the frame is done
 	int pendingPongs;
@@ -141,6 +142,8 @@ void udsSessionReceive(struct UDSSession* session, uint32_t nowMs, const uint8_t
 // Timers: setup re-sends, ping, clock sync, keep-alive, game-unit re-sends, the 10 s silence timeout. Call often (every
 // few milliseconds is fine; it does nothing until something is due).
 void udsSessionPoll(struct UDSSession* session, uint32_t nowMs);
+// Our own end-of-session record on the system stream, the answer to the host's (Gen 2: the host's VC waits about five seconds for it).
+void udsSessionSendLeave(struct UDSSession* session, uint32_t nowMs);
 
 // Queues one Game Boy serial byte as the next unit. False when the unacknowledged window is full. Nothing is
 // transmitted until udsSessionFlush (or a poll re-send), so a block can be queued and sent in full frames.

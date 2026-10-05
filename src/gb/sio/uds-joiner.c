@@ -102,6 +102,23 @@ void udsJoinerPoll(struct UDSJoiner* joiner, uint32_t nowMs) {
 		}
 	}
 	udsRoomPoll(&joiner->room, nowMs);
+	if (joiner->leaveWithHost && joiner->sessionActive && joiner->session.hostLeaving) {
+		// The host's game is leaving the room. Its VC waits about five seconds for its partner's end-of-session record and then closes the
+		// network ("communication lost"): answer with ours (once more a moment later, in case the first is lost), then leave the network
+		// as a 3DS joiner does.
+		if (!joiner->leaveStartMs) {
+			joiner->leaveStartMs = nowMs ? nowMs : 1;
+			udsSessionSendLeave(&joiner->session, nowMs);
+		} else if (nowMs - joiner->leaveStartMs >= UDS_JOINER_LEAVE_RESEND_MS && !joiner->leaveResent) {
+			joiner->leaveResent = true;
+			udsSessionSendLeave(&joiner->session, nowMs);
+		} else if (nowMs - joiner->leaveStartMs >= UDS_JOINER_LEAVE_DELAY_MS) {
+			joiner->sessionActive = false;
+			joiner->leaveStartMs = 0;
+			joiner->leaveResent = false;
+			udsRoomLeave(&joiner->room, nowMs, UDS_JOINER_REJOIN_HOLD_MS);
+		}
+	}
 	if (joiner->sessionActive) {
 		udsSessionPoll(&joiner->session, nowMs);
 		if (joiner->session.state == UDS_STATE_CLOSED) {

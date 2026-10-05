@@ -45,6 +45,11 @@ void udsCableInit(struct UDSCable* cable, const struct UDSUnitPort* port) {
 	memset(cable, 0, sizeof(*cable));
 	cable->port = *port;
 	cable->syncNybble = -1;
+	cable->syncHigh = 0x60;
+}
+
+void udsCableSetSyncHigh(struct UDSCable* cable, uint8_t high) {
+	cable->syncHigh = high & 0xF0;
 }
 
 void udsCableBegin(struct UDSCable* cable) {
@@ -156,12 +161,12 @@ enum UDSCableStatus udsCableSync(struct UDSCable* cable, uint8_t nybble, uint32_
 			unsigned guard;
 			for (guard = 0; guard < 400; ++guard) {
 				if (cable->syncSentN == cable->syncRecvN) {
-					_syncSend(cable, 0x60 | nybble);
+					_syncSend(cable, cable->syncHigh | nybble);
 				}
 				if (!_syncPop(cable, &byte)) {
 					break;
 				}
-				if ((byte & 0xF0) == 0x60) {
+				if ((byte & 0xF0) == cable->syncHigh) {
 					cable->syncNybble = byte & 0x0F;
 					break;
 				}
@@ -170,7 +175,7 @@ enum UDSCableStatus udsCableSync(struct UDSCable* cable, uint8_t nybble, uint32_
 			if (cable->syncNybble >= 0) {
 				unsigned i;
 				for (i = 0; i < UDS_CABLE_SYNC_SIXTIES; ++i) {
-					_syncSend(cable, 0x60 | nybble);
+					_syncSend(cable, cable->syncHigh | nybble);
 				}
 				for (i = 0; i < UDS_CABLE_SYNC_ZEROS; ++i) {
 					_syncSend(cable, 0x00);
@@ -191,7 +196,7 @@ enum UDSCableStatus udsCableSync(struct UDSCable* cable, uint8_t nybble, uint32_
 		}
 		if (cable->syncPhase == UDS_SYNC_TAIL) {
 			// A unit that is not 00 or 6x belongs to what the host does next: leave it.
-			while (cable->syncTail < UDS_CABLE_SYNC_TAIL_MAX && _peek(cable, &byte) && (byte == 0x00 || (byte & 0xF0) == 0x60)) {
+			while (cable->syncTail < UDS_CABLE_SYNC_TAIL_MAX && _peek(cable, &byte) && (byte == 0x00 || (byte & 0xF0) == cable->syncHigh)) {
 				_syncSend(cable, 0x00);
 				_syncPop(cable, &byte);
 				++cable->syncTail;
@@ -200,7 +205,7 @@ enum UDSCableStatus udsCableSync(struct UDSCable* cable, uint8_t nybble, uint32_
 			_flush(cable);
 			bool another = _peek(cable, &byte);
 			// Done when the host has moved on (a different unit is waiting), or has been quiet for a moment.
-			if ((another && byte != 0x00 && (byte & 0xF0) != 0x60) || cable->syncTail >= UDS_CABLE_SYNC_TAIL_MAX ||
+			if ((another && byte != 0x00 && (byte & 0xF0) != cable->syncHigh) || cable->syncTail >= UDS_CABLE_SYNC_TAIL_MAX ||
 			    nowMs - cable->syncTailMs > UDS_CABLE_SYNC_TAIL_QUIET_MS) {
 				return _syncFinish(cable, cable->syncNybble, result, UDS_CABLE_DONE);
 			}

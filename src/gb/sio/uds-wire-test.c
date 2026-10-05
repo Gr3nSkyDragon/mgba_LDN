@@ -170,28 +170,32 @@ static uint8_t exchange(struct Sim* sim, uint8_t byte) {
 
 // Serial_SyncAndExchangeNybble: loop 1 sends 60|nybble until a 6x comes back, loop 2 and loop 3 are ten exchanges each (60|nybble,
 // then 00), a frame apart. The result is the nybble of the last reply of loop 2.
-static int cartSync(struct Sim* sim, uint8_t nybble, unsigned* loop1) {
+static int cartSyncHigh(struct Sim* sim, uint8_t high, uint8_t nybble, unsigned* loop1) {
 	unsigned i, n = 0;
 	uint8_t reply;
 	do {
-		reply = exchange(sim, 0x60 | nybble);
+		reply = exchange(sim, high | nybble);
 		wait(sim, 16);
 		++n;
-	} while ((reply & 0xF0) != 0x60 && n < 2000);
+	} while ((reply & 0xF0) != high && n < 2000);
 	if (loop1) {
 		*loop1 = n;
 	}
 	int result = -1;
 	for (i = 0; i < 10; ++i) {
-		reply = exchange(sim, 0x60 | nybble);
+		reply = exchange(sim, high | nybble);
 		wait(sim, 16);
-		result = (reply & 0xF0) == 0x60 ? reply & 0x0F : -1;
+		result = (reply & 0xF0) == high ? reply & 0x0F : -1;
 	}
 	for (i = 0; i < 10; ++i) {
 		exchange(sim, 0x00);
 		wait(sim, 16);
 	}
 	return result;
+}
+
+static int cartSync(struct Sim* sim, uint8_t nybble, unsigned* loop1) {
+	return cartSyncHigh(sim, 0x60, nybble, loop1);
 }
 
 // The role handshake and the idle exchanges before the first sync, as recorded (01 00 00 from the master).
@@ -384,6 +388,69 @@ static void bringToMenu(struct Sim* sim) {
 	exchange(sim, 0xD0);
 	sim->host.head = sim->host.tail; // whatever the 3DS had left over from the sync
 	sim->wire.readDebt = 0; // and start the menu with nothing owed, so the counts below are the menu's alone
+}
+
+// Gen 2 syncs by link mode: 70 in the Trade Center, 80 in the Colosseum. They are syncs only when the wire is told it is Gen 2 (a 7x in Gen 1
+// is data), the 3DS's nybble comes back in the same range, and a 3DS still in another range is ignored, as the ROM's own code does.
+static void testGen2Sync(void) {
+	unsigned high;
+	for (high = 0x70; high <= 0x80; high += 0x10) {
+		struct Sim sim;
+		simInit(&sim);
+		udsWireSetGeneration(&sim.wire, 2);
+		unsigned i;
+		hostPush(&sim.host, 0xEF);
+		for (i = 0; i < 4; ++i) {
+			hostPush(&sim.host, high | 5);
+		}
+		for (i = 0; i < 40; ++i) {
+			hostPush(&sim.host, 0x00);
+		}
+		uint8_t replies[3];
+		tick(&sim);
+		handshake(&sim, replies);
+		wait(&sim, 300);
+		unsigned loop1 = 0;
+		int result = cartSyncHigh(&sim, high, 3, &loop1);
+		CHECK(sim.wire.syncHigh == high && sim.wire.phase == UDS_WIRE_SYNC, "a %02Xx byte starts a sync in Gen 2 (phase %d)", high, sim.wire.phase);
+		CHECK(result == 5, "the cartridge's loop gets the 3DS's nybble back in its own range (%d)", result);
+		CHECK(sim.wire.syncDone && sim.wire.syncPart == UDS_WIRE_SYNC_DONE, "and its loops and the 3DS's side both finish");
+		bool allInRange = true;
+		for (i = 1; i < 6 && i < sim.host.sentCount; ++i) {
+			allInRange = allInRange && (sim.host.sent[i] & 0xF0) == high;
+		}
+		CHECK(allInRange && sim.host.sent[1] == (high | 3), "the 3DS is sent %02X|nybble units (%02X)", high, sim.host.sent[1]);
+	}
+
+	// Gen 1: a 7x is not a sync.
+	struct Sim sim;
+	simInit(&sim);
+	hostPush(&sim.host, 0xEF);
+	uint8_t replies[3];
+	tick(&sim);
+	handshake(&sim, replies);
+	wait(&sim, 300);
+	exchange(&sim, 0x73);
+	CHECK(sim.wire.phase != UDS_WIRE_SYNC, "in Gen 1 a 7x does not start a sync");
+
+	// Gen 2: a 3DS still in the 60 range does not answer a 70 sync (the ROM ignores a reply in the wrong range, and so does the wire).
+	simInit(&sim);
+	udsWireSetGeneration(&sim.wire, 2);
+	unsigned i;
+	hostPush(&sim.host, 0xEF);
+	for (i = 0; i < 6; ++i) {
+		hostPush(&sim.host, 0x65);
+	}
+	tick(&sim);
+	handshake(&sim, replies);
+	wait(&sim, 300);
+	uint8_t reply = 0;
+	for (i = 0; i < 20; ++i) {
+		reply = exchange(&sim, 0x73);
+		wait(&sim, 16);
+	}
+	CHECK(sim.wire.hostNybble < 0 && (reply & 0xF0) != 0x70 && sim.wire.phase == UDS_WIRE_SYNC,
+	      "a 3DS answering in another range is not taken for the sync's partner (reply %02X)", reply);
 }
 
 static void testMenu(void) {
@@ -737,6 +804,53 @@ static void testBlockLoop(void) {
 	CHECK(runs == 2 && runLen[0] <= 2 && runLen[1] <= 2, "and sent few fd in front of the player and patch blocks (%u runs: %u, %u)", runs, runLen[0], runLen[1]);
 }
 
+// Gen 2's fourth block, the Trade Center's mail: a plain ExchangeBytes, so the first reply of any value ends the ignoring and every reply after
+// it is stored, FE included. Every exchange is a real one (none is a retry) and must send its unit, or the 3DS's own mail exchange is left
+// short of units and never gets to its trade menu (a live run lost 29 and stalled both games); a reply that is not there yet is a stand-in
+// 00 and the real unit is dropped when it comes.
+static void testMail(void) {
+	struct Sim sim;
+	bringToPassClean(&sim);
+	udsWireSetGeneration(&sim.wire, 2);
+	sim.wire.mailMode = true;
+	unsigned base = sim.host.sentCount, i;
+	uint8_t unit[391];
+	for (i = 0; i < 391; ++i) {
+		unit[i] = i < 5 ? 0x20 : (uint8_t) (0x30 + i % 0x40);
+		hostAt(&sim.host, sim.now + 400, unit[i]);
+	}
+	uint8_t stored[390];
+	unsigned exchanges = 0, storedCount = 0;
+	bool ignoring = true;
+	while (storedCount < 390 && exchanges < 5000) {
+		uint8_t reply = exchange(&sim, 0x00);
+		wait(&sim, 16);
+		++exchanges;
+		if (ignoring) {
+			ignoring = false; // the first reply, whatever it is
+		} else {
+			stored[storedCount++] = reply;
+		}
+	}
+	CHECK(storedCount == 390 && exchanges == 391, "the cartridge stores 390 replies after the first (%u stored, %u exchanges)", storedCount, exchanges);
+	CHECK(sim.host.sentCount - base == exchanges, "and every exchange sent its unit (%u units for %u exchanges)", sim.host.sentCount - base, exchanges);
+	bool noFe = true;
+	unsigned lead = 0;
+	while (lead < 390 && stored[lead] == 0x00) {
+		++lead;
+	}
+	for (i = 0; i < 390; ++i) {
+		noFe = noFe && stored[i] != 0xFE;
+	}
+	CHECK(noFe, "with no FE stored as data");
+	CHECK(lead > 5 && lead < 60, "the replies that came before the 3DS's units were stand-ins (%u)", lead);
+	bool aligned = true;
+	for (i = lead; i < 390; ++i) {
+		aligned = aligned && stored[i] == unit[i + 1];
+	}
+	CHECK(aligned, "and from the first real one the 3DS's mail is stored in place, byte for byte");
+}
+
 // The first 99 recorded exchanges: role handshake, the first sync (slave late by 39 exchanges), the menu up to the slave's d4.
 static void testReplay(void) {
 	struct Sim sim;
@@ -811,6 +925,8 @@ static void testReplay(void) {
 int main(void) {
 	testRole();
 	testSync();
+	testGen2Sync();
+	testMail();
 	testMenu();
 	testPass();
 	testBlocks(NULL);

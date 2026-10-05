@@ -83,6 +83,8 @@ struct UDSWire {
 
 	// sync
 	uint8_t cartNybble; // the nybble the cartridge is syncing
+	uint8_t syncHigh; // and its high nybble: 60 in Gen 1; Gen 2 uses 60, 70 (Trade Center) or 80 (Colosseum) by link mode
+	bool gen2; // Gen 2 syncs are recognised in all three ranges
 	int hostNybble; // the 3DS's nybble, -1 until its 6x unit has been read
 	bool syncDone; // the 3DS side of the sync has finished
 	enum UDSWireSyncPart syncPart;
@@ -109,6 +111,7 @@ struct UDSWire {
 	unsigned blockIndex; // which block of the cycle (random numbers, player data, patch lists) the cartridge is receiving
 	unsigned blockRemaining;
 	unsigned blockUnderruns; // replies that had to be FE inside a block's data (the block is damaged)
+	bool mailMode; // Gen 2 after the patch lists: the Trade Center's mail block, a plain ExchangeBytes (see _pass)
 	bool rnCovered; // the 3DS's random-number list has been covered with fd (see _pass)
 	bool rnSuppress; // the cartridge's own list's units are being dropped
 	bool rnSeenFd;
@@ -139,6 +142,8 @@ struct UDSWire {
 #define UDS_WIRE_MENU_AHEAD 12 // most units owed (sent, partner unread) before the menu stops sending, so the send window cannot fill
 
 void udsWireInit(struct UDSWire* wire, const struct UDSUnitPort* port);
+// 2 makes syncs in the 70 and 80 ranges count as syncs too (Gen 2 picks the range by link mode); 1 (the default) only 60.
+void udsWireSetGeneration(struct UDSWire* wire, int generation);
 
 // Call every millisecond or so: brings the session's state in (link up, link lost), runs the 3DS side of a sync and ends a
 // MENU or PASS that has gone quiet.

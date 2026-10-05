@@ -72,6 +72,7 @@ struct UDSCable {
 	unsigned syncTail;
 	uint32_t syncTailMs;
 	uint32_t syncStartMs;
+	uint8_t syncHigh; // the high nybble of the syncs' bytes: 60 in Gen 1, 60/70/80 in Gen 2 by link mode (set per sync)
 	int syncNybble;
 
 	bool menuActive;
@@ -93,6 +94,8 @@ void udsCableInit(struct UDSCable* cable, const struct UDSUnitPort* port);
 
 // The link has just come up: sends the first unit and arranges for the host's to be discarded.
 void udsCableBegin(struct UDSCable* cable);
+// The high nybble of the syncs' bytes for the syncs that follow (60 by default).
+void udsCableSetSyncHigh(struct UDSCable* cable, uint8_t high);
 
 // The host went away. Returns true if a transfer was waiting; the caller should finish it with an idle line (0xFF).
 bool udsCableLost(struct UDSCable* cable);

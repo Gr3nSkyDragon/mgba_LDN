@@ -145,6 +145,7 @@ void udsRoomInit(struct UDSRoom* room, const uint8_t mac[6], const uint16_t name
 	memcpy(room->name, name, sizeof(room->name));
 	room->friendCodeSeed = 0x0000A5A5A5A5A5A5ULL;
 	room->wantCommId = UDS_PIA_COMM_ID;
+	room->wantCommMask = 0xFFFFFFFFu;
 	room->send = send;
 	room->joined = joined;
 	room->pia = pia;
@@ -233,6 +234,16 @@ static void _handleSecureData(struct UDSRoom* room, const struct UDSRoomPacket* 
 	}
 }
 
+void udsRoomLeave(struct UDSRoom* room, uint32_t nowMs, uint32_t holdMs) {
+	if (room->state == UDS_ROOM_SCAN) {
+		return;
+	}
+	static const uint8_t reason[2] = {0x03, 0x00}; // station is leaving
+	_send(room, UDS_PACKET_DEAUTH, room->host.mac, reason, sizeof(reason));
+	room->state = UDS_ROOM_SCAN;
+	room->scanResumeMs = nowMs + holdMs;
+}
+
 void udsRoomReceive(struct UDSRoom* room, uint32_t nowMs, const uint8_t* datagram, size_t size) {
 	struct UDSRoomPacket packet;
 	if (!udsRoomDecode(datagram, size, &packet)) {
@@ -242,12 +253,12 @@ void udsRoomReceive(struct UDSRoom* room, uint32_t nowMs, const uint8_t* datagra
 
 	if (packet.type == UDS_PACKET_BEACON) {
 		++room->beaconsSeen;
-		if (room->state != UDS_ROOM_SCAN) {
+		if (room->state != UDS_ROOM_SCAN || (room->scanResumeMs && (int32_t) (nowMs - room->scanResumeMs) < 0)) {
 			return;
 		}
 		struct UDSRoomHost host;
 		memset(&host, 0, sizeof(host));
-		if (!udsRoomParseBeacon(packet.data, packet.size, &host) || (room->wantCommId && host.commId != room->wantCommId)) {
+		if (!udsRoomParseBeacon(packet.data, packet.size, &host) || (room->wantCommId && (host.commId & room->wantCommMask) != (room->wantCommId & room->wantCommMask))) {
 			return;
 		}
 		memcpy(host.mac, packet.transmitter, 6);

@@ -23,12 +23,19 @@ CXX_GUARD_START
  * Not connected to mGBA yet: nothing creates one.
  */
 
+#define UDS_JOINER_LEAVE_RESEND_MS 150 // the end-of-session record is sent again this long after the first
+#define UDS_JOINER_LEAVE_DELAY_MS 400 // and the network is left this long after it
+#define UDS_JOINER_REJOIN_HOLD_MS 6000 // after leaving, the host's network is closing: do not rejoin it at once
+
 struct UDSJoiner {
 	struct UDSUdp udp; // the Azahar test bridge's air, or
 	struct UDSAirRadio radio; // the real air through the ESP32 board (useRadio)
 	bool useRadio;
 	struct UDSRoom room;
 	struct UDSSession session;
+	uint32_t leaveStartMs; // when we started answering the host's end-of-session record (0: not yet)
+	bool leaveResent;
+	bool leaveWithHost; // Gen 2: leave the network when the host's game announces it is leaving the room (off for Gen 1, which never sends it)
 	bool sessionActive; // the session is built once the host has accepted us
 	uint32_t nowMs;
 	uint16_t name[UDS_NAME_WORDS];

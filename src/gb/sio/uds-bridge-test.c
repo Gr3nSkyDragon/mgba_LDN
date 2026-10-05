@@ -267,6 +267,70 @@ static void testJoin(void) {
 	run(30);
 	CHECK(joiner.session.framesReceived == before, "a non-Pia SecureData frame reached the session");
 
+	joiner.leaveWithHost = true; // (a Gen 2 game)
+	// The host's game leaves the room: its VC sends a 36-byte record on the system stream (the station table is 148 bytes) and waits for the
+	// partner to leave too. A joiner does what a 3DS does: it leaves the network (a deauthentication to the host) and does not rejoin
+	// for a few seconds, while the host's network is closing.
+	{
+		uint8_t pia[160];
+		struct UDSPiaHeader header = {.connectionId = 0, .packetId = 77, .clock = 0, .peerClock = 0};
+		size_t pos = udsFrameBegin(pia, &header);
+		uint8_t record[36];
+		memset(record, 0, sizeof(record));
+		record[1] = 0x03;
+		record[3] = 0x0C;
+		record[8] = 0xFF; // the host's first system record, index -2001 (big endian): the ack of it is -2000
+		record[9] = 0xFF;
+		record[10] = 0xF8;
+		record[11] = 0x2F;
+		struct UDSMessage message = {.sender = 0, .destination = 2, .protocol = UDS_PROTOCOL_SYSTEM, .subtype = 0, .reliable = 1,
+		                             .length = sizeof(record), .payload = record};
+		pos = udsFrameAppend(pia, sizeof(pia), pos, &message);
+		size_t piaSize = udsFrameEnd(pia, sizeof(pia), pos);
+		CHECK(piaSize > 0, "built the end-of-session record");
+		CHECK(!joiner.session.hostLeaving, "not leaving before the record");
+		size = udsBuildSecureData(frame, sizeof(frame), pia, piaSize, 243, 2, 1, 3, false);
+		hostSend(UDS_PACKET_DATA, joiner.room.mac, frame, size);
+		run(450);
+		bool sawDeauth = false;
+		unsigned records = 0;
+		bool recordRight = false;
+		while (hostReceive(&got)) {
+			if (got.type == UDS_PACKET_DEAUTH && !memcmp(got.destination, hostMac, 6) && got.size >= 2 && got.data[0] == 0x03) {
+				sawDeauth = true;
+			}
+			if (got.type == UDS_PACKET_DATA && got.size > UDS_LLC_SIZE + UDS_SECURE_HEADER_SIZE && got.data[6] == 0x87) {
+				struct UDSFrame f;
+				if (udsFrameParse(&got.data[UDS_LLC_SIZE + UDS_SECURE_HEADER_SIZE], got.size - UDS_LLC_SIZE - UDS_SECURE_HEADER_SIZE, &f) &&
+				    f.kind == UDS_FRAME_PIA) {
+					size_t at = 0;
+					struct UDSMessage m;
+					while (udsMessageNext(&f, &at, &m)) {
+						if (m.protocol == UDS_PROTOCOL_SYSTEM && m.reliable && m.length == 36) {
+							++records;
+							recordRight = m.payload[1] == 0x03 && m.payload[3] == 0x0C && m.payload[24] == 0x10 && m.payload[35] == 0x01 &&
+							              m.payload[8] == 0xFF && m.payload[9] == 0xFF && m.payload[10] == 0xF8 && m.payload[11] == 0x2F &&
+							              m.payload[12] == 0xFF && m.payload[13] == 0xFF && m.payload[14] == 0xF8 && m.payload[15] == 0x30;
+						}
+					}
+				}
+			}
+		}
+		CHECK(records == 2 && recordRight, "the joiner answered with its own end-of-session record, twice (%u), its first index, and the host's next as ack", records);
+		CHECK(sawDeauth, "the joiner left the network with a deauthentication when the host's game left");
+		CHECK(!joiner.sessionActive && joiner.room.state == UDS_ROOM_SCAN, "and went back to scanning (state %d)", joiner.room.state);
+		// The host's beacons go on for a moment while it shuts down: they are not answered at once.
+		uint8_t again[512];
+		size_t againSize = beaconBody(again);
+		hostSend(UDS_PACKET_BEACON, (const uint8_t[]){0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, again, againSize);
+		run(30);
+		bool sawAuth = false;
+		while (hostReceive(&got)) {
+			sawAuth = sawAuth || got.type == UDS_PACKET_AUTH;
+		}
+		CHECK(!sawAuth && joiner.room.state == UDS_ROOM_SCAN, "no new join right after leaving");
+	}
+
 	// A host that leaves sends a deauthentication: scanning resumes.
 	hostSend(UDS_PACKET_DEAUTH, joiner.room.mac, (const uint8_t[]){0x03, 0x00}, 2);
 	run(30);

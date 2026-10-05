@@ -144,6 +144,20 @@ static void _sendRecordAck(struct UDSSession* session, uint32_t nowMs, uint8_t p
 	_sendMessage(session, nowMs, protocol, 0, reliable, UDS_ID_HOST, payload, sizeof(payload));
 }
 
+// The record a Game Boy VC sends on the system stream as its game leaves the room (seen from a Gen 2 host): the stream's 12-byte record header,
+// the sender's stream index and its ack of the peer's, then a 20-byte trailer whose byte at 24 is 10 and whose last byte is 01. A joiner's
+// first system record has the first index.
+void udsSessionSendLeave(struct UDSSession* session, uint32_t nowMs) {
+	uint8_t payload[36] = { 0 };
+	payload[1] = 0x03;
+	payload[3] = 0x0C;
+	_put32(&payload[8], (uint32_t) UDS_FIRST_INDEX);
+	_put32(&payload[12], (uint32_t) session->systemNext);
+	payload[24] = 0x10;
+	payload[35] = 0x01;
+	_sendMessage(session, nowMs, UDS_PROTOCOL_SYSTEM, 0, 1, UDS_ID_HOST, payload, sizeof(payload));
+}
+
 // Setup messages (station info, profile, join request)
 
 static struct UDSSetupMessage* _queueSetup(struct UDSSession* session, int slot, uint8_t protocol, uint16_t length) {
@@ -334,6 +348,11 @@ static void _onMessage(struct UDSSession* session, uint32_t nowMs, const struct 
 				++session->systemNext;
 			}
 			_sendRecordAck(session, nowMs, UDS_PROTOCOL_SYSTEM, 1, session->systemNext);
+			if (m->length == 36) {
+				// The station table is the 148-byte record, every 10 s. A short one is new: the host's VC sends it as its game leaves the
+				// room, and then waits for the partner to leave too.
+				session->hostLeaving = true;
+			}
 		} else if (m->length == 128 && p[0] == 0x02 && p[1] == 0x02) {
 			uint32_t sequence = _get32(&p[m->length - 4]);
 			_handledSequence(session, sequence);

@@ -89,6 +89,8 @@ struct UDSRoom {
 	uint16_t name[UDS_NAME_WORDS]; // UTF-16 player name
 	uint64_t friendCodeSeed;
 	uint32_t wantCommId; // 0 accepts any network
+	uint32_t scanResumeMs; // after leaving a host, beacons are ignored until this time (the host is shutting its network down)
+	uint32_t wantCommMask; // the bits of the comm id that must match (the Virtual Console titles of one generation share the upper ones)
 
 	UDSRoomSend send;
 	UDSRoomJoined joined;
@@ -110,6 +112,8 @@ void udsRoomInit(struct UDSRoom* room, const uint8_t mac[6], const uint16_t name
                  UDSRoomJoined joined, UDSRoomPia pia, void* context);
 void udsRoomReceive(struct UDSRoom* room, uint32_t nowMs, const uint8_t* datagram, size_t size);
 void udsRoomPoll(struct UDSRoom* room, uint32_t nowMs);
+// Leaves the host as a 3DS joiner does (a deauthentication, reason 3: station is leaving) and goes back to scanning after `holdMs`.
+void udsRoomLeave(struct UDSRoom* room, uint32_t nowMs, uint32_t holdMs);
 
 // Wraps one Pia frame (a UDS channel-243 payload) in a SecureData frame to the host. False until the join is complete.
 bool udsRoomSendPia(struct UDSRoom* room, const uint8_t* frame, size_t size);

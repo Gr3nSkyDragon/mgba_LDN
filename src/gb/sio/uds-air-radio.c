@@ -302,6 +302,18 @@ void udsAirRadioSend(struct UDSAirRadio* radio, const uint8_t* datagram, size_t 
 		}
 		return;
 	}
+	if (packet.type == UDS_PACKET_DEAUTH) {
+		// Leaving the host, as a 3DS joiner does when its game leaves the room.
+		if (radio->haveHost) {
+			uint8_t frame[UDS_80211_HEADER + 4];
+			size_t length = udsBuildMgmtFrame(frame, sizeof(frame), UDS_FC_DEAUTH, radio->mac, radio->host.mac, radio->host.mac,
+			                                  radio->txSequence++, packet.data, packet.size > 2 ? 2 : packet.size);
+			if (length) {
+				_transmit(radio, frame, length, 0);
+			}
+		}
+		return;
+	}
 	if (packet.type == UDS_PACKET_DATA) {
 		if (!radio->haveHost) {
 			++radio->droppedNoKey;
