@@ -57,12 +57,16 @@ static bool hostReady(void* context) {
 	return ((struct Host*) context)->ready;
 }
 
-static bool hostQueue(void* context, uint8_t byte) {
-	struct Host* host = context;
-	host->sent[host->sentCount++] = byte;
+static void hostRelease(struct Host* host) {
 	while (host->reactive && host->scriptPos < host->scriptLen && host->sentCount >= host->releaseAt[host->scriptPos]) {
 		host->queue[host->tail++] = host->script[host->scriptPos++];
 	}
+}
+
+static bool hostQueue(void* context, uint8_t byte) {
+	struct Host* host = context;
+	host->sent[host->sentCount++] = byte;
+	hostRelease(host);
 	return true;
 }
 
@@ -72,6 +76,7 @@ static void hostFlush(void* context) {
 
 static bool hostPop(void* context, uint8_t* byte) {
 	struct Host* host = context;
+	hostRelease(host);
 	if (host->head == host->tail) {
 		return false;
 	}
@@ -81,6 +86,7 @@ static bool hostPop(void* context, uint8_t* byte) {
 
 static bool hostPeek(void* context, uint8_t* byte) {
 	struct Host* host = context;
+	hostRelease(host);
 	if (host->head == host->tail) {
 		return false;
 	}
@@ -90,6 +96,7 @@ static bool hostPeek(void* context, uint8_t* byte) {
 
 static size_t hostWaiting(void* context) {
 	struct Host* host = context;
+	hostRelease(host);
 	return host->tail - host->head;
 }
 
@@ -483,9 +490,10 @@ static void testPass(void) {
 	CHECK(reply == 0xA2 && sim.host.sentCount == base + 2 && sim.host.sent[base + 1] == 0x22, "and the next");
 	CHECK(sim.host.head == sim.host.tail, "both of the 3DS's units were consumed");
 
-	// Nothing from the 3DS: FE, but every exchange still sends its unit (the 3DS's exchanges block until they have ours), up to a
-	// limit ahead of what has been read.
+	// Nothing from the 3DS: FE. The first exchange sends its unit; the cartridge's retries (the same byte after FE) are not new
+	// exchanges and send nothing, so the 3DS is not fed padding that would move our block away from where its own begins.
 	sim.wire.pending = 0;
+	sim.wire.outstanding = false;
 	unsigned base2 = sim.host.sentCount;
 	bool allFe = true;
 	unsigned i;
@@ -493,15 +501,20 @@ static void testPass(void) {
 		allFe = allFe && exchange(&sim, 0x33) == 0xFE;
 	}
 	CHECK(allFe, "no unit from the 3DS: every reply is FE");
-	CHECK(sim.host.sentCount == base2 + UDS_WIRE_PENDING_MAX, "and units go out, up to %u ahead (%u)", UDS_WIRE_PENDING_MAX, sim.host.sentCount - base2);
+	CHECK(sim.host.sentCount == base2 + 1, "and one unit goes out, not one per retry (%u)", sim.host.sentCount - base2);
+	exchange(&sim, 0x44);
+	CHECK(sim.host.sentCount == base2 + 2 && sim.host.sent[base2 + 1] == 0x44, "a different byte after FE is a new exchange and is sent");
+	exchange(&sim, 0xFD);
+	exchange(&sim, 0xFD);
+	CHECK(sim.host.sentCount == base2 + 3, "an fd repeated while waiting is sent once");
 
-	// The 3DS's units arrive: they are read into the buffer, which lets sending go on, and are delivered in order.
+	// The 3DS's units arrive: they are read into the buffer and delivered in order.
 	hostPush(&sim.host, 0xB1);
 	hostPush(&sim.host, 0xB2);
 	hostPush(&sim.host, 0xB3);
 	reply = exchange(&sim, 0x33);
-	CHECK(reply == 0xB1 && sim.host.head == sim.host.tail && sim.wire.rxCount == 2 && sim.host.sentCount == base2 + UDS_WIRE_PENDING_MAX + 1,
-	      "when the 3DS's units arrive they are read at once, the first is the reply and sending resumes (%02X)", reply);
+	CHECK(reply == 0xB1 && sim.host.head == sim.host.tail && sim.wire.rxCount == 2 && sim.host.sentCount == base2 + 4,
+	      "when the 3DS's units arrive they are read at once, the first is the reply and the exchange is sent (%02X)", reply);
 	reply = exchange(&sim, 0x33);
 	CHECK(reply == 0xB2, "in order");
 	reply = exchange(&sim, 0x33);
@@ -640,23 +653,30 @@ static void testBlockLoop(void) {
 	// The 3DS creates its random-number and player blocks at once (bulk, as soon as it has our first unit) but produces what comes
 	// after them, the patch lists' preamble, only once it has received our whole player block, as in the live run.
 	static const unsigned kLate = 470; // units of ours by then: past what the cartridge has sent when it needs the next unit
+	// Its exchanges are paced by ours until the player block: each unit up to the end of the random-number list is released by
+	// one more unit of ours (as in the live run that stalled with the cartridge waiting for the list to be buffered).
+	unsigned base = sim.host.sentCount - 1; // the exchange that entered the pass has sent its unit: the first of theirs exists
 	sim.host.script[n] = 0x60;
-	sim.host.releaseAt[n++] = 1;
+	sim.host.releaseAt[n] = base + 1 + n;
+	++n;
 	for (i = 0; i < 4; ++i) {
 		sim.host.script[n] = 0x00;
-		sim.host.releaseAt[n++] = 1;
+		sim.host.releaseAt[n] = base + 1 + n;
+		++n;
 	}
 	uint8_t expected[3][424];
 	for (b = 0; b < 3; ++b) {
 		sim.host.script[n] = 0xFD; // the one that ends the cartridge's ignoring
-		sim.host.releaseAt[n++] = b == 2 ? kLate : 1;
+		sim.host.releaseAt[n] = b == 0 ? base + 1 + n : b == 2 ? kLate : base + 1 + 5 + UDS_WIRE_RN_POSITIONS;
+		++n;
 		// The cartridge stores `size` replies after it. The 3DS's player block is one unit short of that: the last one stored is the
 		// first fd of the patch lists' preamble.
 		unsigned own = b == 1 ? kSizes[b] - 1 : kSizes[b];
 		for (i = 0; i < own; ++i) {
 			uint8_t v = i < kLeadFd[b] ? 0xFD : (uint8_t) (0x10 + (i * 7 + b) % 0xB0);
 			sim.host.script[n] = v;
-			sim.host.releaseAt[n++] = b == 2 ? kLate : 1;
+			sim.host.releaseAt[n] = b == 0 ? base + 1 + n : b == 2 ? kLate : base + 1 + 5 + UDS_WIRE_RN_POSITIONS;
+			++n;
 			expected[b][i] = v;
 		}
 		if (b == 1) {
@@ -699,6 +719,22 @@ static void testBlockLoop(void) {
 	CHECK(sim.wire.blockUnderruns == 0, "with no FE stored inside a block");
 	// The 3DS received every byte of the cartridge's blocks, in order.
 	CHECK(sim.host.sentCount >= 17 + 424 + 200, "and received the cartridge's blocks (%u units)", sim.host.sentCount);
+	// The 3DS stores 424 bytes after the first fd it receives, so the fd run in front of the player and patch blocks must stay short
+	// (the test cartridge sends no preamble of its own: the run is the waiting fd plus the one that opened the block).
+	unsigned run = 0, runs = 0, runLen[8] = {0};
+	for (i = 0; i < sim.host.sentCount; ++i) {
+		if (sim.host.sent[i] == 0xFD) {
+			++run;
+		} else {
+			if (run && runs < 8 && sim.host.sent[i] == 0xA0) {
+				runLen[runs++] = run;
+			}
+			run = 0;
+		}
+	}
+	// The random-number list is covered by fd and the cartridge's own units for it dropped, so the player and patch blocks are the
+	// two runs that end in the test cartridge's first data byte.
+	CHECK(runs == 2 && runLen[0] <= 2 && runLen[1] <= 2, "and sent few fd in front of the player and patch blocks (%u runs: %u, %u)", runs, runLen[0], runLen[1]);
 }
 
 // The first 99 recorded exchanges: role handshake, the first sync (slave late by 39 exchanges), the menu up to the slave's d4.

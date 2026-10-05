@@ -259,21 +259,34 @@ static void _blockStored(struct UDSWire* wire) {
 		wire->blockStoring = false;
 		++wire->blockIndex;
 		wire->blockUnderruns = 0;
+		if (wire->blockIndex % UDS_WIRE_BLOCKS == 1) {
+			wire->rnCovered = false; // the list of the next cycle is covered afresh
+		}
 	}
 }
 
-// Every exchange of the cartridge sends a unit: the 3DS's exchanges block until they have ours, so withholding one (as a retry
-// after FE would be) leaves it waiting and, while we hold a block, deadlocks. While the cartridge is only waiting (before a
-// block's data) at most UDS_WIRE_PENDING_MAX are sent ahead of the reads; inside a block's data they are the data and always go.
-static void _pass(struct UDSWire* wire, uint8_t byte) {
+// Units are index-paired with the 3DS's: our unit k is what the 3DS receives in its exchange k, so a block we send must begin at
+// the index where the 3DS's own block begins, or its ignoring phase ends too early and it stores the wrong bytes (padding fds 25
+// positions ahead of its block put our random numbers where its player block started, and the trade menu showed garbage).
+// While the cartridge only waits (before a block's data) the exchanges therefore run in lockstep with the 3DS's units: a retry
+// after FE is not a new exchange and sends nothing, and the fd it repeats goes out only as the reply to the previous one arrives.
+// Any other byte is real data (the tail of the previous block, stale bytes) and always goes. Inside a block's data every exchange
+// sends.
+static void _pass(struct UDSWire* wire, uint32_t nowMs, uint8_t byte) {
+	(void) nowMs;
 	struct UDSUnitPort* port = &wire->cable.port;
 	bool storing = wire->blockStoring;
+	bool opening = false;
+	bool answered = false;
+	bool retry = wire->outstanding && wire->outstandingByte == byte && !wire->preloadHost && !wire->preloadFill;
 	if (wire->preloadHost && wire->rxCount) {
 		uint8_t host = _rxTake(wire);
+		answered = true;
 		if (storing) {
 			_blockStored(wire);
 		} else if (host == 0xFD) {
 			// This fd ends the cartridge's ignoring: the replies after it are the block.
+			opening = true;
 			wire->blockStoring = true;
 			wire->blockRemaining = kBlockSize[wire->blockIndex % UDS_WIRE_BLOCKS];
 			wire->blockUnderruns = 0;
@@ -291,12 +304,38 @@ static void _pass(struct UDSWire* wire, uint8_t byte) {
 		++wire->blockSkip;
 		_blockStored(wire);
 	}
-	if (storing) {
+	if (!storing && !wire->rnCovered && wire->blockIndex % UDS_WIRE_BLOCKS == 0 && wire->rxCount && wire->rx[wire->rxHead] == 0xFD) {
+		// The 3DS's random-number list is starting (its first fd is next in line). Its exchanges are paced by our units: it
+		// needs one for each of the list's 18 positions (the fd that ends its ignoring, seven of preamble, ten numbers) and, with
+		// the cartridge held until the list is buffered, only we can supply them. The list is of no consequence (the hook wrapper's
+		// trades leave the 3DS's all fd), so cover the rest of it with fd and drop the cartridge's own units for it; the player
+		// block's first unit is then the next one, which is where the 3DS's player block begins.
+		unsigned i;
+		for (i = 0; i < UDS_WIRE_RN_POSITIONS - 1; ++i) {
+			port->queue(port->context, 0xFD);
+		}
+		wire->rnCovered = true;
+		wire->rnSuppress = true;
+		wire->rnSeenFd = false;
+		wire->rnNumbers = 0;
+		_trace(wire, "block %u: the 3DS's list starts; covered it with %u fd and dropping the cartridge's own", wire->blockIndex, UDS_WIRE_RN_POSITIONS - 1);
+	}
+	if (wire->rnSuppress) {
+		// The cartridge's own list (fd preamble, then ten numbers, all below fd) has been covered: its units are not sent.
+		if (byte == 0xFD) {
+			wire->rnSeenFd = true;
+		} else if (wire->rnSeenFd && ++wire->rnNumbers >= UDS_WIRE_RN_NUMBERS) {
+			wire->rnSuppress = false;
+		}
+	} else if (storing) {
 		port->queue(port->context, byte);
-	} else if (wire->pending < UDS_WIRE_PENDING_MAX) {
+	} else if (!retry && (byte != 0xFD || wire->pending < UDS_WIRE_PENDING_MAX)) {
 		port->queue(port->context, byte);
 		++wire->pending;
 	}
+	// The exchange that got FE is retried by the cartridge a frame later with the same byte.
+	wire->outstanding = !storing && !opening && !answered && !wire->preloadFill;
+	wire->outstandingByte = byte;
 	port->flush(port->context);
 }
 
@@ -309,6 +348,7 @@ static void _enterPass(struct UDSWire* wire) {
 	wire->blockRemaining = 0;
 	wire->blockUnderruns = 0;
 	wire->blockSkip = 0;
+	wire->rnCovered = wire->rnSuppress = false;
 	wire->rxHead = wire->rxCount = 0;
 	wire->pending = 0;
 }
@@ -402,7 +442,7 @@ static void _syncByte(struct UDSWire* wire, uint32_t nowMs, uint8_t byte) {
 			// an exchange like any other (a plain transfer start such as a zero byte is not retried after FE, so it must not be dropped).
 			_enterPass(wire);
 			_sendOwed(wire, wire->stale);
-			_pass(wire, byte);
+			_pass(wire, nowMs, byte);
 		}
 		return;
 	}
@@ -440,7 +480,7 @@ void udsWireExchanged(struct UDSWire* wire, uint32_t nowMs, uint8_t masterByte) 
 		}
 		break;
 	case UDS_WIRE_PASS:
-		_pass(wire, masterByte);
+		_pass(wire, nowMs, masterByte);
 		break;
 	}
 	wire->lastMaster = masterByte;

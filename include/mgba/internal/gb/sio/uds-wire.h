@@ -109,6 +109,10 @@ struct UDSWire {
 	unsigned blockIndex; // which block of the cycle (random numbers, player data, patch lists) the cartridge is receiving
 	unsigned blockRemaining;
 	unsigned blockUnderruns; // replies that had to be FE inside a block's data (the block is damaged)
+	bool rnCovered; // the 3DS's random-number list has been covered with fd (see _pass)
+	bool rnSuppress; // the cartridge's own list's units are being dropped
+	bool rnSeenFd;
+	unsigned rnNumbers; // its numbers seen so far
 	unsigned blockSkip; // units to drop from the buffer so that an FE stored as data does not shift the block
 	bool preloadFill; // the reply loaded is a stand-in for the block's last byte, which the 3DS has not produced yet
 
@@ -124,6 +128,8 @@ struct UDSWire {
 // Replies the cartridge stores after the fd that ends its ignoring, for the three blocks of an exchange (random numbers with their
 // preamble, the 424-byte player block, the 200-byte patch lists) in the order they come.
 #define UDS_WIRE_BLOCKS 3
+#define UDS_WIRE_RN_POSITIONS 18 // the list's exchanges on the 3DS: the fd that ends its ignoring, seven of preamble, ten numbers
+#define UDS_WIRE_RN_NUMBERS 10
 
 #define UDS_WIRE_IDLE_LINE 0xFF
 #define UDS_WIRE_NO_DATA 0xFE
