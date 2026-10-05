@@ -113,6 +113,8 @@ struct UDSWire {
 	unsigned blockRemaining;
 	unsigned blockUnderruns; // replies that had to be FE inside a block's data (the block is damaged)
 	bool mailMode; // Gen 2 after the patch lists: the Trade Center's mail block, a plain ExchangeBytes (see _pass)
+	bool mailPre; // the 3DS's own $20 run has started (units before it are left over from the patch block and are dropped)
+	bool mailData; // the mail block's first byte after the $20 run has been served (before it, late replies are $20 and nothing is dropped)
 	bool rnCovered; // the 3DS's random-number list has been covered with fd (see _pass)
 	bool rnSuppress; // the cartridge's own list's units are being dropped
 	bool rnSeenFd;
@@ -134,6 +136,8 @@ struct UDSWire {
 #define UDS_WIRE_BLOCKS 3
 #define UDS_WIRE_RN_POSITIONS 18 // the list's exchanges on the 3DS: the fd that ends its ignoring, seven of preamble, ten numbers
 #define UDS_WIRE_RN_NUMBERS 10
+
+#define UDS_WIRE_MAIL_PREAMBLE_BYTE 0x20 // opens the Gen 2 mail block (five of them from a game; the receiver accepts a run of any length)
 
 #define UDS_WIRE_IDLE_LINE 0xFF
 #define UDS_WIRE_NO_DATA 0xFE

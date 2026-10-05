@@ -852,6 +852,9 @@ static void testMail(void) {
 	sim.wire.mailMode = true;
 	unsigned base = sim.host.sentCount, i;
 	uint8_t unit[391];
+	for (i = 0; i < 11; ++i) {
+		hostAt(&sim.host, sim.now + 400, 0x00); // what is left of the 3DS's patch block ahead of its mail: not mail
+	}
 	for (i = 0; i < 391; ++i) {
 		unit[i] = i < 5 ? 0x20 : (uint8_t) (0x30 + i % 0x40);
 		hostAt(&sim.host, sim.now + 400, unit[i]);
@@ -873,19 +876,21 @@ static void testMail(void) {
 	CHECK(sim.host.sentCount - base == exchanges, "and every exchange sent its unit (%u units for %u exchanges)", sim.host.sentCount - base, exchanges);
 	bool noFe = true;
 	unsigned lead = 0;
-	while (lead < 390 && stored[lead] == 0x00) {
+	while (lead < 390 && stored[lead] == 0x20) {
 		++lead;
 	}
+	// The receiver scans for the first $20 and skips the run: the late replies are $20, so the run is longer than five and the mail data
+	// follows it whole (the head of the first message intact, the tail cut by the replies that were late).
 	for (i = 0; i < 390; ++i) {
 		noFe = noFe && stored[i] != 0xFE;
 	}
 	CHECK(noFe, "with no FE stored as data");
-	CHECK(lead > 5 && lead < 60, "the replies that came before the 3DS's units were stand-ins (%u)", lead);
+	CHECK(lead > 5 && lead < 60, "the replies that came before the 3DS's units were $20 stand-ins (%u)", lead);
 	bool aligned = true;
 	for (i = lead; i < 390; ++i) {
-		aligned = aligned && stored[i] == unit[i + 1];
+		aligned = aligned && stored[i] == unit[5 + i - lead];
 	}
-	CHECK(aligned, "and from the first real one the 3DS's mail is stored in place, byte for byte");
+	CHECK(aligned, "and the 3DS's mail data follows the run from its first byte, in order, nothing dropped");
 }
 
 // The first 99 recorded exchanges: role handshake, the first sync (slave late by 39 exchanges), the menu up to the slave's d4.

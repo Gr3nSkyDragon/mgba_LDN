@@ -240,12 +240,19 @@ uint8_t udsWirePreload(struct UDSWire* wire) {
 			_rxTake(wire); // the partner of an FE that was stored as data: dropped so that the block does not shift
 			--wire->blockSkip;
 		}
+		while (wire->mailMode && !wire->mailPre && wire->rxCount && wire->rx[wire->rxHead] != UDS_WIRE_MAIL_PREAMBLE_BYTE) {
+			_rxTake(wire); // what is left of the 3DS's patch block ahead of its mail: not part of the mail, which begins with its $20 run
+		}
 		if (!wire->rxCount) {
 			if (wire->mailMode) {
 				// The mail block's replies are all stored, and its first reply, whatever it is, ends the ignoring: an FE would be stored as
-				// data like any other. Stand in with 00 (what mail data mostly is); the real unit is dropped when it arrives.
+				// data like any other. The receiver finds the partner's mail by scanning for the first $20 and skipping
+				// the whole run of $20 and FE, so a run of any length is harmless: until the first byte of real mail data is served, late
+				// replies are $20 and the real units are kept and served in order (nothing is lost at the head, where the first message
+				// is; the tail is cut by as many replies as were late, which is the padding of the patch set). After that a missing reply
+				// is a 00 and the real unit is dropped when it arrives, so what follows stays aligned.
 				wire->preloadFill = true;
-				return 0x00;
+				return wire->mailData ? 0x00 : UDS_WIRE_MAIL_PREAMBLE_BYTE;
 			}
 			if (wire->blockStoring && wire->blockRemaining == 1) {
 				// The last byte the cartridge stores is the first unit of the next block (the 3DS's player block is one unit short of what
@@ -284,7 +291,8 @@ static void _blockStored(struct UDSWire* wire) {
 			wire->rnCovered = false; // the list of the next cycle is covered afresh
 		}
 		if (wire->gen2 && wire->blockIndex % UDS_WIRE_BLOCKS == 0) {
-			wire->mailMode = true; // the patch lists were the third block; in the Trade Center a fourth follows
+			wire->mailData = wire->mailPre = false;
+				wire->mailMode = true; // the patch lists were the third block; in the Trade Center a fourth follows
 		}
 	}
 }
@@ -307,6 +315,13 @@ static void _pass(struct UDSWire* wire, uint32_t nowMs, uint8_t byte) {
 	if (wire->preloadHost && wire->rxCount) {
 		uint8_t host = _rxTake(wire);
 		answered = true;
+		if (wire->mailMode) {
+			if (host == UDS_WIRE_MAIL_PREAMBLE_BYTE) {
+				wire->mailPre = true;
+			} else if (wire->mailPre) {
+				wire->mailData = true; // the first byte of mail data after the run
+			}
+		}
 		if (storing) {
 			_blockStored(wire);
 		} else if (host == 0xFD && !wire->mailMode) {
@@ -319,7 +334,9 @@ static void _pass(struct UDSWire* wire, uint32_t nowMs, uint8_t byte) {
 			_trace(wire, "block %u opens, %u units buffered", wire->blockIndex, wire->rxCount);
 		}
 	} else if (wire->preloadFill) {
-		++wire->blockSkip; // the real unit that this stood in for
+		if (!wire->mailMode || wire->mailData) {
+			++wire->blockSkip; // the real unit that this stood in for
+		} // (ahead of the mail data nothing is dropped: the real stream is served whole after the $20 run, see _preload)
 		if (storing) {
 			_trace(wire, "block %u: the last byte was not there yet, filled in", wire->blockIndex);
 		}
@@ -376,6 +393,7 @@ static void _enterPass(struct UDSWire* wire) {
 	wire->blockUnderruns = 0;
 	wire->blockSkip = 0;
 	wire->mailMode = false;
+	wire->mailData = wire->mailPre = false;
 	wire->rnCovered = wire->rnSuppress = false;
 	wire->rxHead = wire->rxCount = 0;
 	wire->pending = 0;
