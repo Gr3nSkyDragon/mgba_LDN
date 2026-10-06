@@ -15,8 +15,15 @@
  * summary. With --all it also counts every frame the board forwards. No key is needed or used.
  *
  * Close Azahar first (one program at a time can have the board), and give a retail 3DS a VC Pokemon game hosting a trade.
+ *
+ * The 3DS key kept on the board (firmware 1.4 on, for its Game Boy wrapper) instead:
+ *
+ *   uds-esp32-probe [COMx] --key-status           whether the board holds the UDS data key (slot 0x2D); the key itself is never read back
+ *   uds-esp32-probe [COMx] --store-key <file>     stores slot 0x2D KeyN from an Azahar aes_keys.txt (or the file mGBA's Settings > BIOS uses)
+ *   uds-esp32-probe [COMx] --erase-keys           removes it
  */
 #include <mgba/internal/gb/sio/uds-esp32.h>
+#include <mgba/internal/gb/sio/uds-keyfile.h>
 #include <mgba/internal/gb/sio/uds-room.h>
 
 #include <stdio.h>
@@ -109,9 +116,17 @@ int main(int argc, char** argv) {
 	const char* port = NULL;
 	unsigned seconds = 20;
 	int fixedChannel = 0;
+	const char* storeKey = NULL;
+	bool keyStatus = false, eraseKeys = false;
 	int i;
 	for (i = 1; i < argc; ++i) {
-		if (!strcmp(argv[i], "--seconds") && i + 1 < argc) {
+		if (!strcmp(argv[i], "--store-key") && i + 1 < argc) {
+			storeKey = argv[++i];
+		} else if (!strcmp(argv[i], "--key-status")) {
+			keyStatus = true;
+		} else if (!strcmp(argv[i], "--erase-keys")) {
+			eraseKeys = true;
+		} else if (!strcmp(argv[i], "--seconds") && i + 1 < argc) {
 			seconds = (unsigned) atoi(argv[++i]);
 		} else if (!strcmp(argv[i], "--channel") && i + 1 < argc) {
 			fixedChannel = atoi(argv[++i]);
@@ -138,6 +153,36 @@ int main(int argc, char** argv) {
 	printf("firmware %u.%u, protocol %u, board MAC %02X:%02X:%02X:%02X:%02X:%02X\n", esp.info.major, esp.info.minor, esp.info.proto,
 	       esp.info.factoryMac[0], esp.info.factoryMac[1], esp.info.factoryMac[2], esp.info.factoryMac[3], esp.info.factoryMac[4],
 	       esp.info.factoryMac[5]);
+
+	if (storeKey || keyStatus || eraseKeys) {
+		int result = 0;
+		if (!udsEsp32HasGbWrapper(&esp)) {
+			printf("this firmware keeps no keys: flash esp32-uds-bridge 1.4 or later\n");
+			result = 1;
+		} else if (storeKey) {
+			uint8_t key[16];
+			enum UDSKeyStatus status = udsKeyFileLoad(storeKey, key);
+			if (!udsKeyStatusOk(status)) {
+				printf("key file: %s\n", udsKeyStatusText(status));
+				result = 1;
+			} else if (udsEsp32SetKey(&esp, UDS_ESP32_KEY_SLOT_DATA, key, 3000)) {
+				printf("the UDS data key (slot 0x2D) is stored on the board\n");
+			} else {
+				printf("the board did not store the key\n");
+				result = 1;
+			}
+			memset(key, 0, sizeof(key));
+		} else if (eraseKeys) {
+			result = udsEsp32EraseKeys(&esp, 3000) ? 0 : 1;
+			printf(result ? "the board did not erase its keys\n" : "the board's keys are erased\n");
+		}
+		if (!result) {
+			int present = udsEsp32KeyStatus(&esp, 1000);
+			printf("UDS data key (slot 0x2D) on the board: %s\n", present < 0 ? "no answer" : present ? "present" : "missing");
+		}
+		udsEsp32Close(&esp);
+		return result;
+	}
 
 	// A locally administered address of our own for the radio (the board listens on a twin of it; see the firmware's README).
 	uint8_t mac[6] = {0x02, 0x47, 0x42, 0x55, 0x44, 0x53};

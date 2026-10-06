@@ -388,9 +388,30 @@ static bool _padAllowed(const struct UDSWire* wire) {
 // it), skips the fd and copies 441 bytes from the first other one. The cartridge's block (the same layout) must therefore start at
 // T-1, as the 3DS's own did in its stream: what we have sent up to here is padding, so fill up to T-1 with fd, or, if we are already
 // past it, leave out as many of the cartridge's own preamble fd as that.
+//
+// The player block is placed by its data instead (the trainer name, the first byte that is not fd), because that is what the 3DS's
+// unpacking finds. T is the position of the 3DS's first preamble fd; its own name is at T+6. Gen 2 stores 450 units of ours from T-1
+// and searches from the window's first byte [measured]: our name at T+6 (where the nickname fix put it, live with Azahar) has all 441
+// bytes inside, two to spare. Gen 1's window is not measured; the name goes at T+6 too, which needs its start at T+3 or before (its
+// unpacking, cable_club.asm, skips the window's first three bytes) and at T-3 or after (415 bytes of data in 424).
+//
+// The cartridge's own random-number list is not sent (rnSuppress, counted to ten numbers) and must be over here: its bytes lag one
+// exchange on the wire, so its tenth number can be the stale byte of the exchange that ends the ignoring. That exchange is not counted,
+// and a live Gen 1 trade had the count end on the trainer name's first letter instead, which went out as fd: the 3DS read the whole
+// party one byte late (a traded Rapidash arrived as a Nidoking, the next species in the list, with its struct and names shifted).
+// The cartridge's first byte after its ignoring ends is sent as fd whatever it is, for the same reason.
 static void _alignBlock(struct UDSWire* wire) {
 	struct UDSUnitPort* port = &wire->cable.port;
 	unsigned t = _headPosition(wire) - 1; // the unit just taken
+	if (wire->blockIndex % UDS_WIRE_BLOCKS == 1) {
+		wire->dataTarget = t + (wire->gen2 ? UDS_WIRE_DATA_AT_GEN2 : UDS_WIRE_DATA_AT_GEN1);
+		wire->dataAligning = true;
+		wire->dataFirst = true;
+		wire->rnSuppress = false; // the cartridge's list is over (see above)
+		wire->blockDrop = 0;
+		_trace(wire, "block %u: the 3DS's starts at unit %u; our data will start at %u", wire->blockIndex, t, wire->dataTarget);
+		return;
+	}
 	unsigned target = t ? t - 1 : 0;
 	unsigned preamble = wire->blockIndex % UDS_WIRE_BLOCKS == 1 ? UDS_WIRE_PREAMBLE : UDS_WIRE_PATCH_PREAMBLE;
 	if (wire->sentUnits <= target) {
@@ -483,6 +504,29 @@ static void _pass(struct UDSWire* wire, uint32_t nowMs, uint8_t byte) {
 		if (_padAllowed(wire)) {
 			port->queue(port->context, 0xFD);
 		}
+	} else if (storing && wire->dataAligning) {
+		// The player block's preamble: fd up to the data's place, then the data from there (see _alignBlock).
+		uint8_t sent = wire->dataFirst ? 0xFD : byte;
+		wire->dataFirst = false;
+		if (sent == 0xFD) {
+			if (wire->sentUnits < wire->dataTarget) {
+				port->queue(port->context, 0xFD);
+			}
+		} else {
+			unsigned fill = 0;
+			while (wire->sentUnits < wire->dataTarget && fill < UDS_WIRE_RX) {
+				port->queue(port->context, 0xFD);
+				++fill;
+			}
+			if (wire->sentUnits > wire->dataTarget) {
+				_trace(wire, "block %u: our data starts %u units late (STILL LATE: the end of the block is lost)", wire->blockIndex,
+				       wire->sentUnits - wire->dataTarget);
+			} else {
+				_trace(wire, "block %u: our data starts at unit %u", wire->blockIndex, wire->sentUnits);
+			}
+			port->queue(port->context, sent);
+			wire->dataAligning = false;
+		}
 	} else if (storing && wire->blockDrop && byte == 0xFD) {
 		--wire->blockDrop; // a preamble fd of a block that would otherwise start late (see _alignBlock)
 	} else if (storing || wire->mailMode) {
@@ -512,6 +556,7 @@ static void _enterPass(struct UDSWire* wire) {
 	wire->blockUnderruns = 0;
 	wire->blockSkip = 0;
 	wire->blockDrop = 0;
+	wire->dataAligning = wire->dataFirst = false;
 	wire->mailMode = false;
 	wire->mailData = wire->mailPre = false;
 	wire->rnCovered = wire->rnSuppress = false;

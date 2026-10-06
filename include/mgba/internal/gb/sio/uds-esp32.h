@@ -47,6 +47,13 @@ enum UDSEsp32Command {
 	UDS_ESP32_CMD_SET_BEACON = 0x07,
 	UDS_ESP32_CMD_SET_WATCH = 0x08,
 	UDS_ESP32_CMD_PING = 0x09,
+	// Firmware 1.4 on: the 3DS key kept on the board, and the Game Boy wrapper running on it (see udsEsp32GbStart).
+	UDS_ESP32_CMD_SET_KEY = 0x0A,
+	UDS_ESP32_CMD_KEY_STATUS = 0x0B,
+	UDS_ESP32_CMD_ERASE_KEYS = 0x0C,
+	UDS_ESP32_CMD_GB_START = 0x10,
+	UDS_ESP32_CMD_GB_XFER = 0x11,
+	UDS_ESP32_CMD_GB_STOP = 0x12,
 };
 
 enum UDSEsp32Event {
@@ -57,7 +64,15 @@ enum UDSEsp32Event {
 	UDS_ESP32_EVT_STATS = 0x85,
 	UDS_ESP32_EVT_PONG = 0x86,
 	UDS_ESP32_EVT_TX_DONE = 0x87,
+	UDS_ESP32_EVT_KEY_INFO = 0x88,
+	UDS_ESP32_EVT_GB_STATE = 0x90,
+	UDS_ESP32_EVT_GB_REPLY = 0x91,
+	UDS_ESP32_EVT_GB_STATS = 0x92,
 };
+
+#define UDS_ESP32_KEY_SLOT_DATA 0x2D // the 3DS UDS data key the board's wrapper needs
+#define UDS_ESP32_GB_TITLE 16
+#define UDS_ESP32_GB_STATS 10
 
 enum {
 	UDS_ESP32_TX_NO_ACK = 0x01, // group addressed: do not wait for an ACK
@@ -115,6 +130,9 @@ struct UDSEsp32Handlers {
 	void (*status)(void* context, uint8_t requestType, int32_t result);
 	void (*log)(void* context, const char* text, size_t length);
 	void (*txDone)(void* context, bool acked, size_t length);
+	// The wrapper on the board: its state changed (room, session, wire phase, generation, channel), or its 5-second counters.
+	void (*gbState)(void* context, const uint8_t state[5]);
+	void (*gbStats)(void* context, const uint32_t stats[UDS_ESP32_GB_STATS]);
 };
 
 struct Esp32Serial;
@@ -131,6 +149,16 @@ struct UDSEsp32 {
 	unsigned txAcked;
 	uint32_t lastPong;
 	bool portFailed;
+	// Answers that are waited for (udsEsp32GbTransfer, udsEsp32KeyStatus, udsEsp32Request).
+	bool keyInfoValid;
+	bool keyPresent;
+	bool replyValid;
+	uint8_t replySeq;
+	uint8_t replyByte;
+	uint8_t replyPhase;
+	bool statusValid;
+	uint8_t statusType;
+	int32_t statusResult;
 };
 
 // `portName` may be NULL or empty to find the board (Esp32SerialFindEspressif). Returns false when no port opens.
@@ -152,6 +180,22 @@ bool udsEsp32SetWatch(struct UDSEsp32* esp, const uint8_t mac[6]); // all zero c
 bool udsEsp32TxFrame(struct UDSEsp32* esp, uint8_t flags, uint8_t rate500kbps, const uint8_t* mpdu, size_t length);
 bool udsEsp32SetBeacon(struct UDSEsp32* esp, const uint8_t* mpdu, size_t length); // empty clears
 bool udsEsp32Ping(struct UDSEsp32* esp, uint32_t token);
+
+// Firmware 1.4 on. These wait for the board's answer (up to `timeoutMs`), polling the port meanwhile.
+bool udsEsp32HasGbWrapper(const struct UDSEsp32* esp); // the HelloAck says 1.4 or later
+// Stores a key in the board's flash (the board never sends it back). True when the board says it is stored.
+bool udsEsp32SetKey(struct UDSEsp32* esp, uint8_t slot, const uint8_t key[16], unsigned timeoutMs);
+// Whether the board holds the UDS data key. -1: no answer.
+int udsEsp32KeyStatus(struct UDSEsp32* esp, unsigned timeoutMs);
+bool udsEsp32EraseKeys(struct UDSEsp32* esp, unsigned timeoutMs);
+// Starts the board's Game Boy wrapper for the cartridge with this header title (0x134, up to 16 characters) and player name. The result
+// is the board's status (0 ok; see udsEsp32GbStartText), or -1 for no answer.
+int32_t udsEsp32GbStart(struct UDSEsp32* esp, bool log, const char title[UDS_ESP32_GB_TITLE], const uint16_t name[10], unsigned timeoutMs);
+const char* udsEsp32GbStartText(int32_t result);
+bool udsEsp32GbStop(struct UDSEsp32* esp, unsigned timeoutMs);
+// One transfer the cartridge clocked out as master: `master` goes to the board, the byte the slave shifts back comes into *reply. False if
+// the board did not answer in time.
+bool udsEsp32GbTransfer(struct UDSEsp32* esp, uint8_t master, uint8_t* reply, uint8_t* phase, unsigned timeoutMs);
 
 const char* udsEsp32StatusText(int32_t result);
 

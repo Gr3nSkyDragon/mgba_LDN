@@ -805,16 +805,24 @@ static void testBlockLoop(void) {
 	CHECK(runs <= 2 && runLen[0] <= 2 && runLen[1] <= 2, "and sent few fd in front of the player and patch blocks (%u runs: %u, %u)", runs, runLen[0], runLen[1]);
 }
 
-// The Gen 2 player block against a 3DS that behaves as the Azahar log of a trade shows, and a cartridge that runs pret's
+// The player block of either generation, against a 3DS that behaves as the logs of live trades show, and a cartridge that runs pret's
 // Serial_ExchangeBytes (while ignoring it re-sends its block's first byte; on an fd reply it sends the whole block from its first byte,
-// storing a reply per byte). Measured in that trade: the 3DS's random-number list (7 fd, 10 numbers) arrived 8 units ahead of ours, then
-// one other unit, then its player block in one burst: 6 fd, 441 bytes of data, 3 of padding and one more unit. It stores our units from
-// one before its own first preamble fd for 450 units, skips fd and 00, and copies 441 bytes. With our block 11 units late the last 9
-// bytes (the sixth nickname but its first two letters) fell outside that window.
-static void testPlayerBlockWindow(void) {
+// storing a reply per byte), with the one-exchange lag of a real master: the byte it clocks out in an exchange is the one it loaded for the
+// previous one. The 3DS's random-number list arrives 8 units ahead of ours, then its player block in one burst: 6 fd from position T, the
+// data, 3 of padding.
+//  - Gen 2 (Azahar): its list is 7 fd and 10 numbers, then one other unit; its block is 451 units (one after the padding); it stores 450 of
+//    ours from T-1 and searches for the name from the first byte [measured]. With our block 11 late the sixth nickname kept two letters.
+//  - Gen 1 (retail): its list is 8 fd and 10 numbers, then the block at once (424 units; the cartridge's last reply is filled in); it
+//    searches for the name from the window's FOURTH byte (cable_club.asm skips three). Its window's start is not measured: T-1 as Gen 2 is
+//    assumed. Here the cartridge's block opens on its first exchange, so its tenth random number is the stale byte of the opening
+//    exchange, as in the live trade where the trainer name's first letter was taken for that number and lost.
+static void testPlayerBlockWindow(int generation) {
 	struct Sim sim;
 	bringToPassClean(&sim);
-	udsWireSetGeneration(&sim.wire, 2);
+	udsWireSetGeneration(&sim.wire, generation);
+	const bool gen2 = generation == 2;
+	const unsigned size = gen2 ? 450 : 424, data = size - 9, listFd = gen2 ? 7 : 8, between = gen2 ? 1 : 0, tail = gen2 ? 1 : 0;
+	const unsigned fixedSkip = gen2 ? 0 : 3, expectedName = gen2 ? UDS_WIRE_DATA_AT_GEN2 : UDS_WIRE_DATA_AT_GEN1;
 	unsigned r0 = sim.wire.recvUnits + (sim.host.tail - sim.host.head); // the position of the 3DS's next scripted unit
 	int sentToPos = (int) sim.wire.sentUnits - (int) sim.host.sentCount; // our position = host.sentCount + this
 	unsigned n = 0, i;
@@ -825,48 +833,54 @@ static void testPlayerBlockWindow(void) {
 		sim.host.releaseAt[n++] = 0;
 	}
 	unsigned listStart = r0 + n;
-	for (i = 0; i < 17; ++i) { // the list, 8 ahead of ours
-		sim.host.script[n] = i < 7 ? 0xFD : (uint8_t) (0x10 + i);
+	for (i = 0; i < listFd + 10; ++i) { // the list, 8 ahead of ours
+		sim.host.script[n] = i < listFd ? 0xFD : (uint8_t) (0x10 + i);
 		sim.host.releaseAt[n] = AT_POS(listStart + i - 8);
 		++n;
 	}
-	unsigned p3 = r0 + n;
-	sim.host.script[n] = 0x00;
-	sim.host.releaseAt[n++] = AT_POS(p3 - 1);
+	unsigned listEnd = r0 + n;
+	for (i = 0; i < between; ++i) {
+		sim.host.script[n] = 0x00;
+		sim.host.releaseAt[n++] = AT_POS(listEnd - 1);
+	}
 	unsigned t = r0 + n; // the 3DS's first preamble fd
-	uint8_t hostBlock[451];
-	for (i = 0; i < 451; ++i) {
-		hostBlock[i] = i < 6 ? 0xFD : i < 447 ? (uint8_t) (0x80 + (i * 3) % 0x4F) : 0x00;
+	const unsigned windowStart = t - 1;
+	uint8_t hostBlock[456];
+	for (i = 0; i < size + tail; ++i) {
+		hostBlock[i] = i < 6 ? 0xFD : i < size - 3 ? (uint8_t) (0x80 + (i * 3) % 0x4F) : 0x00;
 		sim.host.script[n] = hostBlock[i];
-		sim.host.releaseAt[n++] = AT_POS(p3); // the burst, once the 3DS has our unit in front of its block
+		sim.host.releaseAt[n++] = AT_POS(listEnd); // the burst, once the 3DS has our units up to its block
 	}
 	unsigned t2 = r0 + n; // its patch lists: once it has our whole player block
 	for (i = 0; i < 201; ++i) {
 		sim.host.script[n] = i < 3 ? 0xFD : (uint8_t) (i < 13 ? 0x00 : 0xFF);
-		sim.host.releaseAt[n++] = AT_POS(t - 1 + 450);
+		sim.host.releaseAt[n++] = AT_POS(windowStart + size);
 	}
 	sim.host.scriptLen = n;
 	sim.host.scriptPos = 0;
 	sim.host.reactive = true;
 
-	// The cartridge: its three blocks, as Gen2ToGen2LinkComms lays them out.
-	static const unsigned kSize[3] = {17, 450, 200};
+	// The cartridge: its three blocks, as the link code lays them out (preamble, data, 3 of padding).
+	const unsigned kSize[3] = {17, size, 200};
 	uint8_t blocks[3][450];
 	for (i = 0; i < 17; ++i) {
 		blocks[0][i] = i < 7 ? 0xFD : (uint8_t) (0x40 + i);
 	}
-	for (i = 0; i < 450; ++i) {
-		blocks[1][i] = i < 6 ? 0xFD : i < 447 ? (uint8_t) (0x81 + (i * 7) % 0x4D) : 0x00;
+	for (i = 0; i < size; ++i) {
+		blocks[1][i] = i < 6 ? 0xFD : i < size - 3 ? (uint8_t) (0x81 + (i * 7) % 0x4D) : 0x00;
 	}
 	for (i = 0; i < 200; ++i) {
 		blocks[2][i] = i < 3 ? 0xFD : (uint8_t) (i < 13 ? 0x00 : 0xFF);
 	}
 	unsigned partyStart = 0, patchStart = 0, b, exchanges = 0;
 	bool partyStored = true;
+	uint8_t shifter = 0x00; // what the cartridge loaded for the previous exchange: the byte that goes out in this one
+#define CLOCK(byte) (lagged = shifter, shifter = (byte), exchange(&sim, lagged))
+	uint8_t lagged;
 	for (b = 0; b < 3; ++b) {
 		uint8_t reply;
 		do {
-			reply = exchange(&sim, blocks[b][0]);
+			reply = CLOCK(blocks[b][0]);
 			wait(&sim, 1);
 			++exchanges;
 		} while (reply != 0xFD && exchanges < 20000);
@@ -879,39 +893,58 @@ static void testPlayerBlockWindow(void) {
 					patchStart = at;
 				}
 			}
-			reply = exchange(&sim, blocks[b][i]);
+			reply = CLOCK(blocks[b][i]);
 			wait(&sim, 1);
 			++exchanges;
-			if (b == 1 && i < 450) {
-				partyStored = partyStored && reply == hostBlock[i + 1];
+			if (b == 1) {
+				// Its reply i is the 3DS's unit T+1+i; past the 3DS's block (Gen 1 sends 423 after T) the wire fills in an fd.
+				partyStored = partyStored && reply == (i + 1 < size + tail ? hostBlock[i + 1] : 0xFD);
 			}
 		}
 	}
-	CHECK(exchanges < 20000, "the three blocks complete (%u exchanges)", exchanges);
-	CHECK(partyStored, "the cartridge stored the 3DS's player block from its second preamble fd on");
-	// Where our blocks went (the cartridge may have left preamble fd out; what counts is where the data begins).
+#undef CLOCK
+	CHECK(exchanges < 20000, "Gen %d: the three blocks complete (%u exchanges)", generation, exchanges);
+	CHECK(partyStored, "Gen %d: the cartridge stored the 3DS's player block from its second preamble fd on", generation);
+	// Where our data went: the first byte of the name.
 	unsigned ourName = 0;
 	for (i = 0; i < sim.host.sentCount; ++i) {
 		unsigned pos = (unsigned) ((int) i + sentToPos);
-		if (pos >= partyStart && sim.host.sent[i] == blocks[1][6] && !ourName) {
+		if ((int) i + sentToPos >= 0 && pos >= partyStart && sim.host.sent[i] == blocks[1][6] && !ourName) {
 			ourName = pos;
 		}
 	}
-	CHECK(ourName == t + 5, "our name goes out one unit before the 3DS's own name, as its window needs (ours %d from it)", (int) ourName - (int) (t + 6));
-	// The 3DS's window: our units from t-1, 450 of them; skip fd and 00, then 441 bytes must be our data.
+	CHECK(ourName == t + expectedName, "Gen %d: our name goes out at T+%u (ours at T%+d)", generation, expectedName, (int) ourName - (int) t);
+	// The 3DS's window and its unpacking: skip the fixed bytes, then fd, 00 and FE; then all of our data must follow, inside the window.
 	uint8_t window[450];
-	for (i = 0; i < 450; ++i) {
-		int idx = (int) (t - 1 + i) - sentToPos;
+	for (i = 0; i < size; ++i) {
+		int idx = (int) (windowStart + i) - sentToPos;
 		window[i] = idx >= 0 && (unsigned) idx < sim.host.sentCount ? sim.host.sent[idx] : 0x00;
 	}
-	unsigned skip = 0;
-	while (skip < 450 && (window[skip] == 0xFD || window[skip] == 0x00 || window[skip] == 0xFE)) {
+	unsigned skip = fixedSkip;
+	while (skip < size && (window[skip] == 0xFD || window[skip] == 0x00 || window[skip] == 0xFE)) {
 		++skip;
 	}
-	bool whole = skip + 441 <= 450 && !memcmp(&window[skip], &blocks[1][6], 441);
-	CHECK(whole, "and the 3DS's window holds all 441 bytes of our data, the last nickname included (data from %u)", skip);
-	// The patch lists the same way: ours start one unit before the 3DS's first preamble fd.
-	CHECK(patchStart == t2 - 1, "and the patch lists start one unit before the 3DS's (ours %d from it)", (int) patchStart - (int) (t2 - 1));
+	bool whole = skip + data <= size && !memcmp(&window[skip], &blocks[1][6], data);
+	CHECK(whole, "Gen %d: the 3DS's window holds all %u bytes of our data from its first, the last nickname included (data from %u)", generation, data, skip);
+	// The patch lists, as the 3DS's unpacking reads them: from its window's start, skip 00, fd and FE, then the first list ends at an FF,
+	// and likewise the second (ours are empty: no FE in the party). The window's start is T2-1 in Gen 2; for Gen 1 it is not measured, so
+	// both that and T2+4 (where Gen 1's player block window starts) must read right.
+	unsigned w;
+	for (w = 0; w < 2; ++w) {
+		unsigned start = w == 0 ? t2 - 1 : t2 + 4;
+		unsigned found = 0, k;
+		bool clean = true;
+		for (k = 0; k < 200 && found < 2; ++k) {
+			int idx = (int) (start + k) - sentToPos;
+			uint8_t v = idx >= 0 && (unsigned) idx < sim.host.sentCount ? sim.host.sent[idx] : 0x00;
+			if (v == 0xFF) {
+				++found;
+			} else if (v != 0x00 && v != 0xFD && v != 0xFE) {
+				clean = false;
+			}
+		}
+		CHECK(found == 2 && clean, "Gen %d: a patch list window from T2%+d reads our two empty lists", generation, (int) start - (int) t2);
+	}
 #undef AT_POS
 }
 
@@ -1081,7 +1114,8 @@ int main(void) {
 	testGen2Sync();
 	testGen2Menu();
 	testMail();
-	testPlayerBlockWindow();
+	testPlayerBlockWindow(2);
+	testPlayerBlockWindow(1);
 	testMenu();
 	testPass();
 	testBlocks(NULL);

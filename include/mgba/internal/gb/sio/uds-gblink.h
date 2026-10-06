@@ -45,6 +45,9 @@ struct GBVCLink;
 enum GBVCAir {
 	GBVC_AIR_BRIDGE, // Wireless Adapter > Local: the UDP pair to Azahar's test bridge
 	GBVC_AIR_RADIO, // Wireless Adapter > ESP32: the real radio through the ESP32 board, to a retail 3DS
+	GBVC_AIR_BOARD, // Wireless Adapter > ESP32 with "Virtual Console" unticked: the wrapper runs on the board (firmware 1.4 on); the
+	                // ROM is the cartridge and only its serial transfers go to the board. The board keeps the 3DS key: if it has none,
+	                // the key file (keyPath) is stored on it.
 };
 
 struct GBVCLinkConfig {

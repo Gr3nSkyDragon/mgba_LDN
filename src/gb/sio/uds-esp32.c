@@ -230,8 +230,40 @@ static void _dispatch(struct UDSEsp32* esp, const struct UDSEsp32Frame* frame) {
 			memcpy(esp->info.factoryMac, &p[3], 6);
 		}
 		break;
+	case UDS_ESP32_EVT_KEY_INFO:
+		if (frame->length >= 2) {
+			esp->keyInfoValid = true;
+			esp->keyPresent = p[1] != 0;
+		}
+		break;
+	case UDS_ESP32_EVT_GB_REPLY:
+		if (frame->length >= 2) {
+			esp->replyValid = true;
+			esp->replySeq = frame->seq;
+			esp->replyByte = p[0];
+			esp->replyPhase = p[1];
+		}
+		break;
+	case UDS_ESP32_EVT_GB_STATE:
+		if (frame->length >= 5 && esp->handlers.gbState) {
+			esp->handlers.gbState(esp->handlers.context, p);
+		}
+		break;
+	case UDS_ESP32_EVT_GB_STATS:
+		if (frame->length >= 4 * UDS_ESP32_GB_STATS && esp->handlers.gbStats) {
+			uint32_t stats[UDS_ESP32_GB_STATS];
+			size_t i;
+			for (i = 0; i < UDS_ESP32_GB_STATS; ++i) {
+				stats[i] = _le32(&p[4 * i]);
+			}
+			esp->handlers.gbStats(esp->handlers.context, stats);
+		}
+		break;
 	case UDS_ESP32_EVT_STATUS:
 		if (frame->length >= 5) {
+			esp->statusValid = true;
+			esp->statusType = p[0];
+			esp->statusResult = (int32_t) _le32(&p[1]);
 			++esp->statusFrames;
 			if (esp->handlers.status) {
 				esp->handlers.status(esp->handlers.context, p[0], (int32_t) _le32(&p[1]));
@@ -366,6 +398,129 @@ bool udsEsp32SetBeacon(struct UDSEsp32* esp, const uint8_t* mpdu, size_t length)
 bool udsEsp32Ping(struct UDSEsp32* esp, uint32_t token) {
 	uint8_t payload[4] = {(uint8_t) token, (uint8_t) (token >> 8), (uint8_t) (token >> 16), (uint8_t) (token >> 24)};
 	return _send(esp, UDS_ESP32_CMD_PING, 0, payload, sizeof(payload));
+}
+
+// Firmware 1.4: the key on the board and the Game Boy wrapper ---------------------------------------------------------------
+
+bool udsEsp32HasGbWrapper(const struct UDSEsp32* esp) {
+	return esp->info.valid && (esp->info.major > 1 || (esp->info.major == 1 && esp->info.minor >= 4));
+}
+
+// Polls until *flag is set or the time is up. The board answers within a few milliseconds over USB, so this spins rather than sleeping
+// (a sleep on Windows lasts a scheduler tick, about 15 ms).
+static bool _await(struct UDSEsp32* esp, const bool* flag, unsigned timeoutMs) {
+	uint32_t start = _nowMs();
+	for (;;) {
+		if (!udsEsp32Poll(esp)) {
+			return false;
+		}
+		if (*flag) {
+			return true;
+		}
+		if (_nowMs() - start > timeoutMs) {
+			return false;
+		}
+#ifdef _WIN32
+		Sleep(0);
+#endif
+	}
+}
+
+// Sends a request that the board answers with Status, and waits for it. -1 for no answer.
+static int32_t _request(struct UDSEsp32* esp, uint8_t type, const uint8_t* payload, size_t length, unsigned timeoutMs) {
+	esp->statusValid = false;
+	if (!_send(esp, type, 0, payload, length)) {
+		return -1;
+	}
+	uint32_t start = _nowMs();
+	while (_await(esp, &esp->statusValid, timeoutMs)) {
+		if (esp->statusType == type) {
+			return esp->statusResult;
+		}
+		esp->statusValid = false; // the answer to something else
+		if (_nowMs() - start > timeoutMs) {
+			break;
+		}
+	}
+	return -1;
+}
+
+bool udsEsp32SetKey(struct UDSEsp32* esp, uint8_t slot, const uint8_t key[16], unsigned timeoutMs) {
+	uint8_t payload[17];
+	payload[0] = slot;
+	memcpy(&payload[1], key, 16);
+	int32_t result = _request(esp, UDS_ESP32_CMD_SET_KEY, payload, sizeof(payload), timeoutMs);
+	memset(payload, 0, sizeof(payload));
+	return result == 0;
+}
+
+int udsEsp32KeyStatus(struct UDSEsp32* esp, unsigned timeoutMs) {
+	esp->keyInfoValid = false;
+	if (!_send(esp, UDS_ESP32_CMD_KEY_STATUS, 0, NULL, 0) || !_await(esp, &esp->keyInfoValid, timeoutMs)) {
+		return -1;
+	}
+	return esp->keyPresent ? 1 : 0;
+}
+
+bool udsEsp32EraseKeys(struct UDSEsp32* esp, unsigned timeoutMs) {
+	return _request(esp, UDS_ESP32_CMD_ERASE_KEYS, NULL, 0, timeoutMs) == 0;
+}
+
+int32_t udsEsp32GbStart(struct UDSEsp32* esp, bool log, const char title[UDS_ESP32_GB_TITLE], const uint16_t name[10], unsigned timeoutMs) {
+	uint8_t payload[1 + UDS_ESP32_GB_TITLE + 20];
+	memset(payload, 0, sizeof(payload));
+	payload[0] = log ? 1 : 0;
+	size_t i;
+	for (i = 0; i < UDS_ESP32_GB_TITLE && title[i]; ++i) {
+		payload[1 + i] = (uint8_t) title[i];
+	}
+	for (i = 0; i < 10; ++i) {
+		payload[1 + UDS_ESP32_GB_TITLE + 2 * i] = (uint8_t) name[i];
+		payload[2 + UDS_ESP32_GB_TITLE + 2 * i] = (uint8_t) (name[i] >> 8);
+	}
+	return _request(esp, UDS_ESP32_CMD_GB_START, payload, sizeof(payload), timeoutMs);
+}
+
+const char* udsEsp32GbStartText(int32_t result) {
+	switch (result) {
+	case 0:
+		return "started";
+	case -1:
+		return "the board did not answer";
+	case 0x105: // ESP_ERR_NOT_FOUND
+		return "the board holds no UDS key (slot 0x2D): store one first";
+	case 0x106: // ESP_ERR_NOT_SUPPORTED
+		return "the board does not know this game (Red, Blue, Yellow, Gold, Silver and Crystal are supported)";
+	default:
+		return udsEsp32StatusText(result);
+	}
+}
+
+bool udsEsp32GbStop(struct UDSEsp32* esp, unsigned timeoutMs) {
+	return _request(esp, UDS_ESP32_CMD_GB_STOP, NULL, 0, timeoutMs) == 0;
+}
+
+bool udsEsp32GbTransfer(struct UDSEsp32* esp, uint8_t master, uint8_t* reply, uint8_t* phase, unsigned timeoutMs) {
+	uint8_t seq = esp->seq;
+	esp->replyValid = false;
+	if (!_send(esp, UDS_ESP32_CMD_GB_XFER, 0, &master, 1)) {
+		return false;
+	}
+	uint32_t start = _nowMs();
+	while (_await(esp, &esp->replyValid, timeoutMs)) {
+		if (esp->replySeq == seq) {
+			*reply = esp->replyByte;
+			if (phase) {
+				*phase = esp->replyPhase;
+			}
+			return true;
+		}
+		esp->replyValid = false; // a late answer to an earlier transfer
+		if (_nowMs() - start > timeoutMs) {
+			break;
+		}
+	}
+	return false;
 }
 
 const char* udsEsp32StatusText(int32_t result) {

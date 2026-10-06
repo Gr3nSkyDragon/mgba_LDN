@@ -125,6 +125,9 @@ struct UDSWire {
 	unsigned rnNumbers; // its numbers seen so far
 	unsigned blockSkip; // units to drop from the buffer so that an FE stored as data does not shift the block
 	unsigned blockDrop; // the cartridge's preamble fd left out so that its block starts where the 3DS's window does
+	bool dataAligning; // the player block's preamble is going out: fd up to dataTarget, then the data (see _alignBlock)
+	bool dataFirst; // the next byte is the first after the ignoring ended: the stale one, sent as fd
+	unsigned dataTarget; // the stream position of the player block's first data byte
 	bool preloadFill; // the reply loaded is a stand-in for the block's last byte, which the 3DS has not produced yet
 
 	// PASS has its own receive buffer. The 3DS only produces its next unit once it has ours (its exchanges block), so every
@@ -143,6 +146,9 @@ struct UDSWire {
 #define UDS_WIRE_RN_NUMBERS 10
 #define UDS_WIRE_PREAMBLE 6 // fd in front of the player block (SERIAL_PREAMBLE_LENGTH)
 #define UDS_WIRE_PATCH_PREAMBLE 3 // fd in front of the patch lists (SERIAL_PATCH_PREAMBLE_LENGTH)
+// Where the player block's first data byte goes, from the 3DS's first preamble fd T (see _alignBlock in uds-wire.c)
+#define UDS_WIRE_DATA_AT_GEN1 6 // as Gen 2: the Gen 1 window's start is not measured (see _alignBlock)
+#define UDS_WIRE_DATA_AT_GEN2 6
 
 #define UDS_WIRE_MAIL_PREAMBLE_BYTE 0x20 // opens the Gen 2 mail block (five of them from a game; the receiver accepts a run of any length)
 

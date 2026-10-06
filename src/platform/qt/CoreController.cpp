@@ -1377,14 +1377,18 @@ void CoreController::setVCWrapper(bool enabled) {
 // UDP pair to Azahar's test bridge (AZAHAR_UDS_BRIDGE). Like the RFU Cable Wrapper's wireless side it does not wait for the game: the
 // join starts at once and takes the first matching beacon, so it is up before the game opens its link. The link is created and
 // destroyed with the core stopped.
+//
+// With ESP32 chosen and the box unticked, a Game Boy game is the cartridge and the wrapper runs on the board instead (firmware 1.4 on,
+// GBVC_AIR_BOARD): only the serial transfers go over USB, and the key file is stored on the board if it has none.
 void CoreController::applyVC() {
 	const bool radio = m_rfuRequestedBackend == QLatin1String("esp32");
-	const bool wanted = m_vcWrapper && platform() == mPLATFORM_GB && (radio || m_rfuRequestedBackend == QLatin1String("local"));
+	const bool board = !m_vcWrapper && radio && platform() == mPLATFORM_GB;
+	const bool wanted = board || (m_vcWrapper && platform() == mPLATFORM_GB && (radio || m_rfuRequestedBackend == QLatin1String("local")));
 	if (!wanted) {
 		stopVC();
 		return;
 	}
-	if (m_vcLink && m_vcLinkRadio == radio && (!radio || (m_vcLinkPort == m_rfuEsp32Port && m_vcLinkKey == m_vcKeyFile))) {
+	if (m_vcLink && m_vcLinkRadio == radio && m_vcLinkBoard == board && (!radio || (m_vcLinkPort == m_rfuEsp32Port && m_vcLinkKey == m_vcKeyFile))) {
 		return;
 	}
 	stopVC();
@@ -1394,11 +1398,12 @@ void CoreController::applyVC() {
 	const QByteArray port = m_rfuEsp32Port.toUtf8();
 	const QByteArray key = m_vcKeyFile.toUtf8();
 	GBVCLinkConfig config = {};
-	config.air = radio ? GBVC_AIR_RADIO : GBVC_AIR_BRIDGE;
+	config.air = board ? GBVC_AIR_BOARD : radio ? GBVC_AIR_RADIO : GBVC_AIR_BRIDGE;
 	config.portName = port.constData();
 	config.keyPath = key.constData();
 	m_vcLink = GBVCLinkCreate(m_threadContext.core, &m_debugger, name, &config);
 	m_vcLinkRadio = radio;
+	m_vcLinkBoard = board;
 	m_vcLinkPort = m_rfuEsp32Port;
 	m_vcLinkKey = m_vcKeyFile;
 	if (!m_vcLink) {

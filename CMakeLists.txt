@@ -954,6 +954,7 @@ if(BUILD_UDS_TEST)
 	add_executable(uds-esp32-probe
 		src/gb/sio/uds-esp32-probe.c
 		src/gb/sio/uds-esp32.c
+		src/gb/sio/uds-keyfile.c
 		src/gb/sio/uds-room.c
 		src/gba/sio/esp32/esp32-serial.c)
 	target_include_directories(uds-esp32-probe PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)

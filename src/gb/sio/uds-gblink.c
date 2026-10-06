@@ -10,7 +10,9 @@
 #include <mgba/internal/gb/gb.h>
 #include <mgba/internal/gb/io.h>
 #include <mgba/internal/gb/sio/uds-cable.h>
+#include <mgba/internal/gb/sio/uds-esp32.h>
 #include <mgba/internal/gb/sio/uds-joiner.h>
+#include <mgba/internal/gb/sio/uds-keyfile.h>
 #include <mgba/internal/gb/sio/uds-wire.h>
 #include <mgba/internal/sm83/sm83.h>
 
@@ -96,6 +98,18 @@ struct GBVCLink {
 	bool wireMode;
 	int lastWirePhase;
 	unsigned wireExchanges;
+
+	// Board mode (GBVC_AIR_BOARD): the wrapper runs on the ESP32; the joiner, cable and wire above are not used.
+	bool boardMode;
+	int boardState; // enum BoardState
+	struct UDSEsp32 esp;
+	uint32_t boardSinceMs;
+	uint32_t boardHelloMs;
+	char boardTitle[UDS_ESP32_GB_TITLE + 1];
+	char keyPath[512];
+	uint16_t name[10];
+	uint8_t boardPhase; // the wire phase the board last reported
+	unsigned boardTimeouts;
 
 	bool attachedDriver;
 	bool attachedModule;
@@ -404,6 +418,161 @@ static uint8_t _wireWriteSC(struct GBSIODriver* driver, uint8_t value) {
 	return value;
 }
 
+// Board mode: the wrapper runs on the ESP32 board, this ROM is the cartridge ----------------------------------------------------
+
+enum BoardState {
+	BOARD_BOOT, // the board resets when its port opens: Hello until it answers
+	BOARD_KEY, // does it hold the 3DS key? (if not, the key file is stored on it)
+	BOARD_START, // GB_START for this game
+	BOARD_RUNNING, // every transfer goes to the board
+	BOARD_FAILED,
+};
+
+#define BOARD_BOOT_MS 15000
+#define BOARD_TRANSFER_MS 250
+
+static const char* const kRoomStates[] = {"scan", "auth", "eapol", "joined"};
+static const char* const kSessionStates[] = {"idle", "setup", "joined", "closed"};
+
+static void _boardFail(struct GBVCLink* link, const char* why) {
+	link->boardState = BOARD_FAILED;
+	mLOG(GB_SIO, ERROR, "Virtual Console (board): %s", why);
+	_trace(link, "board: %s", why);
+}
+
+static void _boardLog(void* context, const char* text, size_t length) {
+	_trace(context, "board: %.*s", (int) length, text);
+}
+
+static void _boardState(void* context, const uint8_t state[5]) {
+	struct GBVCLink* link = context;
+	link->boardPhase = state[2];
+	_trace(link, "board state: room %s, session %s, wire %s, Gen %u, channel %u", state[0] < 4 ? kRoomStates[state[0]] : "?",
+	       state[1] < 4 ? kSessionStates[state[1]] : "none", state[2] <= UDS_WIRE_PASS ? kWirePhases[state[2]] : "?", state[3], state[4]);
+	if (state[1] == UDS_STATE_JOINED && state[2] == UDS_WIRE_ROLE) {
+		mLOG(GB_SIO, INFO, "Virtual Console (board): link up");
+	}
+}
+
+static void _boardStats(void* context, const uint32_t stats[UDS_ESP32_GB_STATS]) {
+	_trace(context, "board stats: beacons %u, frames sent %u received %u, dropped decrypt %u replay %u other %u, tx failed %u, units sent %u received %u, transfers %u",
+	       (unsigned) stats[0], (unsigned) stats[1], (unsigned) stats[2], (unsigned) stats[3], (unsigned) stats[4], (unsigned) stats[5],
+	       (unsigned) stats[6], (unsigned) stats[7], (unsigned) stats[8], (unsigned) stats[9]);
+}
+
+// Brings the board up: called from the poll until it runs. The waits inside are short (the board answers in milliseconds).
+static void _boardStep(struct GBVCLink* link, uint32_t now) {
+	switch (link->boardState) {
+	case BOARD_BOOT:
+		if (link->esp.info.valid) {
+			_trace(link, "board: firmware %u.%u, protocol %u", link->esp.info.major, link->esp.info.minor, link->esp.info.proto);
+			if (!udsEsp32HasGbWrapper(&link->esp)) {
+				_boardFail(link, "the board's firmware has no Game Boy wrapper: flash esp32-uds-bridge 1.4 or later (or tick Virtual Console to run the wrapper in mGBA)");
+				return;
+			}
+			link->boardState = BOARD_KEY;
+		} else if (now - link->boardSinceMs > BOARD_BOOT_MS) {
+			_boardFail(link, "the board did not answer Hello: it must run Azahar's esp32-uds-bridge firmware");
+		} else if (!link->boardHelloMs || now - link->boardHelloMs >= 500) {
+			udsEsp32SendHello(&link->esp);
+			link->boardHelloMs = now ? now : 1;
+		}
+		return;
+	case BOARD_KEY: {
+		int present = udsEsp32KeyStatus(&link->esp, 1000);
+		if (present < 0) {
+			_boardFail(link, "the board did not answer the key query");
+			return;
+		}
+		if (!present) {
+			// Like GB-Link's web client storing the Switch keys: the key file's UDS key is written to the board once, and stays there.
+			uint8_t key[16];
+			enum UDSKeyStatus status = udsKeyFileLoad(link->keyPath, key);
+			if (!udsKeyStatusOk(status)) {
+				char why[200];
+				snprintf(why, sizeof(why), "the board holds no 3DS UDS key, and the key file cannot supply one (%s): choose it in Settings > BIOS",
+				         udsKeyStatusText(status));
+				_boardFail(link, why);
+				return;
+			}
+			bool stored = udsEsp32SetKey(&link->esp, UDS_ESP32_KEY_SLOT_DATA, key, 3000);
+			memset(key, 0, sizeof(key));
+			if (!stored) {
+				_boardFail(link, "the board did not store the UDS key");
+				return;
+			}
+			mLOG(GB_SIO, INFO, "Virtual Console (board): stored the 3DS UDS key on the board");
+			_trace(link, "board: UDS key stored on the board");
+		}
+		link->boardState = BOARD_START;
+		return;
+	}
+	case BOARD_START: {
+		int32_t result = udsEsp32GbStart(&link->esp, link->trace != NULL, link->boardTitle, link->name, 2000);
+		if (result != 0) {
+			char why[200];
+			snprintf(why, sizeof(why), "the board's wrapper did not start: %s", udsEsp32GbStartText(result));
+			_boardFail(link, why);
+			return;
+		}
+		link->boardState = BOARD_RUNNING;
+		mLOG(GB_SIO, INFO, "Virtual Console (board): %s, the wrapper runs on the ESP32; looking for a 3DS", link->game->title);
+		_trace(link, "board: wrapper started for %s", link->boardTitle);
+		return;
+	}
+	default:
+		return;
+	}
+}
+
+static void _boardPoll(struct mTiming* timing, void* context, uint32_t cyclesLate) {
+	struct GBVCLink* link = context;
+	uint32_t now = _nowMs() - link->startMs;
+	if (link->boardState != BOARD_FAILED) {
+		if (!udsEsp32Poll(&link->esp)) {
+			_boardFail(link, "the serial port failed (is the board still plugged in?)");
+		} else {
+			_boardStep(link, now);
+		}
+	}
+	if (link->trace && now - link->lastHeartbeatMs >= 5000) {
+		link->lastHeartbeatMs = now;
+		struct SM83Core* cpu = link->core->cpu;
+		_trace(link, "heartbeat: pc %02X:%04X map %02X linkstate %02X conn %02X, board %d, wire %s, transfers %u, timeouts %u",
+		       link->gb->memory.currentBank, cpu->pc, _read8(link, link->game->curMap), _read8(link, link->game->linkState),
+		       _read8(link, link->game->connectionStatus), link->boardState,
+		       link->boardPhase <= UDS_WIRE_PASS ? kWirePhases[link->boardPhase] : "?", link->wireExchanges, link->boardTimeouts);
+	}
+	mTimingSchedule(timing, &link->event, GBVC_POLL_CYCLES - cyclesLate);
+}
+
+// The cartridge started a transfer as master: the board answers with the slave's byte for this same transfer. The emulator waits for
+// it (a few milliseconds over USB), so the game sees a slave that is always ready, as a real one is. Until the board's wrapper runs, the
+// line is idle (FF).
+static uint8_t _boardWriteSC(struct GBSIODriver* driver, uint8_t value) {
+	struct GBVCLink* link = (struct GBVCLink*) driver;
+	if ((value & 0x81) == 0x81) {
+		uint8_t master = link->gb->memory.io[GB_REG_SB];
+		uint8_t reply = UDS_WIRE_IDLE_LINE;
+		uint8_t phase = link->boardPhase;
+		if (link->boardState == BOARD_RUNNING) {
+			if (!udsEsp32GbTransfer(&link->esp, master, &reply, &phase, BOARD_TRANSFER_MS)) {
+				reply = UDS_WIRE_IDLE_LINE;
+				++link->boardTimeouts;
+				_trace(link, "board: no answer to a transfer (%02X)", master);
+			} else {
+				link->boardPhase = phase;
+			}
+		}
+		link->gb->sio.pendingSB = reply;
+		++link->wireExchanges;
+		if (link->trace && link->wireExchanges <= 8000) {
+			_trace(link, "wire %02X -> %02X [%s]", master, reply, phase <= UDS_WIRE_PASS ? kWirePhases[phase] : "?");
+		}
+	}
+	return value;
+}
+
 // The serial device ---------------------------------------------------------------------------------------------------
 
 static bool _driverInit(struct GBSIODriver* driver) {
@@ -588,6 +757,9 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 	if (wireEnv && *wireEnv) {
 		wire = *wireEnv != '0';
 	}
+	if (config->air == GBVC_AIR_BOARD) {
+		wire = true; // the board's wrapper is the wire front end; nothing is hooked here
+	}
 	const struct VCGame* game = _findGame(core, title);
 	if (!game) {
 		size_t i;
@@ -651,6 +823,42 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 		char path[512];
 		snprintf(path, sizeof(path), "%s/vclink_%u.txt", dir, (unsigned) time(NULL));
 		link->trace = fopen(path, "w");
+	}
+
+	if (config->air == GBVC_AIR_BOARD) {
+		link->boardMode = true;
+		link->boardState = BOARD_BOOT;
+		link->boardPhase = UDS_WIRE_DOWN;
+		memcpy(link->name, name, sizeof(link->name));
+		strncpy(link->boardTitle, title, sizeof(link->boardTitle) - 1);
+		if (config->keyPath) {
+			strncpy(link->keyPath, config->keyPath, sizeof(link->keyPath) - 1);
+		}
+		struct UDSEsp32Handlers handlers = {
+			.context = link, .log = _boardLog, .gbState = _boardState, .gbStats = _boardStats,
+		};
+		if (!udsEsp32Open(&link->esp, config->portName, &handlers)) {
+			mLOG(GB_SIO, ERROR, "Virtual Console (board): no ESP32 board found%s%s", config->portName && *config->portName ? " on " : "",
+			     config->portName && *config->portName ? config->portName : "");
+			GBVCLinkDestroy(link);
+			return NULL;
+		}
+		link->boardSinceMs = _nowMs() - link->startMs;
+		link->d.init = _driverInit;
+		link->d.deinit = _driverDeinit;
+		link->d.writeSB = _driverWriteSB;
+		link->d.writeSC = _boardWriteSC;
+		GBSIOSetDriver(&link->gb->sio, &link->d);
+		link->attachedDriver = true;
+		link->event.context = link;
+		link->event.name = "GB VC board";
+		link->event.callback = _boardPoll;
+		link->event.priority = 0x40;
+		mTimingSchedule(&link->gb->timing, &link->event, GBVC_POLL_CYCLES);
+		mLOG(GB_SIO, INFO, "Virtual Console (board): %s, the wrapper runs on the ESP32 board%s%s", game->title,
+		     config->portName && *config->portName ? " on " : "", config->portName && *config->portName ? config->portName : "");
+		_trace(link, "created for %s, board mode", game->title);
+		return link;
 	}
 
 	if (config->air == GBVC_AIR_RADIO) {
@@ -763,7 +971,14 @@ void GBVCLinkDestroy(struct GBVCLink* link) {
 		}
 		mDebuggerDetachModule(link->core->debugger, &link->module);
 	}
-	udsJoinerClose(&link->joiner);
+	if (link->boardMode) {
+		if (link->boardState == BOARD_RUNNING) {
+			udsEsp32GbStop(&link->esp, 500);
+		}
+		udsEsp32Close(&link->esp);
+	} else {
+		udsJoinerClose(&link->joiner);
+	}
 	if (link->trace) {
 		_trace(link, "link stopped (units sent %u, received %u)", link->txUnits, link->rxUnits);
 		fclose(link->trace);

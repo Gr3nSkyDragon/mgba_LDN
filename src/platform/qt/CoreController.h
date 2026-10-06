@@ -413,6 +413,7 @@ private:
 	void stopVC();
 	GBVCLink* m_vcLink = nullptr;
 	bool m_vcLinkRadio = false; // what the running link was made for, to restart it when the choice changes
+	bool m_vcLinkBoard = false; // ESP32 with "Virtual Console" unticked: the wrapper runs on the board
 	QString m_vcLinkPort;
 	QString m_vcLinkKey;
 	QString m_vcKeyFile;
