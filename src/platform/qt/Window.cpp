@@ -1680,10 +1680,10 @@ void Window::setupMenu(QMenuBar* menubar) {
 	}, this);
 	// Not part of the wireless adapter: a Game Boy (not GBA) link cable signal carried inside a UDS wrapper, so a Gen 1-2
 	// Pokemon game on the Game Boy core can trade with the 3DS Virtual Console release (doc/uds-wrapper-plan.md). It sits
-	// in this menu only because the menu is where the Cable wrapper box is. The label is a placeholder and, for now, the
-	// box only records the choice; nothing is attached. Saved as vcwrapper.enabled.
+	// in this menu only because the menu is where the Cable wrapper box is. Only the Local backend (Azahar's UDS bridge) needs
+	// it: with ESP32 a Game Boy game always uses the wrapper on the board. Saved as vcwrapper.enabled.
 	ConfigOption* vcWrapper = localOption("vcwrapper.enabled");
-	vcWrapper->addBoolean(tr("Virtual Console (Gen 1-2)"), &m_actions, "rfu");
+	vcWrapper->addBoolean(tr("Virtual Console (local only)"), &m_actions, "rfu");
 	vcWrapper->connect([this](const QVariant& value) {
 		m_vcWrapper = value.toBool();
 		if (m_controller) {

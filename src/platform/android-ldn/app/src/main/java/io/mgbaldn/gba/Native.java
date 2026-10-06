@@ -38,8 +38,14 @@ final class Native {
     /** Adds a line (wall-clock stamped by the caller) to the adapter trace, if an adapter is attached. */
     static native void traceNote(String note);
 
-    /** 0 = no adapter, 1 = wireless adapter (ESP32), 2 = cable adapter (RFU cable wrapper over the ESP32). */
+    /**
+     * 0 = no adapter, 1 = wireless adapter (ESP32), 2 = cable adapter (RFU cable wrapper over the ESP32). On a Game Boy game 1 is
+     * the Virtual Console link to a retail 3DS (the board runs Azahar's esp32-uds-bridge 1.4 or later) and 2 is nothing.
+     */
     static native boolean setAdapter(int mode);
+
+    /** The USB link to the board has just opened: the Virtual Console link, which needs the board when it starts, starts again. */
+    static native void usbConnected();
 
     /** Averages each frame with the previous one. Safe from any thread, like setKeys. */
     static native void setFrameBlending(boolean blend);

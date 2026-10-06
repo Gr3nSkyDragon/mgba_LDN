@@ -161,9 +161,15 @@ static unsigned _progress(void* ctx) {
 
 static uint64_t _nowMs(void) {
 	struct timespec ts;
+#ifdef __ANDROID__
+	if (clock_gettime(CLOCK_REALTIME, &ts)) { // timespec_get needs Android API 29; the app builds for 26
+		return 0;
+	}
+#else
 	if (!timespec_get(&ts, TIME_UTC)) {
 		return 0;
 	}
+#endif
 	return (uint64_t) ts.tv_sec * 1000ULL + (uint64_t) (ts.tv_nsec / 1000000L);
 }
 

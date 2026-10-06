@@ -43,9 +43,9 @@ struct GBVCLink;
 #define GBVC_NAME_WORDS 10
 
 enum GBVCAir {
-	GBVC_AIR_BRIDGE, // Wireless Adapter > Local: the UDP pair to Azahar's test bridge
-	GBVC_AIR_RADIO, // Wireless Adapter > ESP32: the real radio through the ESP32 board, to a retail 3DS
-	GBVC_AIR_BOARD, // Wireless Adapter > ESP32 with "Virtual Console" unticked: the wrapper runs on the board (firmware 1.4 on); the
+	GBVC_AIR_BRIDGE, // Wireless Adapter > Local with "Virtual Console (local only)": the UDP pair to Azahar's test bridge
+	GBVC_AIR_RADIO, // the board as a raw radio, the wrapper here, to a retail 3DS (no longer offered in the menu: GBVC_AIR_BOARD does it)
+	GBVC_AIR_BOARD, // Wireless Adapter > ESP32: the wrapper runs on the board (firmware 1.4 on); the
 	                // ROM is the cartridge and only its serial transfers go to the board. The board keeps the 3DS key: if it has none,
 	                // the key file (keyPath) is stored on it.
 };
@@ -57,11 +57,14 @@ struct GBVCLinkConfig {
 	const char* portName; // radio: the board's serial port, NULL or empty to find it
 	const char* keyPath; // radio: the 3DS UDS key file (Settings > BIOS)
 	bool wire; // unused: wire mode (the ROM is the master of a link cable and a front end is its slave, uds-wire.c, no ROM hooks) is the default; MGBA_VCLINK_WIRE=0 selects the hook mode
+	const char* tracePath; // a file for the trace (the Android app's shared log); NULL or empty: MGBA_VCLINK_TRACE as before
 };
 
 struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, const uint16_t name[GBVC_NAME_WORDS],
                                 const struct GBVCLinkConfig* config);
 void GBVCLinkDestroy(struct GBVCLink* link);
+// A line of the front end's own in the trace (the Android app's wall-clock and frame-rate notes). Nothing without a trace.
+void GBVCLinkTraceNote(struct GBVCLink* link, const char* text);
 
 CXX_GUARD_END
 

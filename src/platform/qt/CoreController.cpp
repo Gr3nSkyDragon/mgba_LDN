@@ -1360,35 +1360,32 @@ void CoreController::setRFUCableWrapper(bool enabled) {
 	applyRFU();
 }
 
-// The "Virtual Console (Gen 1-2)" box: a Game Boy link cable signal inside a UDS wrapper (nothing to do with the GBA
-// wireless adapter above). Placeholder until the UDS wrapper (src/gb/sio/uds-*.c, see
-// doc/uds-wrapper-plan.md) is attached to the Game Boy core's link port; for now the choice is only recorded.
+// The "Virtual Console (local only)" box: with the Local backend, a Game Boy game trades with Azahar through its UDS bridge, the
+// wrapper running here (nothing to do with the GBA wireless adapter above). The ESP32 backend does not need it (see applyVC).
 void CoreController::setVCWrapper(bool enabled) {
 	if (m_vcWrapper == enabled) {
 		return;
 	}
 	m_vcWrapper = enabled;
-	qInfo() << "Virtual Console (Gen 1-2) wrapper" << (enabled ? "selected" : "deselected");
+	qInfo() << "Virtual Console (local only)" << (enabled ? "selected" : "deselected");
 	applyVC();
 }
 
-// The Virtual Console wrapper needs a Game Boy core running one of the known games, the box ticked and a Wireless Adapter backend that
-// has a meaning for it: ESP32 is the real radio (the board and the 3DS UDS key file from Settings > BIOS, to a retail 3DS), Local is the
-// UDP pair to Azahar's test bridge (AZAHAR_UDS_BRIDGE). Like the RFU Cable Wrapper's wireless side it does not wait for the game: the
-// join starts at once and takes the first matching beacon, so it is up before the game opens its link. The link is created and
-// destroyed with the core stopped.
-//
-// With ESP32 chosen and the box unticked, a Game Boy game is the cartridge and the wrapper runs on the board instead (firmware 1.4 on,
-// GBVC_AIR_BOARD): only the serial transfers go over USB, and the key file is stored on the board if it has none.
+// The Virtual Console link needs a Game Boy core running one of the known games and a Wireless Adapter backend that has a meaning for
+// it. ESP32: the game is the cartridge and the wrapper runs on the board (firmware 1.4 on, GBVC_AIR_BOARD) to a retail 3DS; only the
+// serial transfers go over USB, and the key file (Settings > BIOS) is stored on the board if it has none. Local, with the "Virtual
+// Console (local only)" box ticked: the wrapper runs here, on the UDP pair to Azahar's bridge (AZAHAR_UDS_BRIDGE). The PC-side radio
+// mode (GBVC_AIR_RADIO) is no longer offered: the board does that job. Like the RFU Cable Wrapper's wireless side the link does not wait
+// for the game: the join starts at once and takes the first matching beacon. The link is created and destroyed with the core stopped.
 void CoreController::applyVC() {
-	const bool radio = m_rfuRequestedBackend == QLatin1String("esp32");
-	const bool board = !m_vcWrapper && radio && platform() == mPLATFORM_GB;
-	const bool wanted = board || (m_vcWrapper && platform() == mPLATFORM_GB && (radio || m_rfuRequestedBackend == QLatin1String("local")));
-	if (!wanted) {
+	const bool gb = platform() == mPLATFORM_GB;
+	const bool board = gb && m_rfuRequestedBackend == QLatin1String("esp32");
+	const bool bridge = gb && m_vcWrapper && m_rfuRequestedBackend == QLatin1String("local");
+	if (!board && !bridge) {
 		stopVC();
 		return;
 	}
-	if (m_vcLink && m_vcLinkRadio == radio && m_vcLinkBoard == board && (!radio || (m_vcLinkPort == m_rfuEsp32Port && m_vcLinkKey == m_vcKeyFile))) {
+	if (m_vcLink && m_vcLinkBoard == board && (!board || (m_vcLinkPort == m_rfuEsp32Port && m_vcLinkKey == m_vcKeyFile))) {
 		return;
 	}
 	stopVC();
@@ -1398,11 +1395,10 @@ void CoreController::applyVC() {
 	const QByteArray port = m_rfuEsp32Port.toUtf8();
 	const QByteArray key = m_vcKeyFile.toUtf8();
 	GBVCLinkConfig config = {};
-	config.air = board ? GBVC_AIR_BOARD : radio ? GBVC_AIR_RADIO : GBVC_AIR_BRIDGE;
+	config.air = board ? GBVC_AIR_BOARD : GBVC_AIR_BRIDGE;
 	config.portName = port.constData();
 	config.keyPath = key.constData();
 	m_vcLink = GBVCLinkCreate(m_threadContext.core, &m_debugger, name, &config);
-	m_vcLinkRadio = radio;
 	m_vcLinkBoard = board;
 	m_vcLinkPort = m_rfuEsp32Port;
 	m_vcLinkKey = m_vcKeyFile;

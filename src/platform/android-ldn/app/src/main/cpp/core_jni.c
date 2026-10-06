@@ -2,6 +2,9 @@
 //  - runs a game (load/reset/runFrame/setKeys), hands video to a Java direct buffer and audio to a short[]
 //  - attaches the wireless adapter (the RFU driver) with the ESP32 backend, whose serial port is the app's USB link
 //    (Esp32SerialSetOps: the seam added to esp32-serial.h), reached from the backend's own I/O thread via JNI.
+//  - on a Game Boy game, the same ESP32 choice is the Virtual Console link in board mode (uds-gblink.c, GBVC_AIR_BOARD): the board
+//    runs Azahar's esp32-uds-bridge firmware (1.4 or later) with the wrapper, and only the cartridge's serial transfers cross USB,
+//    from the game thread.
 #include <jni.h>
 #include <android/log.h>
 #include <pthread.h>
@@ -16,6 +19,7 @@
 #include <mgba/internal/gba/sio/rfu.h>
 #include <mgba/internal/gba/sio/rfu-wrapper.h>
 #include <mgba/internal/gba/sio/rfu-wrapper-air.h>
+#include <mgba/internal/gb/sio/uds-gblink.h>
 #include <mgba-util/audio-buffer.h>
 #include <mgba-util/vfs.h>
 #include <fcntl.h>
@@ -107,7 +111,41 @@ static bool _attachWrapper(const char* backend) {
 	return true;
 }
 
+// The Virtual Console link (Game Boy games, ESP32): a retail 3DS through the board's own wrapper. It needs the board on USB when it is
+// created, so it is made again when the USB link opens (Native.usbConnected). The 3DS key must already be on the board: the desktop
+// build or uds-esp32-probe --store-key puts it there; the app has no key file to offer.
+static struct GBVCLink* gVcLink;
+static int gAdapterMode;
+
+static void _detachVc(void) {
+	if (gVcLink) {
+		GBVCLinkDestroy(gVcLink);
+		gVcLink = NULL;
+	}
+}
+
+static bool _attachVc(void) {
+	_detachVc();
+	if (!gCore) {
+		return false;
+	}
+	static const uint16_t name[GBVC_NAME_WORDS] = {'M', 'G', 'B', 'A'};
+	struct GBVCLinkConfig config = {0};
+	config.air = GBVC_AIR_BOARD;
+	config.tracePath = gTracePath[0] ? gTracePath : NULL;
+	gVcLink = GBVCLinkCreate(gCore, NULL, name, &config);
+	if (!gVcLink) {
+		LOGI("Virtual Console: no link (a game the wrapper knows, and the board on USB, are needed)");
+	}
+	return gVcLink != NULL;
+}
+
+static bool _isGameBoy(void) {
+	return gCore && gCore->platform(gCore) == mPLATFORM_GB;
+}
+
 static void _detachAdapter(void) {
+	_detachVc();
 	_detachWrapper();
 	if (!gRfuAttached) {
 		return;
@@ -331,11 +369,13 @@ JNIEXPORT void JNICALL Java_io_mgbaldn_gba_Native_setSaveDir(JNIEnv* env, jclass
 // A line in the adapter trace stamped with wall-clock time, so emulation speed on the phone can be read from the log.
 JNIEXPORT void JNICALL Java_io_mgbaldn_gba_Native_traceNote(JNIEnv* env, jclass clazz, jstring note) {
 	(void) clazz;
-	if (!gRfuAttached && !gWrapperAttached) {
+	if (!gRfuAttached && !gWrapperAttached && !gVcLink) {
 		return;
 	}
 	const char* text = (*env)->GetStringUTFChars(env, note, NULL);
-	if (gRfuAttached) {
+	if (gVcLink) {
+		GBVCLinkTraceNote(gVcLink, text);
+	} else if (gRfuAttached) {
 		GBASIORFUTrace(&gRfu, "APP    %s", text);
 	} else if (gCore) {
 		GBASIOCableTrace(&((struct GBA*) gCore->board)->sio, "APP    %s", text);
@@ -355,15 +395,30 @@ JNIEXPORT void JNICALL Java_io_mgbaldn_gba_Native_setTrace(JNIEnv* env, jclass c
 }
 
 // 0 = nothing, 1 = wireless adapter (ESP32), 2 = cable adapter (RFU cable wrapper over the ESP32). Called between frames
-// (Java takes care of that), like the desktop menu's switching.
+// (Java takes care of that), like the desktop menu's switching. On a Game Boy game 1 is the Virtual Console link and 2 is nothing.
 JNIEXPORT jboolean JNICALL Java_io_mgbaldn_gba_Native_setAdapter(JNIEnv* env, jclass clazz, jint mode) {
 	(void) env;
 	(void) clazz;
+	gAdapterMode = mode;
+	if (_isGameBoy()) {
+		_detachAdapter();
+		return mode == 1 ? (_attachVc() ? JNI_TRUE : JNI_FALSE) : JNI_TRUE;
+	}
 	if (mode == 2) {
 		_detachAdapter();
 		return _attachWrapper("esp32") ? JNI_TRUE : JNI_FALSE;
 	}
 	return _attachAdapter(mode == 1 ? "esp32" : NULL) ? JNI_TRUE : JNI_FALSE;
+}
+
+// The USB link (re)opened. The Wireless Adapter's backend finds the board by itself; the Virtual Console link opens the board when it
+// is created, so it is created again (a link from before the board was plugged in either failed or lost its port). Between frames.
+JNIEXPORT void JNICALL Java_io_mgbaldn_gba_Native_usbConnected(JNIEnv* env, jclass clazz) {
+	(void) env;
+	(void) clazz;
+	if (_isGameBoy() && gAdapterMode == 1) {
+		_attachVc();
+	}
 }
 
 // ---- the ESP32's serial port, provided by Java (UsbLink) --------------------------------------------------------
@@ -381,6 +436,11 @@ struct ThreadJni {
 	jbyteArray buffer;
 };
 
+// A Java thread (the game thread, which runs the Virtual Console link) is the JVM's own: it is not detached here, and its buffer is
+// kept for the thread's life. The thread ends with the game, so each game loaded leaves one 512-byte array behind; deleting it would
+// need the thread's JNIEnv after the JVM has already let go of it.
+static __thread struct ThreadJni* tJavaThread;
+
 static void _threadDone(void* value) {
 	struct ThreadJni* tj = value;
 	if (!tj) {
@@ -397,14 +457,27 @@ static void _makeKey(void) {
 	pthread_key_create(&gThreadKey, _threadDone);
 }
 
-// The backend calls the serial functions from its own I/O thread, which the JVM does not know: attach it on first use.
+// The backend calls the serial functions from its own I/O thread, which the JVM does not know: attach it on first use (and detach
+// it when it ends). The Virtual Console link calls them from the game thread, which is a Java thread already.
 static struct ThreadJni* _tj(void) {
 	pthread_once(&gKeyOnce, _makeKey);
 	struct ThreadJni* tj = pthread_getspecific(gThreadKey);
 	if (tj) {
 		return tj;
 	}
+	if (tJavaThread) {
+		return tJavaThread;
+	}
 	JNIEnv* env = NULL;
+	if ((*gVm)->GetEnv(gVm, (void**) &env, JNI_VERSION_1_6) == JNI_OK) {
+		tj = calloc(1, sizeof(*tj));
+		tj->env = env;
+		jbyteArray local = (*env)->NewByteArray(env, kBufferSize);
+		tj->buffer = (*env)->NewGlobalRef(env, local);
+		(*env)->DeleteLocalRef(env, local);
+		tJavaThread = tj;
+		return tj;
+	}
 	if ((*gVm)->AttachCurrentThread(gVm, &env, NULL) != JNI_OK) {
 		return NULL;
 	}

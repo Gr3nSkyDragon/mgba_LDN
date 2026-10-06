@@ -961,6 +961,30 @@ if(BUILD_UDS_TEST)
 	if(WIN32)
 		target_link_libraries(uds-esp32-probe setupapi)
 	endif()
+
+	# The flasher's ROM loader client against a simulated ESP32-S3.
+	add_executable(uds-esp32-flash-test
+		src/gb/sio/uds-esp32-flash-test.c
+		src/gb/sio/uds-esp32-flash.c
+		src/util/md5.c)
+	target_include_directories(uds-esp32-flash-test PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
+
+	# Flashes esp32-uds-bridge and stores the 3DS key on the board, with a window: one file to hand out with the firmware. The C runtime is
+	# linked in so that it runs on a PC without the Visual C++ redistributable.
+	if(WIN32)
+		add_executable(uds-esp32-setup WIN32
+			src/gb/sio/uds-esp32-setup.c
+			src/gb/sio/uds-esp32-flash.c
+			src/gb/sio/uds-esp32.c
+			src/gb/sio/uds-keyfile.c
+			src/gba/sio/esp32/esp32-serial.c
+			src/util/md5.c)
+		target_include_directories(uds-esp32-setup PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
+		target_link_libraries(uds-esp32-setup setupapi comctl32 comdlg32 advapi32)
+		if(MSVC)
+			target_compile_options(uds-esp32-setup PRIVATE $<IF:$<CONFIG:Debug>,/MTd,/MT>)
+		endif()
+	endif()
 endif()
 
 if(USE_LDND)

@@ -467,7 +467,7 @@ static void _boardStep(struct GBVCLink* link, uint32_t now) {
 		if (link->esp.info.valid) {
 			_trace(link, "board: firmware %u.%u, protocol %u", link->esp.info.major, link->esp.info.minor, link->esp.info.proto);
 			if (!udsEsp32HasGbWrapper(&link->esp)) {
-				_boardFail(link, "the board's firmware has no Game Boy wrapper: flash esp32-uds-bridge 1.4 or later (or tick Virtual Console to run the wrapper in mGBA)");
+				_boardFail(link, "the board's firmware has no Game Boy wrapper: flash esp32-uds-bridge 1.4 or later (uds-esp32-setup does it)");
 				return;
 			}
 			link->boardState = BOARD_KEY;
@@ -819,7 +819,9 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 	});
 
 	const char* dir = getenv("MGBA_VCLINK_TRACE");
-	if (dir && *dir) {
+	if (config->tracePath && *config->tracePath) {
+		link->trace = fopen(config->tracePath, "w");
+	} else if (dir && *dir) {
 		char path[512];
 		snprintf(path, sizeof(path), "%s/vclink_%u.txt", dir, (unsigned) time(NULL));
 		link->trace = fopen(path, "w");
@@ -985,4 +987,10 @@ void GBVCLinkDestroy(struct GBVCLink* link) {
 	}
 	mLOG(GB_SIO, INFO, "Virtual Console: link stopped");
 	free(link);
+}
+
+void GBVCLinkTraceNote(struct GBVCLink* link, const char* text) {
+	if (link) {
+		_trace(link, "app: %s", text);
+	}
 }

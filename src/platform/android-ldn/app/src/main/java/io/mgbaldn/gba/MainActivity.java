@@ -920,7 +920,7 @@ public class MainActivity extends Activity implements UsbLink.Logger {
     }
 
     private void chooseAdapter() {
-        String[] names = {"Off", "ESP32 (GB-Link Switch LDN board, USB)", "Cable adapter (Ruby/Sapphire, ESP32)"};
+        String[] names = {"Off", "ESP32 (USB board: Switch LDN for GBA games, 3DS UDS bridge for Game Boy)", "Cable adapter (Ruby/Sapphire, ESP32)"};
         new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert).setTitle("Wireless adapter")
                 .setSingleChoiceItems(names, adapter, (dialog, which) -> {
                     adapter = which;
@@ -944,7 +944,10 @@ public class MainActivity extends Activity implements UsbLink.Logger {
                 .setMessage("mGBA with Wireless Adapter support, for trading Generation 3 games with a Nintendo Switch through "
                         + "an ESP32 using GB-Link Switch LDN firmware.\n\nWireless adapter (FireRed/LeafGreen, Emerald): with board "
                         + "firmware 2.1 or later either side can lead the group in the Wireless Club > Direct Corner; earlier firmware needs "
-                        + "the Switch to host.\nCable adapter (Ruby/Sapphire): the Switch must host.\n\nDo not use "
+                        + "the Switch to host.\nCable adapter (Ruby/Sapphire): the Switch must host.\n\nGame Boy (Red, Blue, Yellow, Gold, "
+                        + "Silver, Crystal): ESP32 trades with the Virtual Console on a 3DS. The board must run Azahar's esp32-uds-bridge "
+                        + "firmware 1.4 or later with the 3DS key already stored on it (from the desktop build or uds-esp32-probe "
+                        + "--store-key).\n\nDo not use "
                         + "fast-forward. Not affiliated with or endorsed by mGBA.\n\nROMs and saves are kept in:\n"
                         + baseDir.getAbsolutePath() + "\n(ROMs and Saves folders)" + game)
                 .setPositiveButton("OK", null);
@@ -1196,6 +1199,11 @@ public class MainActivity extends Activity implements UsbLink.Logger {
     private void openUsb(UsbDevice device) {
         if (usbLink.open(usbManager, device)) {
             toast("ESP32 connected");
+            if (emulator.isLoaded() && adapter == ADAPTER_ESP32) {
+                synchronized (emulator.lock) {
+                    Native.usbConnected();
+                }
+            }
         }
         refreshStatus();
     }

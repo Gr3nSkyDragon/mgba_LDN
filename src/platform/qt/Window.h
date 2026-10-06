@@ -172,7 +172,7 @@ private:
 	// Wireless adapter / RFU Cable Wrapper choices of this window only.
 	QString m_rfuBackend = QStringLiteral("off");
 	bool m_rfuCableWrapper = false;
-	bool m_vcWrapper = false; // Cable wrapper > Virtual Console (Gen 1-2): the UDS wrapper, not attached to anything yet
+	bool m_vcWrapper = false; // Virtual Console (local only): the UDS wrapper on the Local backend, to Azahar's bridge
 	bool m_rfuLog = false;
 	QString m_rfuEsp32Port; // empty: auto-detect
 	bool m_rfuEsp32Primary = false; // this window saves its board choice (see the menu setup)

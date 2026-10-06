@@ -479,7 +479,7 @@ see [Role swap](#role-swap-azahar-hosting-measured-2-captures-neither-completed)
 **[user-reported]** Trades complete in wire mode against the Azahar bridge and against a retail 3DS (2026-10-05), and did in hook mode on both before that (the Trade Center left by resetting, as on a cable).
 **[user-reported]** Gen 2 trades work between Gold and Silver, and a Gold to Yellow trade through the Time Capsule worked (2026-10-05). When the client's game leaves the Gen 2 trade room first, the host's VC waits about five seconds after its own end-of-session record and then closes the network ("communication lost"); retail consoles do the same, so it is the VC's behaviour. Gold with Silver trades mail in both directions and the full sixth nickname (2026-10-05, after the mail and block-alignment fixes on the Game Boy page). The trade-back, Crystal, battles and a real cartridge are untested.
 
-Menu: **Wireless Adapter > ESP32** plus the **Virtual Console (Gen 1-2)** box is the real radio; **Wireless Adapter > Local** plus the box is the Azahar bridge. The 3DS UDS key file is set under Settings > BIOS. Wire mode is
+Menu: **Wireless Adapter > ESP32** on a Game Boy game is the real radio, with the wrapper running on the board (firmware 1.4 or later); the 3DS UDS key file set under Settings > BIOS is stored on the board the first time if it has none. **Wireless Adapter > Local** plus the **Virtual Console (local only)** box is the Azahar bridge, with the wrapper running in mGBA. Wire mode is
 the default (no setting needed); the environment variable `MGBA_VCLINK_WIRE=0` selects the older hook mode, which carries Gen 1 only.
 
 ## Layers

@@ -13,6 +13,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#elif defined(__unix__) || defined(__APPLE__)
+#include <sched.h>
 #endif
 
 #define UDS_ESP32_BAUD 921600
@@ -422,6 +424,8 @@ static bool _await(struct UDSEsp32* esp, const bool* flag, unsigned timeoutMs) {
 		}
 #ifdef _WIN32
 		Sleep(0);
+#elif defined(__unix__) || defined(__APPLE__)
+		sched_yield(); // the reply is a USB round trip away: give the core up rather than spin (Android, Linux, macOS)
 #endif
 	}
 }

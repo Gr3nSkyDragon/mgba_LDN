@@ -221,9 +221,9 @@ public slots:
 	void setRFUCableWrapper(bool enabled);
 	void setRFUWrapperLogging(bool enabled);
 	bool rfuWrapperEnabled() const;
-	// Virtual Console (Gen 1-2): the Game Boy link cable carried over UDS to the 3DS VC. Not a wireless-adapter feature.
-	// Puts the Game Boy link driver (src/gb/sio/uds-gblink.c) on the core: a ghost joiner on the Local backend's UDP pair to
-	// Azahar, the ROM hooks, and the serial device. Needs a Game Boy core running Red, Blue or Yellow.
+	// Virtual Console (Gen 1-2): the Game Boy link cable carried over UDS to the 3DS VC (src/gb/sio/uds-gblink.c). With the ESP32
+	// backend it is on for any Game Boy game the wrapper knows (the wrapper runs on the board); with Local it needs this box, "Virtual
+	// Console (local only)", and joins Azahar's UDS bridge.
 	void setVCWrapper(bool enabled);
 	bool vcWrapperRequested() const { return m_vcWrapper; }
 	// The 3DS UDS key file the real-radio mode needs (Settings > BIOS), as a path the program can open.
@@ -408,12 +408,11 @@ private:
 	QString m_rfuWrapperConnection; // the connection the attached wrapper was started with
 	QByteArray m_rfuWrapperConnectionName;
 	bool m_rfuCableWrapper = false; // the menu's "Cable wrapper": m_rfuRequestedBackend drives the wrapper
-	bool m_vcWrapper = false; // the menu's "Virtual Console (Gen 1-2)"
+	bool m_vcWrapper = false; // the menu's "Virtual Console (local only)"
 	void applyVC();
 	void stopVC();
 	GBVCLink* m_vcLink = nullptr;
-	bool m_vcLinkRadio = false; // what the running link was made for, to restart it when the choice changes
-	bool m_vcLinkBoard = false; // ESP32 with "Virtual Console" unticked: the wrapper runs on the board
+	bool m_vcLinkBoard = false; // what the running link was made for (ESP32: the board; else Azahar's bridge), to restart it on a change
 	QString m_vcLinkPort;
 	QString m_vcLinkKey;
 	QString m_vcKeyFile;
