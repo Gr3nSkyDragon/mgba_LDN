@@ -408,6 +408,8 @@ private:
 	QString m_rfuWrapperConnection; // the connection the attached wrapper was started with
 	QByteArray m_rfuWrapperConnectionName;
 	bool m_rfuCableWrapper = false; // the menu's "Cable wrapper": m_rfuRequestedBackend drives the wrapper
+	bool rfuCableOnlyGame() const; // Ruby or Sapphire: no wireless of their own, so the wrapper is always used
+	bool rfuUseCableWrapper() const { return m_rfuCableWrapper || rfuCableOnlyGame(); }
 	bool m_vcWrapper = false; // the menu's "Virtual Console (local only)"
 	void applyVC();
 	void stopVC();

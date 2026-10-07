@@ -186,12 +186,17 @@ struct GBASIORFUESP32 {
 	const char* awaitPrefix; // while set, a response or event frame whose text starts with it sets awaitMatched
 	bool awaitMatched;
 	char lastText[64];
-	// The board joins the first room it sees, once per LDN_BRIDGE_START, and stops after a failed or ended join. The
-	// I/O thread starts it again a moment later, so a join that timed out (radio, a busy channel, the Switch not ready
-	// yet) is retried instead of leaving the emulator searching an idle board for good.
+	// A join timeout or lost network reported without the board stopping: the I/O thread nudges it with LDN_BRIDGE_START
+	// a moment later. A stopped bridge means a reboot instead (boardRebooting below).
 	bool bridgeRestart;
 	uint32_t bridgeRestartAt;
 	unsigned bridgeRestarts;
+	// "LDN_BRIDGE stopped" is the last thing the board says before it reboots (pia_bridge.c bridge_restart ends in
+	// esp_restart, after every failed join, handshake timeout, lost network or ended session). It comes back in text mode
+	// with no session and not in adapter-host mode, while the native USB port stays open, so nothing short of the whole
+	// handshake again reaches it: _run returns and the I/O thread redoes it on the same port.
+	bool boardRebooting;
+	unsigned boardReboots;
 	unsigned bytesRead;
 	unsigned beacons;
 	unsigned beaconsSent;
@@ -313,8 +318,10 @@ static void _handleFrame(struct GBASIORFUESP32* esp, const struct Esp32WireFrame
 			_lockEnter(&esp->lock);
 			snprintf(esp->statusEvent, sizeof(esp->statusEvent), "%s", text);
 			_lockLeave(&esp->lock);
-			if (!esp->stop && (!strncmp(text, "LDN_BRIDGE stopped", 18) || !strncmp(text, "LDN_BRIDGE join timed out", 25) ||
-			                   !strncmp(text, "LDN_NET_LOST", 12))) {
+			if (!esp->stop && !strncmp(text, "LDN_BRIDGE stopped", 18)) {
+				esp->boardRebooting = true;
+				esp->bridgeRestart = false;
+			} else if (!esp->stop && (!strncmp(text, "LDN_BRIDGE join timed out", 25) || !strncmp(text, "LDN_NET_LOST", 12))) {
 				esp->bridgeRestart = true;
 				esp->bridgeRestartAt = _ticks() + kBridgeRestartMs;
 			}
@@ -508,6 +515,8 @@ static bool _waitMs(struct GBASIORFUESP32* esp, unsigned ms) {
 	return !esp->stop;
 }
 
+static bool _negotiate(struct GBASIORFUESP32* esp);
+
 static bool _handshake(struct GBASIORFUESP32* esp) {
 	const char* configured = esp->configuredPort[0] ? esp->configuredPort : getenv("MGBA_RFU_ESP32_PORT");
 	if (configured && configured[0]) {
@@ -522,8 +531,14 @@ static bool _handshake(struct GBASIORFUESP32* esp) {
 		_setError(esp, error);
 		return false;
 	}
-	_setPhase(esp, ESP_PHASE_BOOTING);
 	GBASIORFUTrace(esp->rfu, "ESP32  opened %s (the board resets when its port is opened; waiting for it to boot)", esp->portName);
+	return _negotiate(esp);
+}
+
+// Everything after the port is open: wait out the boot, then binary mode, session and adapter-host mode. Also used on its
+// own after the board rebooted itself (boardRebooting), on the port that is still open.
+static bool _negotiate(struct GBASIORFUESP32* esp) {
+	_setPhase(esp, ESP_PHASE_BOOTING);
 	Esp32WireParserInit(&esp->parser);
 
 	// Let the board boot (its console text is discarded), then switch it to binary mode.
@@ -597,7 +612,7 @@ static void _run(struct GBASIORFUESP32* esp) {
 	uint32_t nextPing = _ticks() + kPingMs;
 	esp->nextBeacon = _ticks();
 	bool failed = false;
-	while (!esp->stop && !failed) {
+	while (!esp->stop && !failed && !esp->boardRebooting) {
 		_pumpOnce(esp, &failed);
 
 		uint32_t now = _ticks();
@@ -672,7 +687,9 @@ ESP_THREAD_FUNC(_thread) {
 	struct GBASIORFUESP32* esp = context;
 	bool reportedMissing = false;
 	while (!esp->stop) {
-		if (_handshake(esp)) {
+		const bool rebooted = esp->boardRebooting && esp->port;
+		esp->boardRebooting = false;
+		if (rebooted ? _negotiate(esp) : _handshake(esp)) {
 			reportedMissing = false;
 			_setError(esp, "");
 			_setPhase(esp, ESP_PHASE_READY);
@@ -690,6 +707,12 @@ ESP_THREAD_FUNC(_thread) {
 				GBASIORFUTrace(esp->rfu, "ESP32  the board went away: the Switch's session with the game is over");
 				GBASIORFUDisconnected(esp->rfu, (int) clientSlot);
 			}
+			if (esp->boardRebooting && !esp->stop) {
+				++esp->boardReboots;
+				GBASIORFUTrace(esp->rfu, "ESP32  the board's bridge stopped and the board is rebooting: setting it up again on %s (reboot %u)",
+				               esp->portName, esp->boardReboots);
+				continue;
+			}
 			if (!esp->stop) {
 				char error[64];
 				snprintf(error, sizeof(error), "Lost the board on %s", esp->portName);
@@ -701,7 +724,17 @@ ESP_THREAD_FUNC(_thread) {
 				_espSleep(100);
 			}
 		} else if (!esp->stop && !esp->port && !reportedMissing) {
-			GBASIORFUTrace(esp->rfu, "ESP32  no board found (looking for an Espressif USB serial port; set MGBA_RFU_ESP32_PORT to name one)");
+			// A named port that exists but will not open is held by another program (the GB-Link web page, pokeldn, ...),
+			// which is not the same as no board at all.
+			_lockEnter(&esp->lock);
+			char error[RFU_BACKEND_STATUS_TEXT];
+			snprintf(error, sizeof(error), "%s", esp->statusError);
+			_lockLeave(&esp->lock);
+			if (!strncmp(error, "Could not open", 14)) {
+				GBASIORFUTrace(esp->rfu, "ESP32  %s: is another program (the GB-Link web page, pokeldn, a serial monitor) using it? Retrying", error);
+			} else {
+				GBASIORFUTrace(esp->rfu, "ESP32  no board found (looking for an Espressif USB serial port; set MGBA_RFU_ESP32_PORT to name one)");
+			}
 			reportedMissing = true;
 		}
 		_setPhase(esp, reportedMissing ? ESP_PHASE_MISSING : ESP_PHASE_LOOKING);

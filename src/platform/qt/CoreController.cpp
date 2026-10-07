@@ -1354,6 +1354,19 @@ void CoreController::stopRFUWrapper() {
 	m_rfuWrapperAttached = false;
 }
 
+// Ruby and Sapphire have only the link cable. GB-Link's web page turns their Cable Club link into the Switch's wireless
+// itself (web/js/cable/translator.js; the ESP32 firmware has no part in it), so with mGBA in the page's place the wrapper
+// is what does it: these games get the wrapper on any backend, ticked or not. Any language (AXVx Ruby, AXPx Sapphire).
+bool CoreController::rfuCableOnlyGame() const {
+	mCore* core = m_threadContext.core;
+	if (!core || core->platform(core) != mPLATFORM_GBA) {
+		return false;
+	}
+	mGameInfo info;
+	core->getGameInfo(core, &info);
+	return !strncmp(info.code, "AXV", 3) || !strncmp(info.code, "AXP", 3);
+}
+
 // Wireless Adapter > "Cable wrapper": the chosen backend is used by the wrapper instead of the adapter.
 void CoreController::setRFUCableWrapper(bool enabled) {
 	m_rfuCableWrapper = enabled;
@@ -1499,8 +1512,9 @@ void CoreController::applyRFU() {
 		}
 		return;
 	}
-	if (m_rfuCableWrapper ? (rfuWrapperEnabled() && m_rfuWrapperConnection == name)
-	                      : (rfuEnabled() && m_rfuBackendName == name)) {
+	const bool cableWrapper = rfuUseCableWrapper();
+	if (cableWrapper ? (rfuWrapperEnabled() && m_rfuWrapperConnection == name)
+	                 : (rfuEnabled() && m_rfuBackendName == name)) {
 		return;
 	}
 	Interrupter interrupter(this);
@@ -1509,7 +1523,7 @@ void CoreController::applyRFU() {
 		clearMultiplayerController();
 	}
 	// Each start releases the other's hold on the link port.
-	if (!m_rfuCableWrapper) {
+	if (!cableWrapper) {
 		startRFU(name);
 	} else if (startRFUWrapper(name)) {
 		m_rfuWrapperConnection = name;
