@@ -16,17 +16,33 @@ You will need your Switch prod.keys. You **must** have your Switch prod.keys for
 
 You'll also need a way to broadcast Wi-Fi, be that a USB Wi-Fi adapter or devboard like the ESP32. If you're getting an ESP32, I recommend an ESP32-S3, as that is also compatible with [Pokemon Automation](https://pokemonautomation.github.io/index.html)
 
-If you're using a USB Wi-Fi adapter, you'll need to set up ldnd.exe from [unlimitedcoder2](https://github.com/unlimitedcoder2/ldnrs/releases), in a version that speaks ldnd protocol 7 (older ldnd builds are not supported any more). You'll need to follow the steps in that repository to set up your USB Wi-Fi adapter (you will need a compatible USB Wi-Fi adapter). I've been using a cheap/generic AC1300 adapter in my testing. This is a Windows-only program. If you have experience with Linux, you can probably convert it to be Linux-compatible fairly easily. ldnd loads your prod.keys itself (its `--keys` option), so mGBA doesn't need to know where they are. mGBA uses ldnd's default pipe (`\\.\pipe\ldnd`), or the one named by the `LDN_DAEMON` environment variable.
+If you're using a USB Wi-Fi adapter, you'll need to set up ldnd.exe from [unlimitedcoder2](https://github.com/unlimitedcoder2/ldnrs/releases), in a version that speaks ldnd protocol 7 (older ldnd builds are not supported anymore). You'll need to follow the steps in that repository to set up your USB Wi-Fi adapter (you will need a compatible USB Wi-Fi adapter). I've been using a cheap/generic AC1300 adapter in my testing. This is a Windows-only program. If you have experience with Linux, you can probably convert it to be Linux-compatible fairly easily. ldnd loads your prod.keys itself (its `--keys` option), so mGBA doesn't need to know where they are anymore, either.
 
-If you're using an ESP32, you'll need to install the firmware either [manually](https://github.com/GB-Link/GB-Link-Switch-LDN) or via [the GB-Link Switch LDN webpage](https://switch.gblink.io/?from=gblink-launcher). You'll also need to install your prod.keys on the ESP32. The webpage is a little more convenient to use so I'd recommend trying that first.
+If you're using an ESP32 for GBA games, you'll need to install the GB-Link Switch LND firmware either [manually](https://github.com/GB-Link/GB-Link-Switch-LDN) or via [the GB-Link Switch LDN webpage](https://switch.gblink.io/?from=gblink-launcher). You'll also need to install your prod.keys on the ESP32. The webpage is a little more convenient to use so I'd recommend trying that first.
+
+If you're using an ESP32 for GB games, you'll need to install the Azahar UDS firmware. It's easier to use the firmware flasher, but if you want to install it manually, you can use the [ESP-IDF v5.2.8](https://dl.espressif.com/dl/esp-idf/) installer or use a web-based tool like [esptool](https://espressif.github.io/esptool-js/) to flash the firmware. Flash at address 0x0000. For the aes_keys.txt feature, you can pass the keys in the firmware flasher while setting up your ESP32 or use "uds-esp32-probe COMX --store-key <file>" where X is your COM port, using the uds-esp32-probe script in the mGBA_LDN repository. You can also pass the keys from mGBA using Tools > Settings > BIOS > 3DS UDS key file and then running a Gameboy title.
+
+### ESP32 Screen
+
+We've added screen support! Similar to [pokeldn](https://github.com/Decryptu/pokeldn), we now have an animated screen that plays during communication. Not as fancy, but it's there. It *should* be compatible with most ESP32s, but I've only personally confirmed with the ESP32-S3, and only the SSD1309. In my testing, all three of the aforementioned screens have been interchangeable, but if you encounter any problems, please let me know. 
+
+If you have an SSD1306, SSD1315, or SSD1309 screen, you can connect them to the ESP32 according to this table:
+
+| Board | Screen SDA | Screen SCL | VCC | GND |
+|---|---|---|---|---|
+| ESP32-S3 | GPIO8 | GPIO9 | 3V3 | GND |
+| XIAO ESP32-S3 | D9 (GPIO8) | D10 (GPIO9) | 3V3 | GND |
+| XIAO ESP32-C6 | D4 (GPIO22) | D5 (GPIO23) | 3V3 | GND |
+| XIAO ESP32-C3 | D4 (GPIO6) | D5 (GPIO7) | 3V3 | GND |
+| Other C3 boards (e.g. SuperMini) | GPIO6 | GPIO7 | 3V3 | GND |
 
 ### Trading
 
 **DO NOT USE SPEED-UP** under any circumstances. The trade setup or actual trade will likely break down. You probably won't mess up your save file, as the game should just throw a communication error and revert to the last save, but I didn't test this to verify.
 
-The Switch **must** host all trades. The emulator can only join for now. I may work on getting ldnd mode hosting working, but for now, all Wireless Adapter modes except Local are join-only.
+Hosting now works for all native Wireless Adapter games (FireRed, LeafGreen, and Emerald). Ruby and Sapphire and the GB titles are join-only at this time. 
 
-Do not use the Wireless Union Room (the left window lady on the upper floor of the Pokemon Center). You can go exploring there if you want, but actual trading is the right window lady.
+For the GBA games, do not use the Wireless Union Room (the left window lady on the upper floor of the Pokemon Center). You can go exploring there if you want, but actual trading is the right window lady.
 
 ### Desktop
 
@@ -36,9 +52,17 @@ For trading between a computer (FRLG/Emerald) and a Switch, you can choose ldnd 
 
 For trading between a computer (Ruby/Sapphire) and a Switch, you **must** choose ESP32 and tick Cable wrapper (Emulation > Wireless Adapter > ESP32, then Cable wrapper (Ruby/Sapphire)) for Ruby/Sapphire. ldnd is currently stubbed and does not work. Let FRLG host the trade before interacting with the Link Trade Cable lady at the middle window in Ruby/Sapphire. 
 
+For trading between a computer (Red, Blue, Yellow, Gold Silver, Crystal) and Azahar, run a single instance of mGBA and Azahar. In Azahar, go to Multiplayer and tick the box for "Local mGBA Virtual Console." **Before** starting mGBA, launch the Azahar Virtual Console title and host a trade session. **DO NOT** start the mGBA Gameboy title until Azahar is hosting a trade, and **DO NOT** accept the mGBA trainer until mGBA is ready to enter the trade room. In mGBA, go to Emulation > Wireless Adapter and check both "Local" and "Virtual Console (local only)". Once Azahar is hosting the trade, launch the mGBA Gameboy title and talk to the trade window lady. Once you reach the final "Please wait..." you can accept the mGBA trainer in Azahar. When choosing the Trade Center option, only one game needs to select it. It's recommended that you not mash through this option, as these games are fragile and prone to desync. 
+
+For trading between a computer (Red, Blue, Yellow, Gold Silver, Crystal) and a 3DS, launch the 3DS Virtual Console title and host a trade before opening mGBA. Once the 3DS is ready, launch mGBA and go to Emulation > Wireless Adapter > ESP32. The process is then similar to the computer to Azahar process. Navigate the mGBA game through the trade window setup until you reach the final "Please wait..." before accepting the mGBA trainer in the 3DS. When selecting the Trade Colosseum, only one console needs to choose the option, and please do not mash through the sequence. These games are old and fragile, and prone to desync. 
+
+**DO NOT** select "Virtual Console (local only)" as this is an mGBA to Azahar only feature. Unfortunately, with the latest ldnd updates, ldnd mode is not currently supported at this time, and only ESP32 mode works for the original GB titles. 
+
 ### Android
 
 For trading between a smartphone (FRLG/Emerald) and a Switch, you need to install the APK, then click the three bars (☰) menu in the top right, select Wireless Adapter, choose ESP32 (currently supports an ESP32 running the GB-Link Switch LDN firmware; I'm using an ESP32-S3, other models may be added later), and plug the adapter into your smartphone via its USB-C port. You will need a USB-C-to-USB-C cable for this. 
+
+For GB Gen 1 and 2, the steps are the same, but you need to use an ESP32 running the Azahar UDS firmware instead and make sure to have Azahar or the 3DS hosting the trade before starting the game in mGBA.
 
 For trading between a smartphone (Ruby/Sapphire) and a Switch, click the three bars (☰) menu in the top right, select Wireless Adapter, choose Cable Adapter (currently supports an ESP32 running the GB-Link Switch LDN firmware; I'm using an ESP32-S3, other models may be added later), and plug the adapter into your smartphone via its USB-C port. Let FRLG host the trade before interacting with the Link Cable Trade lady at the middle window in Ruby/Sapphire.
 
@@ -48,7 +72,7 @@ Open ROM copies your ROM into the emulator's ROM folder. You can also select you
 
 Import Save lets you use other saves with your ROM. This will update your default save for that ROM until you import another save into the ROM.
 
-Display Settings lets you enable or disable the FPS counter, ESP32 status message, on-screen controls, and pixelation ("scanlines"). You can also change the button colors, either with presets or hexadecimal values for individual buttons. Background Photo lets you set an image as your "shell" image when in vertical mode. Color Mode and Frame Counter (for you RNG manipulation nerds) coming soon.
+Display Settings lets you enable or disable the FPS counter, Frame counter, ESP32 status message, on-screen controls, and pixelation ("scanlines"). Color mode lets you choose between different color modes and filters. You can also change the button colors, either with presets or hexadecimal values for individual buttons. Background Photo lets you set an image as your "shell" image when in vertical mode. Horizontal panels lets you set solid colors, mirrored images, or two distinct images when in horizontal mode. 
 
 # Original ReadMe
 
