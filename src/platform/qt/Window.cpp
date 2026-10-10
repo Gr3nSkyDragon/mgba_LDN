@@ -950,6 +950,7 @@ void Window::gameStarted() {
 		m_controller->setVCKeyFile(keyFile);
 	}
 	m_controller->setVCCartSlave(m_vcCartSlave);
+	m_controller->setVCPicoClock(m_vcPicoClock);
 	m_controller->setVCWrapper(m_vcWrapper);
 	m_controller->setRFUBackend(m_rfuBackend);
 #endif
@@ -1705,6 +1706,17 @@ void Window::setupMenu(QMenuBar* menubar) {
 		}
 	}, this);
 	vcCart->setValue(QVariant(savedOr("vcwrapper.cartRole", "master")));
+	// Slave only: clock with nothing a Pico cannot know (see GBVCLinkConfig::picoClock). Saved as vcwrapper.picoClock.
+	m_actions.addSeparator("vcCart");
+	ConfigOption* picoClock = localOption("vcwrapper.picoClock");
+	picoClock->addBoolean(tr("Clock exactly like a GB-Link (Pico)"), &m_actions, "vcCart");
+	picoClock->connect([this](const QVariant& value) {
+		m_vcPicoClock = value.toBool();
+		if (m_controller) {
+			m_controller->setVCPicoClock(m_vcPicoClock);
+		}
+	}, this);
+	picoClock->setValue(QVariant(savedOr("vcwrapper.picoClock", "0").toInt() != 0));
 	// Which board the ESP32 backend opens: the ones plugged in are listed (Refresh looks again), and Auto-detect takes the
 	// first of them. Per window like the rest; only the first window saves it.
 	m_actions.addMenu(tr("ESP32 board"), "rfuEsp32", "rfu");

@@ -66,6 +66,11 @@ struct GBVCLinkConfig {
 	bool wire; // unused: wire mode (the ROM is the master of a link cable and a front end is its slave, uds-wire.c, no ROM hooks) is the default; MGBA_VCLINK_WIRE=0 selects the hook mode
 	const char* tracePath; // a file for the trace (the Android app's shared log); NULL or empty: MGBA_VCLINK_TRACE as before
 	enum GBVCCartRole cartRole; // zero (a zeroed config) is GBVC_CART_MASTER, the path that has always run
+	// Slave cartridge only: clock exactly as a GB-Link (Pico) would. Nothing a Pico cannot know is used: the clock goes out on its own
+	// schedule whether or not the cartridge is armed (unarmed, or busy with its own transfer, the reply is FF and our byte is lost),
+	// the byte shifts at once (the Pico's SPI takes microseconds) and every exchange is followed by the Pico's gap plus a UART round
+	// trip (MGBA_VCLINK_PICO_LATENCY_US, 75 by default). Off: mGBA skips the clocks that would find the cartridge unarmed.
+	bool picoClock;
 };
 
 struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, const uint16_t name[GBVC_NAME_WORDS],

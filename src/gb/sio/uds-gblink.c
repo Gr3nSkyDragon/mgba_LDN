@@ -29,13 +29,21 @@
 #define GBVC_POLL_CYCLES 4096 // about 1 ms
 // Slave cartridge: how often the wrapper clocks. A master Pokemon clocks once a frame in its sync, menu and idle loops and as fast
 // as the slave keeps up inside Serial_ExchangeBytes; the slave's routines are written for exactly that.
+// The clock's times are in mGBA's Game Boy timing units: CGB_SM83_FREQUENCY, 8388608 a second in normal and double speed alike
+// (a DMG frame is 140448 of them). The values below are the ones every slave-cartridge test passed with (Gen 1, Gen 2, Time Capsule,
+// with and without the Pico clock); they were written as if a tick were a 4194304 Hz cycle, so each is half of what its first comment
+// claimed. Doubling them (the real 1.5 frames and 1 ms) made a Gen 2 cartridge time out after the Cable Club menu ("Too much time has
+// elapsed"): keep them as measured, and change pacing only phase by phase, with a test.
+#define GBVC_CLOCK_TICKS_PER_SECOND 8388608ULL
 #define GBVC_CLOCK_POLL_CYCLES 1024
-// A frame and a half. The slave's sync and menu loops wait a frame (DelayFrame) and then wait for the master's clock; clocked once
-// a frame exactly, some clocks land in the DelayFrame, where the game takes no byte (ours is lost and it answers FE next). Slower
-// than its loop, every clock finds it waiting.
+// Idle, sync and menu: 0.75 frame. The slave's loops wait a frame (DelayFrame) and then for the master's clock.
 #define GBVC_CLOCK_LOOP_CYCLES 105336
-#define GBVC_CLOCK_BYTE_CYCLES 4194 // 1 ms: the GB-Link's gap after each byte (MGBA_VCLINK_CLOCK_GAP_US changes it)
-#define GBVC_CLOCK_ROLE_CYCLES 8389 // 2 ms between our 01 offers while the cartridge alternates its clock
+#define GBVC_CLOCK_BYTE_CYCLES 4194 // 0.5 ms after each byte in PASS (MGBA_VCLINK_CLOCK_GAP_US changes it)
+#define GBVC_CLOCK_ROLE_CYCLES 8389 // 1 ms between our 01 offers while the cartridge alternates its clock
+// The Gen 2 Trade Center's mail (pokecrystal engine/link/link.asm, ExchangeBytes of wLinkSendMail): one exchange that is ignored, then
+// wLinkSendMailEnd - wLinkSendMail = 5 preamble + 6 x 33 messages + 6 x 14 metadata + 6 x 17 + 1 patch set = 390 stored. (Western
+// games; the Japanese ones have shorter mail.)
+#define GBVC_MAIL_EXCHANGES 391
 #define GBVC_USING_INTERNAL_CLOCK 0x02
 
 struct VCAddr {
@@ -115,6 +123,15 @@ struct GBVCLink {
 	unsigned clockUnarmed; // exchanges skipped because the cartridge was not armed as slave
 	unsigned clockQuiet; // exchanges clocked but kept from the wire: empty both ways, or handshake leftovers in IDLE
 	uint32_t clockNoteMs; // when the clock's counts last went to the trace
+	unsigned clockRoleOffers; // our 01 offers that nobody took
+	unsigned clockMailExchanges; // exchanges given to the wire since its Gen 2 mail mode began
+	// Pico clock (config->picoClock): clocks that found the cartridge unarmed or clocking itself, so it read FF and lost our byte.
+	// A real board cannot see these; they are counted here only to read the trace.
+	bool picoClock;
+	int32_t picoLatencyCycles;
+	unsigned picoMissed;
+	unsigned picoMissedInPhase[6];
+	unsigned picoMissedInBlock; // of those in PASS, the ones inside a block or the mail, which the wire stored as data
 	int clockUnarmedPhase; // the phase whose skips were last reported
 
 	// Board mode (GBVC_AIR_BOARD): the wrapper runs on the ESP32; the joiner, cable and wire above are not used.
@@ -449,11 +466,20 @@ static int32_t _clockGap(const struct GBVCLink* link) {
 static void _clockExchange(struct GBVCLink* link, uint32_t now) {
 	struct GBSIO* sio = &link->gb->sio;
 	const int phase = link->wire.phase;
-	link->clockWait = _clockGap(link);
+	link->clockWait = _clockGap(link) + (link->picoClock ? link->picoLatencyCycles : 0);
 	// A slave is armed (start, external clock) whenever it can take a byte. Unarmed, a real master's clock finds nobody: the
-	// GB-Link would read FF and the byte would be lost. Here the exchange is skipped instead (and counted), so that the first
-	// traces test the wire with the clock reversed and nothing else.
-	if ((link->gb->memory.io[GB_REG_SC] & 0x81) != 0x80) {
+	// GB-Link would read FF and the byte would be lost. Without the Pico clock the exchange is skipped instead (and counted), so
+	// that the wire is tested with the clock reversed and nothing else; with it, that is what happens.
+	const bool armed = (link->gb->memory.io[GB_REG_SC] & 0x81) == 0x80 && !sio->remainingBits;
+	// Where FF is data (Pico clock): inside a block, and inside the Gen 2 mail for as long as it lasts. The wire's mail mode ends
+	// only on a quiet gap, but the game's mail is exactly GBVC_MAIL_EXCHANGES exchanges; after them the cartridge is back in its
+	// menu, unarmed, and an FF is a clock nobody heard.
+	if (!link->wire.mailMode) {
+		link->clockMailExchanges = 0;
+	}
+	const bool mailOpen = link->wire.mailMode && link->clockMailExchanges < GBVC_MAIL_EXCHANGES;
+	const bool inBlock = phase == UDS_WIRE_PASS && (link->wire.blockStoring || mailOpen);
+	if (!armed && !link->picoClock) {
 		++link->clockUnarmed;
 		if (phase != UDS_WIRE_ROLE && link->clockUnarmedPhase != phase) {
 			link->clockUnarmedPhase = phase;
@@ -464,11 +490,30 @@ static void _clockExchange(struct GBVCLink* link, uint32_t now) {
 	}
 	const bool role = phase == UDS_WIRE_ROLE;
 	const uint8_t sent = role ? 0x01 : udsWirePreload(&link->wire);
-	const uint8_t reply = link->gb->memory.io[GB_REG_SB];
-	sio->pendingSB = sent;
-	sio->remainingBits = 8;
-	mTimingDeschedule(&link->gb->timing, &sio->event);
-	mTimingSchedule(&link->gb->timing, &sio->event, 0);
+	uint8_t reply;
+	if (!armed) {
+		// Pico clock: nobody shifts on the other end (or the cartridge is clocking a transfer of its own), the line reads FF and
+		// our byte is lost. The board would take FF as the cartridge's byte, and so does the wire here.
+		reply = 0xFF;
+		++link->picoMissed;
+		++link->picoMissedInPhase[phase];
+		if (inBlock) {
+			++link->picoMissedInBlock; // stored as data by the wire: a damaged block
+		}
+	} else if (link->picoClock) {
+		// The Pico's SPI shifts the whole byte in microseconds: the exchange is complete at once.
+		reply = link->gb->memory.io[GB_REG_SB];
+		link->gb->memory.io[GB_REG_SB] = sent;
+		link->gb->memory.io[GB_REG_SC] = GBRegisterSCClearEnable(link->gb->memory.io[GB_REG_SC]);
+		link->gb->memory.io[GB_REG_IF] |= 1 << GB_IRQ_SIO;
+		GBUpdateIRQs(link->gb);
+	} else {
+		reply = link->gb->memory.io[GB_REG_SB];
+		sio->pendingSB = sent;
+		sio->remainingBits = 8;
+		mTimingDeschedule(&link->gb->timing, &sio->event);
+		mTimingSchedule(&link->gb->timing, &sio->event, 0);
+	}
 	if (!role) {
 		// A master cartridge clocks only when its code has a byte to exchange, and the wire reads its silences: a quiet gap is what
 		// ends a MENU or a PASS. We clock at a steady rate instead, so most clocks find the game outside its exchange routines and
@@ -484,16 +529,30 @@ static void _clockExchange(struct GBVCLink* link, uint32_t now) {
 		const bool handshake = phase == UDS_WIRE_IDLE && (reply == 0x01 || reply == 0x02);
 		const bool menuGap = phase == UDS_WIRE_MENU && reply == UDS_WIRE_NO_DATA;
 		const bool passGap = phase == UDS_WIRE_PASS && reply == UDS_WIRE_NO_DATA;
-		if (empty || handshake || menuGap || passGap) {
+		// Pico clock: an idle line reads FF, and the board cannot tell a cartridge that was not listening (Gen 2 is armed only
+		// inside an exchange call) from one that sent FF. Inside a block (and the Gen 2 mail) FF is data, a patched FE or a patch
+		// list's end, and the slave waits armed for every byte; anywhere else it is a clock nobody heard. Our byte was not taken.
+		const bool absent = link->picoClock && reply == 0xFF && !inBlock;
+		if (empty || handshake || menuGap || passGap || absent) {
 			++link->clockQuiet;
 			return;
 		}
 		udsWireExchanged(&link->wire, now, reply);
+		if (link->wire.mailMode) {
+			++link->clockMailExchanges;
+		}
 	} else if (reply == 0x02) {
 		// ESTABLISH_CONNECTION_WITH_EXTERNAL_CLOCK: the cartridge takes the slave's part. The wire leaves ROLE as if a master
 		// cartridge had offered 01 to it.
 		udsWireExchanged(&link->wire, now, 0x01);
 		_trace(link, "clock: the cartridge answered 02, it is the slave");
+	} else {
+		// An offer nobody took (the cartridge is clocking its own try, or not armed): not an exchange, and kept out of the trace's
+		// budget after the first few so that what follows the handshake is recorded.
+		if (link->trace && ++link->clockRoleOffers <= 16) {
+			_trace(link, "clock %02X -> %02X [role]", sent, reply);
+		}
+		return;
 	}
 	++link->wireExchanges;
 	if (link->trace && link->wireExchanges <= 8000) {
@@ -519,12 +578,21 @@ static void _clockPoll(struct mTiming* timing, void* context, uint32_t cyclesLat
 	link->started = link->wire.phase != UDS_WIRE_DOWN;
 	if (link->trace && now - link->clockNoteMs >= 5000) {
 		link->clockNoteMs = now;
-		_trace(link, "clock: %u exchanges to the wire, %u kept from it (empty or handshake leftovers), %u skipped (not armed)",
-		       link->wireExchanges, link->clockQuiet, link->clockUnarmed);
+		if (link->picoClock) {
+			const unsigned* m = link->picoMissedInPhase;
+			_trace(link, "clock (Pico): %u exchanges to the wire, %u kept from it; %u read FF with the cartridge unarmed (role %u, idle %u, "
+			       "sync %u, menu %u, pass %u of which %u inside a block; a real board cannot see these)",
+			       link->wireExchanges, link->clockQuiet, link->picoMissed, m[UDS_WIRE_ROLE], m[UDS_WIRE_IDLE], m[UDS_WIRE_SYNC],
+			       m[UDS_WIRE_MENU], m[UDS_WIRE_PASS], link->picoMissedInBlock);
+		} else {
+			_trace(link, "clock: %u exchanges to the wire, %u kept from it (empty or handshake leftovers), %u skipped (not armed)",
+			       link->wireExchanges, link->clockQuiet, link->clockUnarmed);
+		}
 	}
 
 	link->clockWait -= GBVC_CLOCK_POLL_CYCLES;
-	if (link->wire.phase != UDS_WIRE_DOWN && link->clockWait <= 0 && !link->gb->sio.remainingBits) {
+	// Without the Pico clock a transfer still shifting is waited for; a Pico does not know of one and clocks anyway.
+	if (link->wire.phase != UDS_WIRE_DOWN && link->clockWait <= 0 && (link->picoClock || !link->gb->sio.remainingBits)) {
 		_clockExchange(link, now);
 	}
 	mTimingSchedule(timing, &link->event, GBVC_CLOCK_POLL_CYCLES - cyclesLate);
@@ -938,8 +1006,15 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 		link->clockByteCycles = GBVC_CLOCK_BYTE_CYCLES;
 		const char* gapEnv = getenv("MGBA_VCLINK_CLOCK_GAP_US");
 		if (gapEnv && *gapEnv) {
-			link->clockByteCycles = (int32_t) (strtoul(gapEnv, NULL, 10) * 4194304ULL / 1000000ULL);
+			link->clockByteCycles = (int32_t) (strtoul(gapEnv, NULL, 10) * GBVC_CLOCK_TICKS_PER_SECOND / 1000000ULL);
 		}
+		link->picoClock = config->picoClock;
+		unsigned latencyUs = 75; // 629 ticks, the value the Pico-clock tests passed with
+		const char* latencyEnv = getenv("MGBA_VCLINK_PICO_LATENCY_US");
+		if (latencyEnv && *latencyEnv) {
+			latencyUs = (unsigned) strtoul(latencyEnv, NULL, 10);
+		}
+		link->picoLatencyCycles = (int32_t) (latencyUs * GBVC_CLOCK_TICKS_PER_SECOND / 1000000ULL);
 	}
 	if (wire) {
 		udsWireInit(&link->wire, &(struct UDSUnitPort) {
@@ -1055,8 +1130,9 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 		mTimingSchedule(&link->gb->timing, &link->event, GBVC_CLOCK_POLL_CYCLES);
 		mLOG(GB_SIO, INFO, "Virtual Console: %s in wire mode with a slave cartridge (the wrapper drives the clock, as a GB-Link would)",
 		     game->title);
-		_trace(link, "created for %s, wire mode, slave cartridge: clock gap %u cycles per byte", game->title,
-		       (unsigned) link->clockByteCycles);
+		_trace(link, "created for %s, wire mode, slave cartridge: clock gap %u cycles per byte%s (+%u cycles of UART latency)", game->title,
+		       (unsigned) link->clockByteCycles, link->picoClock ? ", Pico clock" : "",
+		       link->picoClock ? (unsigned) link->picoLatencyCycles : 0u);
 		return link;
 	}
 

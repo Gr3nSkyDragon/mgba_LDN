@@ -1400,7 +1400,8 @@ void CoreController::applyVC() {
 	}
 	// The slave cartridge runs on Local only for now; the board keeps the master path whatever the menu says.
 	const bool cartSlave = bridge && m_vcCartSlave;
-	if (m_vcLink && m_vcLinkBoard == board && m_vcLinkCartSlave == cartSlave &&
+	const bool picoClock = cartSlave && m_vcPicoClock;
+	if (m_vcLink && m_vcLinkBoard == board && m_vcLinkCartSlave == cartSlave && m_vcLinkPicoClock == picoClock &&
 	    (!board || (m_vcLinkPort == m_rfuEsp32Port && m_vcLinkKey == m_vcKeyFile))) {
 		return;
 	}
@@ -1418,9 +1419,11 @@ void CoreController::applyVC() {
 	config.portName = port.constData();
 	config.keyPath = key.constData();
 	config.cartRole = cartSlave ? GBVC_CART_SLAVE : GBVC_CART_MASTER;
+	config.picoClock = picoClock;
 	m_vcLink = GBVCLinkCreate(m_threadContext.core, &m_debugger, name, &config);
 	m_vcLinkBoard = board;
 	m_vcLinkCartSlave = cartSlave;
+	m_vcLinkPicoClock = picoClock;
 	m_vcLinkPort = m_rfuEsp32Port;
 	m_vcLinkKey = m_vcKeyFile;
 	if (!m_vcLink) {
@@ -1434,6 +1437,15 @@ void CoreController::setVCCartSlave(bool slave) {
 	}
 	m_vcCartSlave = slave;
 	qInfo() << "Virtual Console cartridge:" << (slave ? "slave" : "master");
+	applyVC();
+}
+
+void CoreController::setVCPicoClock(bool enabled) {
+	if (m_vcPicoClock == enabled) {
+		return;
+	}
+	m_vcPicoClock = enabled;
+	qInfo() << "Virtual Console cartridge: Pico clock" << (enabled ? "on" : "off");
 	applyVC();
 }
 
