@@ -228,6 +228,9 @@ public slots:
 	bool vcWrapperRequested() const { return m_vcWrapper; }
 	// The 3DS UDS key file the real-radio mode needs (Settings > BIOS), as a path the program can open.
 	void setVCKeyFile(const QString& path);
+	// The menu's "Virtual Console cartridge": true for Slave (the wrapper drives the clock, as a GB-Link would), false for Master,
+	// the path that has always run. Local only for now.
+	void setVCCartSlave(bool slave);
 	// The connection of the attached wireless adapter's backend, or else the RFU Cable Wrapper's wireless side, for the
 	// status menu. False when neither is attached. `backend` gets its name, `wrapper` whether it is the wrapper's.
 	bool rfuStatus(GBASIORFUBackendStatus* out, QString* backend, bool* wrapper) const;
@@ -411,6 +414,8 @@ private:
 	bool rfuCableOnlyGame() const; // Ruby or Sapphire: no wireless of their own, so the wrapper is always used
 	bool rfuUseCableWrapper() const { return m_rfuCableWrapper || rfuCableOnlyGame(); }
 	bool m_vcWrapper = false; // the menu's "Virtual Console (local only)"
+	bool m_vcCartSlave = false; // the menu's "Virtual Console cartridge > Slave"
+	bool m_vcLinkCartSlave = false; // what the running link was made with
 	void applyVC();
 	void stopVC();
 	GBVCLink* m_vcLink = nullptr;

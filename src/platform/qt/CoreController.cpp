@@ -1398,8 +1398,14 @@ void CoreController::applyVC() {
 		stopVC();
 		return;
 	}
-	if (m_vcLink && m_vcLinkBoard == board && (!board || (m_vcLinkPort == m_rfuEsp32Port && m_vcLinkKey == m_vcKeyFile))) {
+	// The slave cartridge runs on Local only for now; the board keeps the master path whatever the menu says.
+	const bool cartSlave = bridge && m_vcCartSlave;
+	if (m_vcLink && m_vcLinkBoard == board && m_vcLinkCartSlave == cartSlave &&
+	    (!board || (m_vcLinkPort == m_rfuEsp32Port && m_vcLinkKey == m_vcKeyFile))) {
 		return;
+	}
+	if (board && m_vcCartSlave) {
+		LOG(QT, WARN) << tr("Virtual Console: the slave cartridge runs on Local only for now; the ESP32 board uses the master cartridge");
 	}
 	stopVC();
 	Interrupter interrupter(this);
@@ -1411,13 +1417,24 @@ void CoreController::applyVC() {
 	config.air = board ? GBVC_AIR_BOARD : GBVC_AIR_BRIDGE;
 	config.portName = port.constData();
 	config.keyPath = key.constData();
+	config.cartRole = cartSlave ? GBVC_CART_SLAVE : GBVC_CART_MASTER;
 	m_vcLink = GBVCLinkCreate(m_threadContext.core, &m_debugger, name, &config);
 	m_vcLinkBoard = board;
+	m_vcLinkCartSlave = cartSlave;
 	m_vcLinkPort = m_rfuEsp32Port;
 	m_vcLinkKey = m_vcKeyFile;
 	if (!m_vcLink) {
 		LOG(QT, ERROR) << tr("Virtual Console: could not start (see the log above)");
 	}
+}
+
+void CoreController::setVCCartSlave(bool slave) {
+	if (m_vcCartSlave == slave) {
+		return;
+	}
+	m_vcCartSlave = slave;
+	qInfo() << "Virtual Console cartridge:" << (slave ? "slave" : "master");
+	applyVC();
 }
 
 void CoreController::setVCKeyFile(const QString& path) {

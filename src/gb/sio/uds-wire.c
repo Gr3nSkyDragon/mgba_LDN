@@ -156,6 +156,10 @@ void udsWireSetGeneration(struct UDSWire* wire, int generation) {
 	wire->gen2 = generation == 2;
 }
 
+void udsWireSetCartEcho(struct UDSWire* wire, bool enabled) {
+	wire->cartEcho = enabled;
+}
+
 static void _menuEnd(struct UDSWire* wire) {
 	if (wire->pendingZero) {
 		// Not the next cycle's stale byte after all: the transfer the cartridge makes once the choice is settled.
@@ -180,6 +184,14 @@ static void _armEcho(struct UDSWire* wire, uint32_t nowMs) {
 		wire->cable.echoByte = wire->menuHost;
 		wire->cable.echoStartMs = wire->cable.echoLastMs = nowMs;
 		wire->cable.echoCount = 0;
+	} else if (wire->cartEcho && wire->cartPress && !wire->hostPress) {
+		// The cartridge chose first and left; the 3DS has not shown that it took the choice (a 3DS that adopts it sends it back,
+		// which would have set hostPress). See udsWireSetCartEcho.
+		wire->cable.echoActive = true;
+		wire->cable.echoByte = wire->menuCart;
+		wire->cable.echoStartMs = wire->cable.echoLastMs = nowMs;
+		wire->cable.echoCount = 0;
+		_trace(wire, "menu: the cartridge chose %02X first; echoing it to the 3DS", wire->menuCart);
 	}
 }
 
@@ -596,6 +608,7 @@ static void _menuByte(struct UDSWire* wire, uint8_t byte) {
 	wire->pendingZero = false; // the held 00 was a cycle's stale byte
 	if (byte & 0x0C) {
 		wire->cartPress = true;
+		wire->menuCart = byte;
 	}
 	if (wire->readDebt >= UDS_WIRE_MENU_AHEAD) {
 		return; // the 3DS is behind: do not run ahead of its units (the send window is small)

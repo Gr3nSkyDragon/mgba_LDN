@@ -50,6 +50,13 @@ enum GBVCAir {
 	                // the key file (keyPath) is stored on it.
 };
 
+// Which side of the link cable the cartridge plays, in wire mode. The names are the cartridge's role, as in the menu.
+enum GBVCCartRole {
+	GBVC_CART_MASTER, // the cartridge drives the clock and the wrapper (uds-wire.c) is its permanent slave: the default
+	GBVC_CART_SLAVE, // the wrapper drives the clock and the cartridge answers as slave, as behind a GB-Link (Pico) in Game Boy mode,
+	                 // whose PIO SPI is master only. Local (GBVC_AIR_BRIDGE) only for now; the board has no such mode yet.
+};
+
 struct GBVCLinkConfig {
 	enum GBVCAir air;
 	uint16_t listenPort; // bridge: 0 takes AZAHAR_UDS_BRIDGE or the default
@@ -58,6 +65,7 @@ struct GBVCLinkConfig {
 	const char* keyPath; // radio: the 3DS UDS key file (Settings > BIOS)
 	bool wire; // unused: wire mode (the ROM is the master of a link cable and a front end is its slave, uds-wire.c, no ROM hooks) is the default; MGBA_VCLINK_WIRE=0 selects the hook mode
 	const char* tracePath; // a file for the trace (the Android app's shared log); NULL or empty: MGBA_VCLINK_TRACE as before
+	enum GBVCCartRole cartRole; // zero (a zeroed config) is GBVC_CART_MASTER, the path that has always run
 };
 
 struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, const uint16_t name[GBVC_NAME_WORDS],

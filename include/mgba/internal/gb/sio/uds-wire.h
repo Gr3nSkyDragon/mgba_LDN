@@ -102,6 +102,8 @@ struct UDSWire {
 	bool cartPress;
 	bool menuEra; // from the menu's start until its leftovers have been read: the 3DS's Dx units are tracked
 	bool echoWanted; // the menu ended and the echo is armed once the debt is paid, if the 3DS pressed and the cartridge did not
+	bool cartEcho; // also echo the other way (udsWireSetCartEcho): the cartridge pressed and the 3DS had not taken its choice
+	uint8_t menuCart; // the cartridge's selection with A or B pressed, for that echo
 
 	// Units sent whose partner (the 3DS's unit with the same index) has not been read yet. Index pairing is what the 3DS
 	// relies on and what keeps a sync from being answered by an old unit: every unit sent without a read adds to the debt,
@@ -162,6 +164,14 @@ struct UDSWire {
 void udsWireInit(struct UDSWire* wire, const struct UDSUnitPort* port);
 // 2 makes syncs in the 70 and 80 ranges count as syncs too (Gen 2 picks the range by link mode); 1 (the default) only 60.
 void udsWireSetGeneration(struct UDSWire* wire, int generation);
+
+// Off by default. On, a menu the cartridge chose first is echoed to the 3DS as the 3DS's own choice is echoed to the cartridge: a
+// Gen 1 game that pressed A while its partner had not uses its own selection and leaves the menu at once (LinkMenu,
+// .doneChoosingMenuSelection), counting on the partner to read it in that same call; the 3DS's calls need not line up with the
+// cartridge's, so it may still be waiting for the choice when the cartridge has gone. Its further units are answered with the
+// cartridge's selection until it is quiet. Every caller turns it on (mGBA's master and slave cartridge paths, the board's
+// wrapper); it stays a switch so that a test can run the wire without it.
+void udsWireSetCartEcho(struct UDSWire* wire, bool enabled);
 
 // Call every millisecond or so: brings the session's state in (link up, link lost), runs the 3DS side of a sync and ends a
 // MENU or PASS that has gone quiet.

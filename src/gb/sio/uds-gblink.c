@@ -27,6 +27,15 @@
 #endif
 
 #define GBVC_POLL_CYCLES 4096 // about 1 ms
+// Slave cartridge: how often the wrapper clocks. A master Pokemon clocks once a frame in its sync, menu and idle loops and as fast
+// as the slave keeps up inside Serial_ExchangeBytes; the slave's routines are written for exactly that.
+#define GBVC_CLOCK_POLL_CYCLES 1024
+// A frame and a half. The slave's sync and menu loops wait a frame (DelayFrame) and then wait for the master's clock; clocked once
+// a frame exactly, some clocks land in the DelayFrame, where the game takes no byte (ours is lost and it answers FE next). Slower
+// than its loop, every clock finds it waiting.
+#define GBVC_CLOCK_LOOP_CYCLES 105336
+#define GBVC_CLOCK_BYTE_CYCLES 4194 // 1 ms: the GB-Link's gap after each byte (MGBA_VCLINK_CLOCK_GAP_US changes it)
+#define GBVC_CLOCK_ROLE_CYCLES 8389 // 2 ms between our 01 offers while the cartridge alternates its clock
 #define GBVC_USING_INTERNAL_CLOCK 0x02
 
 struct VCAddr {
@@ -98,6 +107,15 @@ struct GBVCLink {
 	bool wireMode;
 	int lastWirePhase;
 	unsigned wireExchanges;
+
+	// Slave cartridge (GBVC_CART_SLAVE): the same wire, with the clock on our side (_clockPoll).
+	bool cartSlave;
+	int32_t clockByteCycles; // the gap after each byte in PASS (the Pico's SetTimingConfig default, 1 ms)
+	int32_t clockWait; // cycles until the next exchange may be clocked
+	unsigned clockUnarmed; // exchanges skipped because the cartridge was not armed as slave
+	unsigned clockQuiet; // exchanges clocked but kept from the wire: empty both ways, or handshake leftovers in IDLE
+	uint32_t clockNoteMs; // when the clock's counts last went to the trace
+	int clockUnarmedPhase; // the phase whose skips were last reported
 
 	// Board mode (GBVC_AIR_BOARD): the wrapper runs on the ESP32; the joiner, cable and wire above are not used.
 	bool boardMode;
@@ -398,6 +416,118 @@ static void _wirePoll(struct mTiming* timing, void* context, uint32_t cyclesLate
 	}
 	link->started = link->wire.phase != UDS_WIRE_DOWN;
 	mTimingSchedule(timing, &link->event, GBVC_POLL_CYCLES - cyclesLate);
+}
+
+// Slave cartridge: the wire above, with the clock on our side ----------------------------------------------------------------
+//
+// The Pokemon games treat a byte the same way in either role: their serial interrupt stores rSB as the byte received, loads the
+// next hSerialSendData into rSB and leaves FE (no data) behind (home/serial.asm, Serial; Gen 2 the same). Only two things differ:
+// the master starts every transfer (SC = 81), and in the handshake the side clocking offers 01 while the side waiting answers 02
+// (the status each takes is the byte it receives). So the wire (uds-wire.c) is used unchanged: the byte it would have the slave
+// shift out (udsWirePreload) is the byte we clock, the cartridge's reply is "the master's byte" (udsWireExchanged), and only the
+// handshake is turned round here. Whether the rest holds with the clock reversed is what the first traces are for: the trace's
+// "clock XX -> YY" lines are our byte, then the cartridge's.
+
+static uint8_t _clockWriteSC(struct GBSIODriver* driver, uint8_t value) {
+	UNUSED(driver);
+	return value; // the cartridge's own transfers (its internal-clock tries in the handshake) finish on the built-in shifter with FF
+}
+
+// A master Pokemon clocks once a frame in its sync, menu and idle loops and byte after byte in a block (Serial_ExchangeBytes). We
+// stay a little slower than the slave's frame loops (GBVC_CLOCK_LOOP_CYCLES); in a block it waits for every byte anyway.
+static int32_t _clockGap(const struct GBVCLink* link) {
+	switch (link->wire.phase) {
+	case UDS_WIRE_ROLE:
+		return GBVC_CLOCK_ROLE_CYCLES;
+	case UDS_WIRE_PASS:
+		return link->clockByteCycles;
+	default:
+		return GBVC_CLOCK_LOOP_CYCLES;
+	}
+}
+
+static void _clockExchange(struct GBVCLink* link, uint32_t now) {
+	struct GBSIO* sio = &link->gb->sio;
+	const int phase = link->wire.phase;
+	link->clockWait = _clockGap(link);
+	// A slave is armed (start, external clock) whenever it can take a byte. Unarmed, a real master's clock finds nobody: the
+	// GB-Link would read FF and the byte would be lost. Here the exchange is skipped instead (and counted), so that the first
+	// traces test the wire with the clock reversed and nothing else.
+	if ((link->gb->memory.io[GB_REG_SC] & 0x81) != 0x80) {
+		++link->clockUnarmed;
+		if (phase != UDS_WIRE_ROLE && link->clockUnarmedPhase != phase) {
+			link->clockUnarmedPhase = phase;
+			_trace(link, "clock: the cartridge is not armed as slave in %s (%u skipped so far; a GB-Link would have read FF)",
+			       kWirePhases[phase], link->clockUnarmed);
+		}
+		return;
+	}
+	const bool role = phase == UDS_WIRE_ROLE;
+	const uint8_t sent = role ? 0x01 : udsWirePreload(&link->wire);
+	const uint8_t reply = link->gb->memory.io[GB_REG_SB];
+	sio->pendingSB = sent;
+	sio->remainingBits = 8;
+	mTimingDeschedule(&link->gb->timing, &sio->event);
+	mTimingSchedule(&link->gb->timing, &sio->event, 0);
+	if (!role) {
+		// A master cartridge clocks only when its code has a byte to exchange, and the wire reads its silences: a quiet gap is what
+		// ends a MENU or a PASS. We clock at a steady rate instead, so most clocks find the game outside its exchange routines and
+		// get FE back. When neither side had anything (our FE, its FE), a master would not have clocked at all: the wire does not
+		// see it, and its gap timers see the silence a master leaves. The handshake's own bytes (01, 02), which the cartridge's
+		// Cable Club code keeps loading while it waits, are stale in IDLE as 00 and FE already are.
+		// In MENU an FE from the cartridge is a clock that caught it between selections, not the end of the menu (a master never sends
+		// one there, which is why the wire reads it as the end). Both sides repeat their selection, so a lost or repeated one is harmless.
+		// In PASS likewise: the game is between exchanges (in a Time Capsule trade's menu, for one, while the wire still waits for a
+		// Gen 2 mail block that a Gen 1 partner never sends). A master would have stopped clocking, the wire's gap would end PASS and
+		// the selection's nybble sync would be seen. Our byte is not taken from the wire, so whatever it had is offered again.
+		const bool empty = sent == UDS_WIRE_NO_DATA && reply == UDS_WIRE_NO_DATA;
+		const bool handshake = phase == UDS_WIRE_IDLE && (reply == 0x01 || reply == 0x02);
+		const bool menuGap = phase == UDS_WIRE_MENU && reply == UDS_WIRE_NO_DATA;
+		const bool passGap = phase == UDS_WIRE_PASS && reply == UDS_WIRE_NO_DATA;
+		if (empty || handshake || menuGap || passGap) {
+			++link->clockQuiet;
+			return;
+		}
+		udsWireExchanged(&link->wire, now, reply);
+	} else if (reply == 0x02) {
+		// ESTABLISH_CONNECTION_WITH_EXTERNAL_CLOCK: the cartridge takes the slave's part. The wire leaves ROLE as if a master
+		// cartridge had offered 01 to it.
+		udsWireExchanged(&link->wire, now, 0x01);
+		_trace(link, "clock: the cartridge answered 02, it is the slave");
+	}
+	++link->wireExchanges;
+	if (link->trace && link->wireExchanges <= 8000) {
+		_trace(link, "clock %02X -> %02X [%s]", sent, reply, kWirePhases[link->wire.phase]);
+	}
+}
+
+static void _clockPoll(struct mTiming* timing, void* context, uint32_t cyclesLate) {
+	struct GBVCLink* link = context;
+	uint32_t now = _nowMs() - link->startMs;
+	// As _wirePoll: the session, the logs and the wire's own timers.
+	udsJoinerPoll(&link->joiner, now);
+	_logStates(link);
+	_heartbeat(link, now);
+	udsWirePoll(&link->wire, now);
+	if ((int) link->wire.phase != link->lastWirePhase) {
+		if (link->lastWirePhase < 0 || link->wire.phase == UDS_WIRE_ROLE || link->wire.phase == UDS_WIRE_DOWN) {
+			mLOG(GB_SIO, INFO, "Virtual Console: wire %s (slave cartridge)", kWirePhases[link->wire.phase]);
+		}
+		_trace(link, "wire phase: %s", kWirePhases[link->wire.phase]);
+		link->lastWirePhase = (int) link->wire.phase;
+	}
+	link->started = link->wire.phase != UDS_WIRE_DOWN;
+	if (link->trace && now - link->clockNoteMs >= 5000) {
+		link->clockNoteMs = now;
+		_trace(link, "clock: %u exchanges to the wire, %u kept from it (empty or handshake leftovers), %u skipped (not armed)",
+		       link->wireExchanges, link->clockQuiet, link->clockUnarmed);
+	}
+
+	link->clockWait -= GBVC_CLOCK_POLL_CYCLES;
+	if (link->wire.phase != UDS_WIRE_DOWN && link->clockWait <= 0 && !link->gb->sio.remainingBits) {
+		_clockExchange(link, now);
+	}
+	mTimingSchedule(timing, &link->event, GBVC_CLOCK_POLL_CYCLES - cyclesLate);
 }
 
 // The cartridge started a transfer as master: its byte goes to the front end, the slave's reply is what the built-in shifter
@@ -783,6 +913,15 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 		mLOG(GB_SIO, ERROR, "Virtual Console: this build has no debugger, so the ROM hooks cannot be installed");
 		return NULL;
 	}
+	const bool cartSlave = config->cartRole == GBVC_CART_SLAVE;
+	if (cartSlave && config->air != GBVC_AIR_BRIDGE) {
+		mLOG(GB_SIO, ERROR, "Virtual Console: the slave cartridge runs on Local only for now (the board firmware has no such mode yet)");
+		return NULL;
+	}
+	if (cartSlave && !wire) {
+		mLOG(GB_SIO, ERROR, "Virtual Console: the slave cartridge needs wire mode (is MGBA_VCLINK_WIRE set to 0?)");
+		return NULL;
+	}
 	struct GBVCLink* link = calloc(1, sizeof(*link));
 	link->core = core;
 	link->gb = core->board;
@@ -794,6 +933,14 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 	link->fakeBeginId = link->fakeEndId = link->syncId = link->menuId = -1;
 	link->wireMode = wire;
 	link->lastWirePhase = -1;
+	link->cartSlave = cartSlave;
+	if (cartSlave) {
+		link->clockByteCycles = GBVC_CLOCK_BYTE_CYCLES;
+		const char* gapEnv = getenv("MGBA_VCLINK_CLOCK_GAP_US");
+		if (gapEnv && *gapEnv) {
+			link->clockByteCycles = (int32_t) (strtoul(gapEnv, NULL, 10) * 4194304ULL / 1000000ULL);
+		}
+	}
 	if (wire) {
 		udsWireInit(&link->wire, &(struct UDSUnitPort) {
 			.context = link,
@@ -806,6 +953,7 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 			.trace = _portTrace,
 		});
 		udsWireSetGeneration(&link->wire, game->gen2 ? 2 : 1);
+		udsWireSetCartEcho(&link->wire, true); // a menu the cartridge chose first reaches the 3DS, whichever side clocks
 	}
 	udsCableInit(&link->cable, &(struct UDSUnitPort) {
 		.context = link,
@@ -893,6 +1041,24 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 	link->d.deinit = _driverDeinit;
 	link->d.writeSB = _driverWriteSB;
 	link->d.writeSC = wire ? _wireWriteSC : _driverWriteSC;
+
+	if (link->cartSlave) {
+		// The same wire, with the clock on our side (see _clockPoll). The cartridge's own transfers are left to the built-in
+		// shifter, which finishes them with FF: as on a real cable, a side that clocks with no master opposite hears nobody.
+		link->d.writeSC = _clockWriteSC;
+		GBSIOSetDriver(&link->gb->sio, &link->d);
+		link->attachedDriver = true;
+		link->event.context = link;
+		link->event.name = "GB VC clock";
+		link->event.callback = _clockPoll;
+		link->event.priority = 0x40;
+		mTimingSchedule(&link->gb->timing, &link->event, GBVC_CLOCK_POLL_CYCLES);
+		mLOG(GB_SIO, INFO, "Virtual Console: %s in wire mode with a slave cartridge (the wrapper drives the clock, as a GB-Link would)",
+		     game->title);
+		_trace(link, "created for %s, wire mode, slave cartridge: clock gap %u cycles per byte", game->title,
+		       (unsigned) link->clockByteCycles);
+		return link;
+	}
 
 	if (wire) {
 		GBSIOSetDriver(&link->gb->sio, &link->d);
