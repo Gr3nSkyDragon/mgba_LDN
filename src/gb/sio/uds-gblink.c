@@ -44,6 +44,9 @@
 // wLinkSendMailEnd - wLinkSendMail = 5 preamble + 6 x 33 messages + 6 x 14 metadata + 6 x 17 + 1 patch set = 390 stored. (Western
 // games; the Japanese ones have shorter mail.)
 #define GBVC_MAIL_EXCHANGES 391
+// Pico clock, mail hold (MGBA_VCLINK_PICO_MAIL_HOLD, off unless set): the longest the clock is held for one 3DS unit. The wire ends a
+// PASS after UDS_WIRE_GAP_MS without an exchange, so a hold never comes near that; at the cap the byte is clocked as without the hold.
+#define GBVC_MAIL_HOLD_MAX_MS 150
 #define GBVC_USING_INTERNAL_CLOCK 0x02
 
 struct VCAddr {
@@ -132,6 +135,15 @@ struct GBVCLink {
 	unsigned picoMissed;
 	unsigned picoMissedInPhase[6];
 	unsigned picoMissedInBlock; // of those in PASS, the ones inside a block or the mail, which the wire stored as data
+	// Gen 2 mail with the Pico clock: how many of the cartridge's mail exchanges got a stand-in because the 3DS's unit was not there
+	// yet (the tail of the 3DS's mail is cut by as many), and the mail hold (mailHoldAhead units ahead of the 3DS, 0: off).
+	unsigned mailFills;
+	unsigned mailHoldAhead;
+	bool mailHolding;
+	uint32_t mailHoldSinceMs;
+	uint32_t mailHoldLongestMs;
+	unsigned mailHolds;
+	unsigned mailHoldCapped; // holds that reached GBVC_MAIL_HOLD_MAX_MS and clocked anyway
 	int clockUnarmedPhase; // the phase whose skips were last reported
 
 	// Board mode (GBVC_AIR_BOARD): the wrapper runs on the ESP32; the joiner, cable and wire above are not used.
@@ -476,6 +488,9 @@ static void _clockExchange(struct GBVCLink* link, uint32_t now) {
 	// menu, unarmed, and an FF is a clock nobody heard.
 	if (!link->wire.mailMode) {
 		link->clockMailExchanges = 0;
+		link->mailFills = link->mailHolds = link->mailHoldCapped = 0;
+		link->mailHoldLongestMs = 0;
+		link->mailHolding = false;
 	}
 	const bool mailOpen = link->wire.mailMode && link->clockMailExchanges < GBVC_MAIL_EXCHANGES;
 	const bool inBlock = phase == UDS_WIRE_PASS && (link->wire.blockStoring || mailOpen);
@@ -490,6 +505,35 @@ static void _clockExchange(struct GBVCLink* link, uint32_t now) {
 	}
 	const bool role = phase == UDS_WIRE_ROLE;
 	const uint8_t sent = role ? 0x01 : udsWirePreload(&link->wire);
+	const bool mailFill = mailOpen && link->wire.preloadFill;
+	if (mailFill && link->mailHoldAhead) {
+		// Mail hold. The 3DS sends its unit k only once our unit k has reached it, so a clock that runs on while its units are on
+		// the way gives the cartridge a stand-in for each ($20 ahead of the mail data, which costs as many bytes at the end of the
+		// mail; 00 after it, a damaged byte). A board decides when the Pico clocks, so it can wait instead: once we are
+		// mailHoldAhead units ahead (enough for the 3DS to go on with), and from the first byte of mail data on whenever we are
+		// ahead at all, the clock waits for the 3DS's unit. The cartridge waits armed for as long as it takes (its mail is a plain
+		// ExchangeBytes and the Trade Center's wLinkTimeoutFrames is 0).
+		const int ahead = (int) (link->wire.sentUnits - link->wire.recvUnits);
+		const int need = link->wire.mailData ? 1 : (int) link->mailHoldAhead;
+		if (ahead >= need) {
+			if (!link->mailHolding) {
+				link->mailHolding = true;
+				link->mailHoldSinceMs = now;
+				++link->mailHolds;
+			}
+			if (now - link->mailHoldSinceMs < GBVC_MAIL_HOLD_MAX_MS) {
+				link->clockWait = 0; // look again at the next poll
+				return;
+			}
+			++link->mailHoldCapped;
+		}
+	}
+	if (link->mailHolding) {
+		link->mailHolding = false;
+		if (now - link->mailHoldSinceMs > link->mailHoldLongestMs) {
+			link->mailHoldLongestMs = now - link->mailHoldSinceMs;
+		}
+	}
 	uint8_t reply;
 	if (!armed) {
 		// Pico clock: nobody shifts on the other end (or the cartridge is clocking a transfer of its own), the line reads FF and
@@ -533,13 +577,30 @@ static void _clockExchange(struct GBVCLink* link, uint32_t now) {
 		// inside an exchange call) from one that sent FF. Inside a block (and the Gen 2 mail) FF is data, a patched FE or a patch
 		// list's end, and the slave waits armed for every byte; anywhere else it is a clock nobody heard. Our byte was not taken.
 		const bool absent = link->picoClock && reply == 0xFF && !inBlock;
-		if (empty || handshake || menuGap || passGap || absent) {
+		// Pico clock, in SYNC: an FE is a clock that caught the cartridge between its sync and the link menu (the byte it loaded for
+		// the menu not yet in rSB). The wire takes the first byte after the sync to decide what follows, and an FE there sent it to
+		// PASS instead of MENU: the 3DS never got our selection and stayed at "Please wait". The wire ignores FE everywhere else in
+		// SYNC, so only that decision changes; it waits for the cartridge's real byte.
+		const bool syncGap = link->picoClock && phase == UDS_WIRE_SYNC && reply == UDS_WIRE_NO_DATA;
+		if (empty || handshake || menuGap || passGap || absent || syncGap) {
 			++link->clockQuiet;
 			return;
 		}
 		udsWireExchanged(&link->wire, now, reply);
 		if (link->wire.mailMode) {
-			++link->clockMailExchanges;
+			if (mailFill) {
+				++link->mailFills;
+			}
+			if (++link->clockMailExchanges == GBVC_MAIL_EXCHANGES && link->picoClock) {
+				if (link->mailHoldAhead) {
+					_trace(link, "mail done: %u of its %u exchanges got a stand-in for a 3DS unit not there yet; %u holds, the longest "
+					       "%u ms, %u of them clocked anyway at %u ms", link->mailFills, GBVC_MAIL_EXCHANGES, link->mailHolds,
+					       link->mailHoldLongestMs, link->mailHoldCapped, GBVC_MAIL_HOLD_MAX_MS);
+				} else {
+					_trace(link, "mail done: %u of its %u exchanges got a stand-in for a 3DS unit not there yet (the end of the 3DS's "
+					       "mail is cut by as many)", link->mailFills, GBVC_MAIL_EXCHANGES);
+				}
+			}
 		}
 	} else if (reply == 0x02) {
 		// ESTABLISH_CONNECTION_WITH_EXTERNAL_CLOCK: the cartridge takes the slave's part. The wire leaves ROLE as if a master
@@ -1015,6 +1076,10 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 			latencyUs = (unsigned) strtoul(latencyEnv, NULL, 10);
 		}
 		link->picoLatencyCycles = (int32_t) (latencyUs * GBVC_CLOCK_TICKS_PER_SECOND / 1000000ULL);
+		const char* holdEnv = getenv("MGBA_VCLINK_PICO_MAIL_HOLD");
+		if (link->picoClock && holdEnv && *holdEnv) {
+			link->mailHoldAhead = (unsigned) strtoul(holdEnv, NULL, 10);
+		}
 	}
 	if (wire) {
 		udsWireInit(&link->wire, &(struct UDSUnitPort) {
@@ -1133,6 +1198,9 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 		_trace(link, "created for %s, wire mode, slave cartridge: clock gap %u cycles per byte%s (+%u cycles of UART latency)", game->title,
 		       (unsigned) link->clockByteCycles, link->picoClock ? ", Pico clock" : "",
 		       link->picoClock ? (unsigned) link->picoLatencyCycles : 0u);
+		if (link->mailHoldAhead) {
+			_trace(link, "mail hold: on, up to %u units ahead of the 3DS", link->mailHoldAhead);
+		}
 		return link;
 	}
 
