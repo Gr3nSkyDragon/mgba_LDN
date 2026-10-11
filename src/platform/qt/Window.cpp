@@ -949,8 +949,6 @@ void Window::gameStarted() {
 		}
 		m_controller->setVCKeyFile(keyFile);
 	}
-	m_controller->setVCCartSlave(m_vcCartSlave);
-	m_controller->setVCPicoClock(m_vcPicoClock);
 	m_controller->setVCWrapper(m_vcWrapper);
 	m_controller->setRFUBackend(m_rfuBackend);
 #endif
@@ -1692,31 +1690,8 @@ void Window::setupMenu(QMenuBar* menubar) {
 			m_controller->setVCWrapper(m_vcWrapper);
 		}
 	}, this);
-	// Which side of the cable the Game Boy cartridge plays (CoreController::setVCCartSlave). Master is the path that has always run:
-	// the cartridge drives the clock and the wrapper is its slave. Slave turns that round, as a GB-Link (Pico) in Game Boy mode
-	// forces, so that path can be built here before the hardware exists. Local only for now. Saved as vcwrapper.cartRole.
-	m_actions.addMenu(tr("Virtual Console cartridge"), "vcCart", "rfu");
-	ConfigOption* vcCart = localOption("vcwrapper.cartRole");
-	vcCart->addValue(tr("Master (the cartridge drives the clock)"), "master", &m_actions, "vcCart")->setKeepsMenuOpen();
-	vcCart->addValue(tr("Slave (the wrapper drives the clock, as a GB-Link does)"), "slave", &m_actions, "vcCart")->setKeepsMenuOpen();
-	vcCart->connect([this](const QVariant& value) {
-		m_vcCartSlave = value.toString() == QLatin1String("slave");
-		if (m_controller) {
-			m_controller->setVCCartSlave(m_vcCartSlave);
-		}
-	}, this);
-	vcCart->setValue(QVariant(savedOr("vcwrapper.cartRole", "master")));
-	// Slave only: clock with nothing a Pico cannot know (see GBVCLinkConfig::picoClock). Saved as vcwrapper.picoClock.
-	m_actions.addSeparator("vcCart");
-	ConfigOption* picoClock = localOption("vcwrapper.picoClock");
-	picoClock->addBoolean(tr("Clock exactly like a GB-Link (Pico)"), &m_actions, "vcCart");
-	picoClock->connect([this](const QVariant& value) {
-		m_vcPicoClock = value.toBool();
-		if (m_controller) {
-			m_controller->setVCPicoClock(m_vcPicoClock);
-		}
-	}, this);
-	picoClock->setValue(QVariant(savedOr("vcwrapper.picoClock", "0").toInt() != 0));
+	// Which side of the cable the cartridge plays is not a menu choice: Local runs it as slave behind a virtual GB-Link, as a real
+	// GB-Link in Game Boy mode does (uds-gblink.h has the environment variables that bring the old master cartridge back).
 	// Which board the ESP32 backend opens: the ones plugged in are listed (Refresh looks again), and Auto-detect takes the
 	// first of them. Per window like the rest; only the first window saves it.
 	m_actions.addMenu(tr("ESP32 board"), "rfuEsp32", "rfu");

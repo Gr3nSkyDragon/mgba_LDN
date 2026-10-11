@@ -173,8 +173,6 @@ private:
 	QString m_rfuBackend = QStringLiteral("off");
 	bool m_rfuCableWrapper = false;
 	bool m_vcWrapper = false; // Virtual Console (local only): the UDS wrapper on the Local backend, to Azahar's bridge
-	bool m_vcCartSlave = false; // Virtual Console cartridge > Slave (saved as vcwrapper.cartRole)
-	bool m_vcPicoClock = false; // Virtual Console cartridge > Clock exactly like a GB-Link (saved as vcwrapper.picoClock)
 	bool m_rfuLog = false;
 	QString m_rfuEsp32Port; // empty: auto-detect
 	bool m_rfuEsp32Primary = false; // this window saves its board choice (see the menu setup)

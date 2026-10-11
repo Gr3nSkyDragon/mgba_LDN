@@ -50,12 +50,14 @@ enum GBVCAir {
 	                // the key file (keyPath) is stored on it.
 };
 
-// Which side of the link cable the cartridge plays, in wire mode. The names are the cartridge's role, as in the menu.
-enum GBVCCartRole {
-	GBVC_CART_MASTER, // the cartridge drives the clock and the wrapper (uds-wire.c) is its permanent slave: the default
-	GBVC_CART_SLAVE, // the wrapper drives the clock and the cartridge answers as slave, as behind a GB-Link (Pico) in Game Boy mode,
-	                 // whose PIO SPI is master only. Local (GBVC_AIR_BRIDGE) only for now; the board has no such mode yet.
-};
+// Which side of the link cable the cartridge plays, in wire mode (the front end has no say):
+//  - Local (GBVC_AIR_BRIDGE): the cartridge is the slave and mGBA clocks it as a GB-Link (Pico) in Game Boy mode would, whose SPI is
+//    master only: the Pico clock and the mail hold (uds-gblink.c). This follows the GB-Link model, as the GBA side does.
+//    MGBA_VCLINK_CART=master brings back the master cartridge below (kept in case a GB-Link firmware ever offers both);
+//    MGBA_VCLINK_PICO_CLOCK=0 the slave without the Pico clock; MGBA_VCLINK_PICO_MAIL_HOLD=<units> the mail hold (0: off).
+//  - ESP32 (GBVC_AIR_BOARD): the cartridge is the master and the wrapper on the board its permanent slave (uds-wire.c), the only
+//    arrangement firmware 1.5 has.
+// The hook mode (MGBA_VCLINK_WIRE=0) is master as before.
 
 struct GBVCLinkConfig {
 	enum GBVCAir air;
@@ -65,12 +67,6 @@ struct GBVCLinkConfig {
 	const char* keyPath; // radio: the 3DS UDS key file (Settings > BIOS)
 	bool wire; // unused: wire mode (the ROM is the master of a link cable and a front end is its slave, uds-wire.c, no ROM hooks) is the default; MGBA_VCLINK_WIRE=0 selects the hook mode
 	const char* tracePath; // a file for the trace (the Android app's shared log); NULL or empty: MGBA_VCLINK_TRACE as before
-	enum GBVCCartRole cartRole; // zero (a zeroed config) is GBVC_CART_MASTER, the path that has always run
-	// Slave cartridge only: clock exactly as a GB-Link (Pico) would. Nothing a Pico cannot know is used: the clock goes out on its own
-	// schedule whether or not the cartridge is armed (unarmed, or busy with its own transfer, the reply is FF and our byte is lost),
-	// the byte shifts at once (the Pico's SPI takes microseconds) and every exchange is followed by the Pico's gap plus a UART round
-	// trip (MGBA_VCLINK_PICO_LATENCY_US, 75 by default). Off: mGBA skips the clocks that would find the cartridge unarmed.
-	bool picoClock;
 };
 
 struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, const uint16_t name[GBVC_NAME_WORDS],

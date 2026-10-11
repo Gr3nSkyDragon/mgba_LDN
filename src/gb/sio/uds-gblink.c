@@ -44,8 +44,10 @@
 // wLinkSendMailEnd - wLinkSendMail = 5 preamble + 6 x 33 messages + 6 x 14 metadata + 6 x 17 + 1 patch set = 390 stored. (Western
 // games; the Japanese ones have shorter mail.)
 #define GBVC_MAIL_EXCHANGES 391
-// Pico clock, mail hold (MGBA_VCLINK_PICO_MAIL_HOLD, off unless set): the longest the clock is held for one 3DS unit. The wire ends a
-// PASS after UDS_WIRE_GAP_MS without an exchange, so a hold never comes near that; at the cap the byte is clocked as without the hold.
+// Pico clock, mail hold: how many units we may run ahead of the 3DS before the clock waits (MGBA_VCLINK_PICO_MAIL_HOLD changes it, 0
+// turns the hold off; 32 is the value the mail tests passed with), and the longest the clock is held for one 3DS unit. The wire ends
+// a PASS after UDS_WIRE_GAP_MS without an exchange, so a hold never comes near that; at the cap the byte is clocked as without the hold.
+#define GBVC_MAIL_HOLD_AHEAD 32
 #define GBVC_MAIL_HOLD_MAX_MS 150
 #define GBVC_USING_INTERNAL_CLOCK 0x02
 
@@ -119,7 +121,7 @@ struct GBVCLink {
 	int lastWirePhase;
 	unsigned wireExchanges;
 
-	// Slave cartridge (GBVC_CART_SLAVE): the same wire, with the clock on our side (_clockPoll).
+	// Slave cartridge (Local, see the header): the same wire, with the clock on our side (_clockPoll).
 	bool cartSlave;
 	int32_t clockByteCycles; // the gap after each byte in PASS (the Pico's SetTimingConfig default, 1 ms)
 	int32_t clockWait; // cycles until the next exchange may be clocked
@@ -128,7 +130,7 @@ struct GBVCLink {
 	uint32_t clockNoteMs; // when the clock's counts last went to the trace
 	unsigned clockRoleOffers; // our 01 offers that nobody took
 	unsigned clockMailExchanges; // exchanges given to the wire since its Gen 2 mail mode began
-	// Pico clock (config->picoClock): clocks that found the cartridge unarmed or clocking itself, so it read FF and lost our byte.
+	// Pico clock (on unless MGBA_VCLINK_PICO_CLOCK=0): clocks that found the cartridge unarmed or clocking itself, so it read FF and lost our byte.
 	// A real board cannot see these; they are counted here only to read the trace.
 	bool picoClock;
 	int32_t picoLatencyCycles;
@@ -1042,14 +1044,12 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 		mLOG(GB_SIO, ERROR, "Virtual Console: this build has no debugger, so the ROM hooks cannot be installed");
 		return NULL;
 	}
-	const bool cartSlave = config->cartRole == GBVC_CART_SLAVE;
-	if (cartSlave && config->air != GBVC_AIR_BRIDGE) {
-		mLOG(GB_SIO, ERROR, "Virtual Console: the slave cartridge runs on Local only for now (the board firmware has no such mode yet)");
-		return NULL;
-	}
-	if (cartSlave && !wire) {
-		mLOG(GB_SIO, ERROR, "Virtual Console: the slave cartridge needs wire mode (is MGBA_VCLINK_WIRE set to 0?)");
-		return NULL;
+	// Local's wire mode runs the cartridge as slave behind a virtual GB-Link (see the header); the board and the hook mode as master.
+	bool cartSlave = wire && config->air == GBVC_AIR_BRIDGE;
+	const char* cartEnv = getenv("MGBA_VCLINK_CART");
+	if (cartSlave && cartEnv && !strcmp(cartEnv, "master")) {
+		cartSlave = false;
+		mLOG(GB_SIO, INFO, "Virtual Console: master cartridge (MGBA_VCLINK_CART=master)");
 	}
 	struct GBVCLink* link = calloc(1, sizeof(*link));
 	link->core = core;
@@ -1069,16 +1069,20 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 		if (gapEnv && *gapEnv) {
 			link->clockByteCycles = (int32_t) (strtoul(gapEnv, NULL, 10) * GBVC_CLOCK_TICKS_PER_SECOND / 1000000ULL);
 		}
-		link->picoClock = config->picoClock;
+		const char* picoEnv = getenv("MGBA_VCLINK_PICO_CLOCK");
+		link->picoClock = !(picoEnv && !strcmp(picoEnv, "0"));
 		unsigned latencyUs = 75; // 629 ticks, the value the Pico-clock tests passed with
 		const char* latencyEnv = getenv("MGBA_VCLINK_PICO_LATENCY_US");
 		if (latencyEnv && *latencyEnv) {
 			latencyUs = (unsigned) strtoul(latencyEnv, NULL, 10);
 		}
 		link->picoLatencyCycles = (int32_t) (latencyUs * GBVC_CLOCK_TICKS_PER_SECOND / 1000000ULL);
-		const char* holdEnv = getenv("MGBA_VCLINK_PICO_MAIL_HOLD");
-		if (link->picoClock && holdEnv && *holdEnv) {
-			link->mailHoldAhead = (unsigned) strtoul(holdEnv, NULL, 10);
+		if (link->picoClock) {
+			link->mailHoldAhead = GBVC_MAIL_HOLD_AHEAD;
+			const char* holdEnv = getenv("MGBA_VCLINK_PICO_MAIL_HOLD");
+			if (holdEnv && *holdEnv) {
+				link->mailHoldAhead = (unsigned) strtoul(holdEnv, NULL, 10);
+			}
 		}
 	}
 	if (wire) {
