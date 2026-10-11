@@ -55,8 +55,9 @@ enum GBVCAir {
 //    master only: the Pico clock and the mail hold (uds-gblink.c). This follows the GB-Link model, as the GBA side does.
 //    MGBA_VCLINK_CART=master brings back the master cartridge below (kept in case a GB-Link firmware ever offers both);
 //    MGBA_VCLINK_PICO_CLOCK=0 the slave without the Pico clock; MGBA_VCLINK_PICO_MAIL_HOLD=<units> the mail hold (0: off).
-//  - ESP32 (GBVC_AIR_BOARD): the cartridge is the master and the wrapper on the board its permanent slave (uds-wire.c), the only
-//    arrangement firmware 1.5 has.
+//  - ESP32 (GBVC_AIR_BOARD), firmware 1.6 on: the same GB-Link model, with the clock on the board (its copy of uds-clock.c) and mGBA
+//    standing in for the Pico, speaking the Pico's own frames over USB. Firmware 1.4 and 1.5 have only the master cartridge, with the
+//    wrapper on the board its permanent slave (uds-wire.c), and get that (so does MGBA_VCLINK_CART=master).
 // The hook mode (MGBA_VCLINK_WIRE=0) is master as before.
 
 struct GBVCLinkConfig {

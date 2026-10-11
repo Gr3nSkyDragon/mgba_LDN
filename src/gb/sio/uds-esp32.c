@@ -251,6 +251,11 @@ static void _dispatch(struct UDSEsp32* esp, const struct UDSEsp32Frame* frame) {
 			esp->handlers.gbState(esp->handlers.context, p);
 		}
 		break;
+	case UDS_ESP32_EVT_GB_PICO:
+		if (esp->handlers.gbPico) {
+			esp->handlers.gbPico(esp->handlers.context, p, frame->length);
+		}
+		break;
 	case UDS_ESP32_EVT_GB_STATS:
 		if (frame->length >= 4 * UDS_ESP32_GB_STATS && esp->handlers.gbStats) {
 			uint32_t stats[UDS_ESP32_GB_STATS];
@@ -408,6 +413,10 @@ bool udsEsp32HasGbWrapper(const struct UDSEsp32* esp) {
 	return esp->info.valid && (esp->info.major > 1 || (esp->info.major == 1 && esp->info.minor >= 4));
 }
 
+bool udsEsp32HasGbPico(const struct UDSEsp32* esp) {
+	return esp->info.valid && (esp->info.major > 1 || (esp->info.major == 1 && esp->info.minor >= 6));
+}
+
 // Polls until *flag is set or the time is up. The board answers within a few milliseconds over USB, so this spins rather than sleeping
 // (a sleep on Windows lasts a scheduler tick, about 15 ms).
 static bool _await(struct UDSEsp32* esp, const bool* flag, unsigned timeoutMs) {
@@ -470,10 +479,11 @@ bool udsEsp32EraseKeys(struct UDSEsp32* esp, unsigned timeoutMs) {
 	return _request(esp, UDS_ESP32_CMD_ERASE_KEYS, NULL, 0, timeoutMs) == 0;
 }
 
-int32_t udsEsp32GbStart(struct UDSEsp32* esp, bool log, const char title[UDS_ESP32_GB_TITLE], const uint16_t name[10], unsigned timeoutMs) {
+int32_t udsEsp32GbStart(struct UDSEsp32* esp, bool log, bool pico, const char title[UDS_ESP32_GB_TITLE], const uint16_t name[10],
+                        unsigned timeoutMs) {
 	uint8_t payload[1 + UDS_ESP32_GB_TITLE + 20];
 	memset(payload, 0, sizeof(payload));
-	payload[0] = log ? 1 : 0;
+	payload[0] = (log ? 1 : 0) | (pico ? 2 : 0);
 	size_t i;
 	for (i = 0; i < UDS_ESP32_GB_TITLE && title[i]; ++i) {
 		payload[1 + i] = (uint8_t) title[i];
@@ -525,6 +535,10 @@ bool udsEsp32GbTransfer(struct UDSEsp32* esp, uint8_t master, uint8_t* reply, ui
 		}
 	}
 	return false;
+}
+
+bool udsEsp32GbPico(struct UDSEsp32* esp, const uint8_t* frame, size_t length) {
+	return _send(esp, UDS_ESP32_CMD_GB_PICO, 0, frame, length);
 }
 
 const char* udsEsp32StatusText(int32_t result) {

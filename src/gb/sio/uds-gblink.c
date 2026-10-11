@@ -10,6 +10,7 @@
 #include <mgba/internal/gb/gb.h>
 #include <mgba/internal/gb/io.h>
 #include <mgba/internal/gb/sio/uds-cable.h>
+#include <mgba/internal/gb/sio/uds-clock.h>
 #include <mgba/internal/gb/sio/uds-esp32.h>
 #include <mgba/internal/gb/sio/uds-joiner.h>
 #include <mgba/internal/gb/sio/uds-keyfile.h>
@@ -24,6 +25,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <sched.h>
 #endif
 
 #define GBVC_POLL_CYCLES 4096 // about 1 ms
@@ -40,16 +43,28 @@
 #define GBVC_CLOCK_LOOP_CYCLES 105336
 #define GBVC_CLOCK_BYTE_CYCLES 4194 // 0.5 ms after each byte in PASS (MGBA_VCLINK_CLOCK_GAP_US changes it)
 #define GBVC_CLOCK_ROLE_CYCLES 8389 // 1 ms between our 01 offers while the cartridge alternates its clock
-// The Gen 2 Trade Center's mail (pokecrystal engine/link/link.asm, ExchangeBytes of wLinkSendMail): one exchange that is ignored, then
-// wLinkSendMailEnd - wLinkSendMail = 5 preamble + 6 x 33 messages + 6 x 14 metadata + 6 x 17 + 1 patch set = 390 stored. (Western
-// games; the Japanese ones have shorter mail.)
-#define GBVC_MAIL_EXCHANGES 391
-// Pico clock, mail hold: how many units we may run ahead of the 3DS before the clock waits (MGBA_VCLINK_PICO_MAIL_HOLD changes it, 0
-// turns the hold off; 32 is the value the mail tests passed with), and the longest the clock is held for one 3DS unit. The wire ends
-// a PASS after UDS_WIRE_GAP_MS without an exchange, so a hold never comes near that; at the cap the byte is clocked as without the hold.
-#define GBVC_MAIL_HOLD_AHEAD 32
-#define GBVC_MAIL_HOLD_MAX_MS 150
+// The rules of when to clock and what the wire sees, the Gen 2 mail and its hold are uds-clock.c's, shared with the board's firmware.
 #define GBVC_USING_INTERNAL_CLOCK 0x02
+// The GB-Link Pico's serial protocol (GBLink-Firmware 2.2.7: serialLayer, control.hpp, gb.cpp, linkStatus.hpp), which mGBA speaks
+// when it stands in for a Pico on the ESP32 board: | 47 42 | channel | length:u16 LE | payload |.
+#define GBVC_PICO_MAX_PAYLOAD 64
+#define GBVC_PICO_CHANNEL_COMMAND 0x00
+#define GBVC_PICO_CHANNEL_DATA 0x01
+#define GBVC_PICO_CHANNEL_STATUS 0x02
+#define GBVC_PICO_CMD_SET_MODE 0x00 // {mode}
+#define GBVC_PICO_CMD_CANCEL 0x01
+#define GBVC_PICO_MODE_GB_LINK 0x02
+#define GBVC_PICO_CMD_SET_TIMING 0x30 // {us between transfers:u24 LE, bytes per transfer:u8}
+#define GBVC_PICO_STATUS_GB_MODE_ACTIVE 0xFF0A
+#define GBVC_PICO_STATUS_GB_SESSION_FINISHED 0xFF0C
+// Standing in for a Pico, the emulated Game Boy is kept on real time, as a cartridge behind a real Pico is: mGBA otherwise runs a burst
+// of emulation and then sleeps until the next frame, and a byte the board sends meanwhile waits for the next burst. The cartridge then
+// saw about one clock every two frames, and a Gen 1 sync's last loop (ten frames, one 00 each, not waiting for the clock) lost most
+// of its zeros. The emulation may run this far ahead of real time before it waits. It never catches up: further behind than the
+// second value (the front end held the emulation thread, which happens for tens of milliseconds now and then) and it counts again
+// from there, since a catch-up runs frames at full speed with no clock in them (a 50 ms allowance cost a Gen 1 sync two of its zeros).
+#define GBVC_PICO_PACE_AHEAD_US 1000
+#define GBVC_PICO_PACE_BEHIND_US 2000
 
 struct VCAddr {
 	int bank;
@@ -121,31 +136,20 @@ struct GBVCLink {
 	int lastWirePhase;
 	unsigned wireExchanges;
 
-	// Slave cartridge (Local, see the header): the same wire, with the clock on our side (_clockPoll).
+	// Slave cartridge (Local, see the header): the same wire, with the clock on our side (_clockPoll); the rules are uds-clock.c's.
 	bool cartSlave;
+	struct UDSClock clock;
 	int32_t clockByteCycles; // the gap after each byte in PASS (the Pico's SetTimingConfig default, 1 ms)
 	int32_t clockWait; // cycles until the next exchange may be clocked
 	unsigned clockUnarmed; // exchanges skipped because the cartridge was not armed as slave
-	unsigned clockQuiet; // exchanges clocked but kept from the wire: empty both ways, or handshake leftovers in IDLE
 	uint32_t clockNoteMs; // when the clock's counts last went to the trace
-	unsigned clockRoleOffers; // our 01 offers that nobody took
-	unsigned clockMailExchanges; // exchanges given to the wire since its Gen 2 mail mode began
-	// Pico clock (on unless MGBA_VCLINK_PICO_CLOCK=0): clocks that found the cartridge unarmed or clocking itself, so it read FF and lost our byte.
-	// A real board cannot see these; they are counted here only to read the trace.
+	// Pico clock (on unless MGBA_VCLINK_PICO_CLOCK=0): clocks that found the cartridge unarmed or clocking itself, so it read FF
+	// and lost our byte. A real board cannot see these; they are counted here only to read the trace.
 	bool picoClock;
 	int32_t picoLatencyCycles;
 	unsigned picoMissed;
 	unsigned picoMissedInPhase[6];
 	unsigned picoMissedInBlock; // of those in PASS, the ones inside a block or the mail, which the wire stored as data
-	// Gen 2 mail with the Pico clock: how many of the cartridge's mail exchanges got a stand-in because the 3DS's unit was not there
-	// yet (the tail of the 3DS's mail is cut by as many), and the mail hold (mailHoldAhead units ahead of the 3DS, 0: off).
-	unsigned mailFills;
-	unsigned mailHoldAhead;
-	bool mailHolding;
-	uint32_t mailHoldSinceMs;
-	uint32_t mailHoldLongestMs;
-	unsigned mailHolds;
-	unsigned mailHoldCapped; // holds that reached GBVC_MAIL_HOLD_MAX_MS and clocked anyway
 	int clockUnarmedPhase; // the phase whose skips were last reported
 
 	// Board mode (GBVC_AIR_BOARD): the wrapper runs on the ESP32; the joiner, cable and wire above are not used.
@@ -159,6 +163,24 @@ struct GBVCLink {
 	uint16_t name[10];
 	uint8_t boardPhase; // the wire phase the board last reported
 	unsigned boardTimeouts;
+	// The GB-Link model on the board (firmware 1.6 on): the cartridge is the slave, mGBA stands in for a GB-Link Pico in Game Boy mode
+	// and the board drives the clock (uds-clock.c there). Wanted unless MGBA_VCLINK_CART=master; used if the firmware has it.
+	bool boardPicoWanted;
+	bool boardPico;
+	bool picoGbMode; // the board's SetMode put the Pico in Game Boy mode
+	uint32_t picoUsBetween; // SetTimingConfig: the Pico's wait after each chunk, before it answers
+	uint8_t picoBytesPer;
+	uint8_t picoReply[GBVC_PICO_MAX_PAYLOAD];
+	size_t picoReplyLength; // a reply waiting out picoUsBetween
+	int32_t picoReplyWait; // cycles left
+	unsigned picoBytes; // bytes clocked into the cartridge
+	unsigned picoUnarmed; // of those, the ones that found it unarmed (FF)
+	unsigned picoUnarmedInPass; // of those, the ones while the board's wire was in PASS (a block's bytes among them: damage)
+	bool paceValid; // the real-time lock (GBVC_PICO_PACE_*): where it started counting
+	uint64_t paceEmuBase;
+	uint64_t paceRealBaseUs;
+	uint64_t paceWaitedUs; // how long the emulation waited for real time
+	unsigned paceRestarts;
 
 	bool attachedDriver;
 	bool attachedModule;
@@ -186,6 +208,23 @@ struct GBVCLink {
 	const char* lastHookName;
 	FILE* trace;
 };
+
+static uint64_t _nowUs(void) {
+#ifdef _WIN32
+	static LARGE_INTEGER frequency;
+	if (!frequency.QuadPart) {
+		QueryPerformanceFrequency(&frequency);
+	}
+	LARGE_INTEGER counter;
+	QueryPerformanceCounter(&counter);
+	return (uint64_t) (counter.QuadPart / frequency.QuadPart) * 1000000ULL +
+	       (uint64_t) (counter.QuadPart % frequency.QuadPart) * 1000000ULL / (uint64_t) frequency.QuadPart;
+#else
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t) ts.tv_sec * 1000000ULL + (uint64_t) ts.tv_nsec / 1000ULL;
+#endif
+}
 
 static uint32_t _nowMs(void) {
 #ifdef _WIN32
@@ -451,27 +490,26 @@ static void _wirePoll(struct mTiming* timing, void* context, uint32_t cyclesLate
 
 // Slave cartridge: the wire above, with the clock on our side ----------------------------------------------------------------
 //
-// The Pokemon games treat a byte the same way in either role: their serial interrupt stores rSB as the byte received, loads the
-// next hSerialSendData into rSB and leaves FE (no data) behind (home/serial.asm, Serial; Gen 2 the same). Only two things differ:
-// the master starts every transfer (SC = 81), and in the handshake the side clocking offers 01 while the side waiting answers 02
-// (the status each takes is the byte it receives). So the wire (uds-wire.c) is used unchanged: the byte it would have the slave
-// shift out (udsWirePreload) is the byte we clock, the cartridge's reply is "the master's byte" (udsWireExchanged), and only the
-// handshake is turned round here. Whether the rest holds with the clock reversed is what the first traces are for: the trace's
-// "clock XX -> YY" lines are our byte, then the cartridge's.
+// uds-clock.c decides what to clock and what the wire sees (shared with the board's firmware, which clocks a Pico); this part is the
+// emulated cartridge's end of it: whether it is armed, and the shift itself. The trace's "clock XX -> YY" lines are our byte, then the
+// cartridge's.
 
 static uint8_t _clockWriteSC(struct GBSIODriver* driver, uint8_t value) {
 	UNUSED(driver);
 	return value; // the cartridge's own transfers (its internal-clock tries in the handshake) finish on the built-in shifter with FF
 }
 
-// A master Pokemon clocks once a frame in its sync, menu and idle loops and byte after byte in a block (Serial_ExchangeBytes). We
-// stay a little slower than the slave's frame loops (GBVC_CLOCK_LOOP_CYCLES); in a block it waits for every byte anyway.
+static void _clockTrace(void* context, const char* line) {
+	_trace(context, "%s", line);
+}
+
 static int32_t _clockGap(const struct GBVCLink* link) {
-	switch (link->wire.phase) {
-	case UDS_WIRE_ROLE:
+	switch (udsClockGap(&link->clock)) {
+	case UDS_CLOCK_GAP_ROLE:
 		return GBVC_CLOCK_ROLE_CYCLES;
-	case UDS_WIRE_PASS:
+	case UDS_CLOCK_GAP_BYTE:
 		return link->clockByteCycles;
+	case UDS_CLOCK_GAP_LOOP:
 	default:
 		return GBVC_CLOCK_LOOP_CYCLES;
 	}
@@ -485,17 +523,6 @@ static void _clockExchange(struct GBVCLink* link, uint32_t now) {
 	// GB-Link would read FF and the byte would be lost. Without the Pico clock the exchange is skipped instead (and counted), so
 	// that the wire is tested with the clock reversed and nothing else; with it, that is what happens.
 	const bool armed = (link->gb->memory.io[GB_REG_SC] & 0x81) == 0x80 && !sio->remainingBits;
-	// Where FF is data (Pico clock): inside a block, and inside the Gen 2 mail for as long as it lasts. The wire's mail mode ends
-	// only on a quiet gap, but the game's mail is exactly GBVC_MAIL_EXCHANGES exchanges; after them the cartridge is back in its
-	// menu, unarmed, and an FF is a clock nobody heard.
-	if (!link->wire.mailMode) {
-		link->clockMailExchanges = 0;
-		link->mailFills = link->mailHolds = link->mailHoldCapped = 0;
-		link->mailHoldLongestMs = 0;
-		link->mailHolding = false;
-	}
-	const bool mailOpen = link->wire.mailMode && link->clockMailExchanges < GBVC_MAIL_EXCHANGES;
-	const bool inBlock = phase == UDS_WIRE_PASS && (link->wire.blockStoring || mailOpen);
 	if (!armed && !link->picoClock) {
 		++link->clockUnarmed;
 		if (phase != UDS_WIRE_ROLE && link->clockUnarmedPhase != phase) {
@@ -505,36 +532,10 @@ static void _clockExchange(struct GBVCLink* link, uint32_t now) {
 		}
 		return;
 	}
-	const bool role = phase == UDS_WIRE_ROLE;
-	const uint8_t sent = role ? 0x01 : udsWirePreload(&link->wire);
-	const bool mailFill = mailOpen && link->wire.preloadFill;
-	if (mailFill && link->mailHoldAhead) {
-		// Mail hold. The 3DS sends its unit k only once our unit k has reached it, so a clock that runs on while its units are on
-		// the way gives the cartridge a stand-in for each ($20 ahead of the mail data, which costs as many bytes at the end of the
-		// mail; 00 after it, a damaged byte). A board decides when the Pico clocks, so it can wait instead: once we are
-		// mailHoldAhead units ahead (enough for the 3DS to go on with), and from the first byte of mail data on whenever we are
-		// ahead at all, the clock waits for the 3DS's unit. The cartridge waits armed for as long as it takes (its mail is a plain
-		// ExchangeBytes and the Trade Center's wLinkTimeoutFrames is 0).
-		const int ahead = (int) (link->wire.sentUnits - link->wire.recvUnits);
-		const int need = link->wire.mailData ? 1 : (int) link->mailHoldAhead;
-		if (ahead >= need) {
-			if (!link->mailHolding) {
-				link->mailHolding = true;
-				link->mailHoldSinceMs = now;
-				++link->mailHolds;
-			}
-			if (now - link->mailHoldSinceMs < GBVC_MAIL_HOLD_MAX_MS) {
-				link->clockWait = 0; // look again at the next poll
-				return;
-			}
-			++link->mailHoldCapped;
-		}
-	}
-	if (link->mailHolding) {
-		link->mailHolding = false;
-		if (now - link->mailHoldSinceMs > link->mailHoldLongestMs) {
-			link->mailHoldLongestMs = now - link->mailHoldSinceMs;
-		}
+	uint8_t sent;
+	if (!udsClockPrepare(&link->clock, now, &sent)) {
+		link->clockWait = 0; // the mail hold: look again at the next poll
+		return;
 	}
 	uint8_t reply;
 	if (!armed) {
@@ -543,7 +544,7 @@ static void _clockExchange(struct GBVCLink* link, uint32_t now) {
 		reply = 0xFF;
 		++link->picoMissed;
 		++link->picoMissedInPhase[phase];
-		if (inBlock) {
+		if (link->clock.inBlock) {
 			++link->picoMissedInBlock; // stored as data by the wire: a damaged block
 		}
 	} else if (link->picoClock) {
@@ -560,67 +561,8 @@ static void _clockExchange(struct GBVCLink* link, uint32_t now) {
 		mTimingDeschedule(&link->gb->timing, &sio->event);
 		mTimingSchedule(&link->gb->timing, &sio->event, 0);
 	}
-	if (!role) {
-		// A master cartridge clocks only when its code has a byte to exchange, and the wire reads its silences: a quiet gap is what
-		// ends a MENU or a PASS. We clock at a steady rate instead, so most clocks find the game outside its exchange routines and
-		// get FE back. When neither side had anything (our FE, its FE), a master would not have clocked at all: the wire does not
-		// see it, and its gap timers see the silence a master leaves. The handshake's own bytes (01, 02), which the cartridge's
-		// Cable Club code keeps loading while it waits, are stale in IDLE as 00 and FE already are.
-		// In MENU an FE from the cartridge is a clock that caught it between selections, not the end of the menu (a master never sends
-		// one there, which is why the wire reads it as the end). Both sides repeat their selection, so a lost or repeated one is harmless.
-		// In PASS likewise: the game is between exchanges (in a Time Capsule trade's menu, for one, while the wire still waits for a
-		// Gen 2 mail block that a Gen 1 partner never sends). A master would have stopped clocking, the wire's gap would end PASS and
-		// the selection's nybble sync would be seen. Our byte is not taken from the wire, so whatever it had is offered again.
-		const bool empty = sent == UDS_WIRE_NO_DATA && reply == UDS_WIRE_NO_DATA;
-		const bool handshake = phase == UDS_WIRE_IDLE && (reply == 0x01 || reply == 0x02);
-		const bool menuGap = phase == UDS_WIRE_MENU && reply == UDS_WIRE_NO_DATA;
-		const bool passGap = phase == UDS_WIRE_PASS && reply == UDS_WIRE_NO_DATA;
-		// Pico clock: an idle line reads FF, and the board cannot tell a cartridge that was not listening (Gen 2 is armed only
-		// inside an exchange call) from one that sent FF. Inside a block (and the Gen 2 mail) FF is data, a patched FE or a patch
-		// list's end, and the slave waits armed for every byte; anywhere else it is a clock nobody heard. Our byte was not taken.
-		const bool absent = link->picoClock && reply == 0xFF && !inBlock;
-		// Pico clock, in SYNC: an FE is a clock that caught the cartridge between its sync and the link menu (the byte it loaded for
-		// the menu not yet in rSB). The wire takes the first byte after the sync to decide what follows, and an FE there sent it to
-		// PASS instead of MENU: the 3DS never got our selection and stayed at "Please wait". The wire ignores FE everywhere else in
-		// SYNC, so only that decision changes; it waits for the cartridge's real byte.
-		const bool syncGap = link->picoClock && phase == UDS_WIRE_SYNC && reply == UDS_WIRE_NO_DATA;
-		if (empty || handshake || menuGap || passGap || absent || syncGap) {
-			++link->clockQuiet;
-			return;
-		}
-		udsWireExchanged(&link->wire, now, reply);
-		if (link->wire.mailMode) {
-			if (mailFill) {
-				++link->mailFills;
-			}
-			if (++link->clockMailExchanges == GBVC_MAIL_EXCHANGES && link->picoClock) {
-				if (link->mailHoldAhead) {
-					_trace(link, "mail done: %u of its %u exchanges got a stand-in for a 3DS unit not there yet; %u holds, the longest "
-					       "%u ms, %u of them clocked anyway at %u ms", link->mailFills, GBVC_MAIL_EXCHANGES, link->mailHolds,
-					       link->mailHoldLongestMs, link->mailHoldCapped, GBVC_MAIL_HOLD_MAX_MS);
-				} else {
-					_trace(link, "mail done: %u of its %u exchanges got a stand-in for a 3DS unit not there yet (the end of the 3DS's "
-					       "mail is cut by as many)", link->mailFills, GBVC_MAIL_EXCHANGES);
-				}
-			}
-		}
-	} else if (reply == 0x02) {
-		// ESTABLISH_CONNECTION_WITH_EXTERNAL_CLOCK: the cartridge takes the slave's part. The wire leaves ROLE as if a master
-		// cartridge had offered 01 to it.
-		udsWireExchanged(&link->wire, now, 0x01);
-		_trace(link, "clock: the cartridge answered 02, it is the slave");
-	} else {
-		// An offer nobody took (the cartridge is clocking its own try, or not armed): not an exchange, and kept out of the trace's
-		// budget after the first few so that what follows the handshake is recorded.
-		if (link->trace && ++link->clockRoleOffers <= 16) {
-			_trace(link, "clock %02X -> %02X [role]", sent, reply);
-		}
-		return;
-	}
-	++link->wireExchanges;
-	if (link->trace && link->wireExchanges <= 8000) {
-		_trace(link, "clock %02X -> %02X [%s]", sent, reply, kWirePhases[link->wire.phase]);
-	}
+	udsClockExchanged(&link->clock, now, reply);
+	link->wireExchanges = link->clock.exchanges; // for the heartbeat
 }
 
 static void _clockPoll(struct mTiming* timing, void* context, uint32_t cyclesLate) {
@@ -645,11 +587,11 @@ static void _clockPoll(struct mTiming* timing, void* context, uint32_t cyclesLat
 			const unsigned* m = link->picoMissedInPhase;
 			_trace(link, "clock (Pico): %u exchanges to the wire, %u kept from it; %u read FF with the cartridge unarmed (role %u, idle %u, "
 			       "sync %u, menu %u, pass %u of which %u inside a block; a real board cannot see these)",
-			       link->wireExchanges, link->clockQuiet, link->picoMissed, m[UDS_WIRE_ROLE], m[UDS_WIRE_IDLE], m[UDS_WIRE_SYNC],
+			       link->wireExchanges, link->clock.quiet, link->picoMissed, m[UDS_WIRE_ROLE], m[UDS_WIRE_IDLE], m[UDS_WIRE_SYNC],
 			       m[UDS_WIRE_MENU], m[UDS_WIRE_PASS], link->picoMissedInBlock);
 		} else {
 			_trace(link, "clock: %u exchanges to the wire, %u kept from it (empty or handshake leftovers), %u skipped (not armed)",
-			       link->wireExchanges, link->clockQuiet, link->clockUnarmed);
+			       link->wireExchanges, link->clock.quiet, link->clockUnarmed);
 		}
 	}
 
@@ -721,6 +663,139 @@ static void _boardStats(void* context, const uint32_t stats[UDS_ESP32_GB_STATS])
 	       (unsigned) stats[6], (unsigned) stats[7], (unsigned) stats[8], (unsigned) stats[9]);
 }
 
+// The virtual GB-Link Pico ----------------------------------------------------------------------------------------------------
+//
+// With firmware 1.6 the board clocks the cartridge as a GB-Link's ESP32 clocks its Pico: it asks for Game Boy mode, sets the timing and
+// then sends the bytes to clock, one frame at a time; the Pico shifts each into the cartridge (its SPI is master only, and it cannot
+// see whether the cartridge is armed: an unarmed one leaves the line idle, FF) and answers with what came back. Here the shift is the
+// same instant one as the Local Pico clock's, done when the frame is read, which is at the next poll of the emulated time.
+
+static void _picoSend(struct GBVCLink* link, uint8_t channel, const uint8_t* payload, size_t length) {
+	uint8_t frame[5 + GBVC_PICO_MAX_PAYLOAD];
+	frame[0] = 0x47;
+	frame[1] = 0x42;
+	frame[2] = channel;
+	frame[3] = (uint8_t) length;
+	frame[4] = (uint8_t) (length >> 8);
+	memcpy(&frame[5], payload, length);
+	udsEsp32GbPico(&link->esp, frame, 5 + length);
+}
+
+static void _picoStatus(struct GBVCLink* link, uint16_t status) {
+	const uint8_t payload[2] = {(uint8_t) status, (uint8_t) (status >> 8)};
+	_picoSend(link, GBVC_PICO_CHANNEL_STATUS, payload, sizeof(payload));
+}
+
+static uint8_t _picoShift(struct GBVCLink* link, uint8_t byte) {
+	++link->picoBytes;
+	if ((link->gb->memory.io[GB_REG_SC] & 0x81) != 0x80 || link->gb->sio.remainingBits) {
+		++link->picoUnarmed; // nobody shifts on the other end: the line reads FF and the byte is lost
+		if (link->boardPhase == UDS_WIRE_PASS) {
+			++link->picoUnarmedInPass;
+		}
+		return 0xFF;
+	}
+	uint8_t reply = link->gb->memory.io[GB_REG_SB];
+	link->gb->memory.io[GB_REG_SB] = byte;
+	link->gb->memory.io[GB_REG_SC] = GBRegisterSCClearEnable(link->gb->memory.io[GB_REG_SC]);
+	link->gb->memory.io[GB_REG_IF] |= 1 << GB_IRQ_SIO;
+	GBUpdateIRQs(link->gb);
+	return reply;
+}
+
+static void _boardPico(void* context, const uint8_t* frame, size_t length) {
+	struct GBVCLink* link = context;
+	if (!link->boardPico || length < 5 || frame[0] != 0x47 || frame[1] != 0x42) {
+		return;
+	}
+	size_t size = frame[3] | ((size_t) frame[4] << 8);
+	if (size > length - 5 || size > GBVC_PICO_MAX_PAYLOAD) {
+		return;
+	}
+	const uint8_t* p = &frame[5];
+	if (frame[2] == GBVC_PICO_CHANNEL_COMMAND && size) {
+		if (p[0] == GBVC_PICO_CMD_SET_MODE && size >= 2) {
+			if (link->picoGbMode) {
+				_picoStatus(link, GBVC_PICO_STATUS_GB_SESSION_FINISHED); // a new mode ends the running one
+			}
+			link->picoGbMode = p[1] == GBVC_PICO_MODE_GB_LINK;
+			link->paceValid = false;
+			link->picoUsBetween = 1000; // a new Game Boy module's defaults
+			link->picoBytesPer = 1;
+			link->picoReplyLength = 0;
+			if (link->picoGbMode) {
+				_picoStatus(link, GBVC_PICO_STATUS_GB_MODE_ACTIVE);
+				_trace(link, "pico: Game Boy mode (the board drives the clock)");
+			} else {
+				_trace(link, "pico: the board asked for mode %02X; only Game Boy mode is stood in for", p[1]);
+			}
+		} else if (p[0] == GBVC_PICO_CMD_CANCEL) {
+			if (link->picoGbMode) {
+				link->picoGbMode = false;
+				link->picoReplyLength = 0;
+				_picoStatus(link, GBVC_PICO_STATUS_GB_SESSION_FINISHED);
+				_trace(link, "pico: left Game Boy mode");
+			}
+		} else if (p[0] == GBVC_PICO_CMD_SET_TIMING && size >= 5 && link->picoGbMode) {
+			link->picoUsBetween = p[1] | ((uint32_t) p[2] << 8) | ((uint32_t) p[3] << 16);
+			link->picoBytesPer = p[4] ? p[4] : 1;
+			_trace(link, "pico: timing %u us after every %u bytes", (unsigned) link->picoUsBetween, link->picoBytesPer);
+		}
+		return;
+	}
+	if (frame[2] == GBVC_PICO_CHANNEL_DATA && size && link->picoGbMode) {
+		// The Pico shifts a frame's bytes back to back (a chunk at a time), so after the first the cartridge has had no time to re-arm.
+		size_t i;
+		for (i = 0; i < size; ++i) {
+			link->picoReply[i] = _picoShift(link, p[i]);
+		}
+		size_t chunks = (size + link->picoBytesPer - 1) / link->picoBytesPer;
+		uint64_t waitUs = (uint64_t) chunks * link->picoUsBetween;
+		if (!waitUs) {
+			_picoSend(link, GBVC_PICO_CHANNEL_DATA, link->picoReply, size);
+		} else {
+			link->picoReplyLength = size; // sent once the wait is over (_boardPoll)
+			link->picoReplyWait = (int32_t) (waitUs * GBVC_CLOCK_TICKS_PER_SECOND / 1000000ULL);
+		}
+	}
+}
+
+// The real-time lock (GBVC_PICO_PACE_*). The board is not read while the emulation waits: its time stands still meanwhile, and a byte
+// shifted then would come right behind the last one, before the cartridge has re-armed (it reads FF; in a block that is stored as
+// data, which damaged a trade). A byte that arrives during the wait is shifted at the first poll after it.
+static void _picoPace(struct GBVCLink* link) {
+	const uint64_t emu = mTimingGlobalTime(&link->gb->timing);
+	uint64_t real = _nowUs();
+	if (!link->paceValid) {
+		link->paceValid = true;
+		link->paceEmuBase = emu;
+		link->paceRealBaseUs = real;
+		return;
+	}
+	const int64_t emuUs = (int64_t) ((emu - link->paceEmuBase) * 1000000ULL / GBVC_CLOCK_TICKS_PER_SECOND);
+	int64_t ahead = emuUs - (int64_t) (real - link->paceRealBaseUs);
+	if (ahead < -GBVC_PICO_PACE_BEHIND_US) {
+		link->paceEmuBase = emu;
+		link->paceRealBaseUs = real;
+		++link->paceRestarts;
+		return;
+	}
+	if (ahead <= GBVC_PICO_PACE_AHEAD_US) {
+		return;
+	}
+	const uint64_t start = real;
+	while (ahead > 0) {
+#ifdef _WIN32
+		Sleep(0); // a sleep on Windows lasts a scheduler tick, about 15 ms: give the core up instead
+#else
+		sched_yield();
+#endif
+		real = _nowUs();
+		ahead = emuUs - (int64_t) (real - link->paceRealBaseUs);
+	}
+	link->paceWaitedUs += real - start;
+}
+
 // Brings the board up: called from the poll until it runs. The waits inside are short (the board answers in milliseconds).
 static void _boardStep(struct GBVCLink* link, uint32_t now) {
 	switch (link->boardState) {
@@ -730,6 +805,17 @@ static void _boardStep(struct GBVCLink* link, uint32_t now) {
 			if (!udsEsp32HasGbWrapper(&link->esp)) {
 				_boardFail(link, "the board's firmware has no Game Boy wrapper: flash esp32-uds-bridge 1.4 or later (uds-esp32-setup does it)");
 				return;
+			}
+			if (link->boardPicoWanted && udsEsp32HasGbPico(&link->esp)) {
+				link->boardPico = true;
+				mLOG(GB_SIO, INFO, "Virtual Console (board): the cartridge is the slave behind a virtual GB-Link Pico; the board drives the clock");
+				_trace(link, "board: the cartridge is the slave, mGBA stands in for a GB-Link Pico and the board drives the clock");
+			} else if (link->boardPicoWanted) {
+				mLOG(GB_SIO, INFO, "Virtual Console (board): firmware %u.%u has no Pico mode, so the cartridge is the master; flash 1.6 or later for the GB-Link model",
+				     link->esp.info.major, link->esp.info.minor);
+				_trace(link, "board: firmware %u.%u has no Pico mode: the master cartridge", link->esp.info.major, link->esp.info.minor);
+			} else {
+				_trace(link, "board: the master cartridge (MGBA_VCLINK_CART=master)");
 			}
 			link->boardState = BOARD_KEY;
 		} else if (now - link->boardSinceMs > BOARD_BOOT_MS) {
@@ -769,7 +855,7 @@ static void _boardStep(struct GBVCLink* link, uint32_t now) {
 		return;
 	}
 	case BOARD_START: {
-		int32_t result = udsEsp32GbStart(&link->esp, link->trace != NULL, link->boardTitle, link->name, 2000);
+		int32_t result = udsEsp32GbStart(&link->esp, link->trace != NULL, link->boardPico, link->boardTitle, link->name, 2000);
 		if (result != 0) {
 			char why[200];
 			snprintf(why, sizeof(why), "the board's wrapper did not start: %s", udsEsp32GbStartText(result));
@@ -789,6 +875,15 @@ static void _boardStep(struct GBVCLink* link, uint32_t now) {
 static void _boardPoll(struct mTiming* timing, void* context, uint32_t cyclesLate) {
 	struct GBVCLink* link = context;
 	uint32_t now = _nowMs() - link->startMs;
+	// Standing in for a Pico, the board's frames are answered as soon as the emulated time reaches them: poll as the Local clock does.
+	const int32_t interval = link->boardPico ? GBVC_CLOCK_POLL_CYCLES : GBVC_POLL_CYCLES;
+	if (link->picoReplyLength && (link->picoReplyWait -= interval) <= 0) {
+		_picoSend(link, GBVC_PICO_CHANNEL_DATA, link->picoReply, link->picoReplyLength);
+		link->picoReplyLength = 0;
+	}
+	if (link->boardPico && link->picoGbMode && link->boardState != BOARD_FAILED) {
+		_picoPace(link);
+	}
 	if (link->boardState != BOARD_FAILED) {
 		if (!udsEsp32Poll(&link->esp)) {
 			_boardFail(link, "the serial port failed (is the board still plugged in?)");
@@ -803,8 +898,14 @@ static void _boardPoll(struct mTiming* timing, void* context, uint32_t cyclesLat
 		       link->gb->memory.currentBank, cpu->pc, _read8(link, link->game->curMap), _read8(link, link->game->linkState),
 		       _read8(link, link->game->connectionStatus), link->boardState,
 		       link->boardPhase <= UDS_WIRE_PASS ? kWirePhases[link->boardPhase] : "?", link->wireExchanges, link->boardTimeouts);
+		if (link->boardPico) {
+			_trace(link, "pico: %s, %u bytes clocked into the cartridge, %u of them found it unarmed (FF), %u of those in PASS; the "
+			       "emulation waited %u ms for real time, %u restarts of the count", link->picoGbMode ? "Game Boy mode" : "no mode yet",
+			       link->picoBytes, link->picoUnarmed, link->picoUnarmedInPass, (unsigned) (link->paceWaitedUs / 1000),
+			       link->paceRestarts);
+		}
 	}
-	mTimingSchedule(timing, &link->event, GBVC_POLL_CYCLES - cyclesLate);
+	mTimingSchedule(timing, &link->event, interval - cyclesLate);
 }
 
 // The cartridge started a transfer as master: the board answers with the slave's byte for this same transfer. The emulator waits for
@@ -812,6 +913,9 @@ static void _boardPoll(struct mTiming* timing, void* context, uint32_t cyclesLat
 // line is idle (FF).
 static uint8_t _boardWriteSC(struct GBSIODriver* driver, uint8_t value) {
 	struct GBVCLink* link = (struct GBVCLink*) driver;
+	if (link->boardPico) {
+		return value; // behind a Pico the cartridge's own tries (the handshake) finish on the built-in shifter with FF, as on Local
+	}
 	if ((value & 0x81) == 0x81) {
 		uint8_t master = link->gb->memory.io[GB_REG_SB];
 		uint8_t reply = UDS_WIRE_IDLE_LINE;
@@ -1077,13 +1181,6 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 			latencyUs = (unsigned) strtoul(latencyEnv, NULL, 10);
 		}
 		link->picoLatencyCycles = (int32_t) (latencyUs * GBVC_CLOCK_TICKS_PER_SECOND / 1000000ULL);
-		if (link->picoClock) {
-			link->mailHoldAhead = GBVC_MAIL_HOLD_AHEAD;
-			const char* holdEnv = getenv("MGBA_VCLINK_PICO_MAIL_HOLD");
-			if (holdEnv && *holdEnv) {
-				link->mailHoldAhead = (unsigned) strtoul(holdEnv, NULL, 10);
-			}
-		}
 	}
 	if (wire) {
 		udsWireInit(&link->wire, &(struct UDSUnitPort) {
@@ -1098,6 +1195,15 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 		});
 		udsWireSetGeneration(&link->wire, game->gen2 ? 2 : 1);
 		udsWireSetCartEcho(&link->wire, true); // a menu the cartridge chose first reaches the 3DS, whichever side clocks
+		if (cartSlave) {
+			// The mail hold is a Pico rule: udsClockInit leaves it off without the Pico clock.
+			unsigned holdAhead = UDS_CLOCK_MAIL_HOLD_AHEAD;
+			const char* holdEnv = getenv("MGBA_VCLINK_PICO_MAIL_HOLD");
+			if (holdEnv && *holdEnv) {
+				holdAhead = (unsigned) strtoul(holdEnv, NULL, 10);
+			}
+			udsClockInit(&link->clock, &link->wire, link->picoClock, holdAhead);
+		}
 	}
 	udsCableInit(&link->cable, &(struct UDSUnitPort) {
 		.context = link,
@@ -1129,8 +1235,9 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 			strncpy(link->keyPath, config->keyPath, sizeof(link->keyPath) - 1);
 		}
 		struct UDSEsp32Handlers handlers = {
-			.context = link, .log = _boardLog, .gbState = _boardState, .gbStats = _boardStats,
+			.context = link, .log = _boardLog, .gbState = _boardState, .gbStats = _boardStats, .gbPico = _boardPico,
 		};
+		link->boardPicoWanted = !(cartEnv && !strcmp(cartEnv, "master"));
 		if (!udsEsp32Open(&link->esp, config->portName, &handlers)) {
 			mLOG(GB_SIO, ERROR, "Virtual Console (board): no ESP32 board found%s%s", config->portName && *config->portName ? " on " : "",
 			     config->portName && *config->portName ? config->portName : "");
@@ -1190,6 +1297,9 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 		// The same wire, with the clock on our side (see _clockPoll). The cartridge's own transfers are left to the built-in
 		// shifter, which finishes them with FF: as on a real cable, a side that clocks with no master opposite hears nobody.
 		link->d.writeSC = _clockWriteSC;
+		if (link->trace) {
+			udsClockSetTrace(&link->clock, _clockTrace, link);
+		}
 		GBSIOSetDriver(&link->gb->sio, &link->d);
 		link->attachedDriver = true;
 		link->event.context = link;
@@ -1202,8 +1312,8 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 		_trace(link, "created for %s, wire mode, slave cartridge: clock gap %u cycles per byte%s (+%u cycles of UART latency)", game->title,
 		       (unsigned) link->clockByteCycles, link->picoClock ? ", Pico clock" : "",
 		       link->picoClock ? (unsigned) link->picoLatencyCycles : 0u);
-		if (link->mailHoldAhead) {
-			_trace(link, "mail hold: on, up to %u units ahead of the 3DS", link->mailHoldAhead);
+		if (link->clock.mailHoldAhead) {
+			_trace(link, "mail hold: on, up to %u units ahead of the 3DS", link->clock.mailHoldAhead);
 		}
 		return link;
 	}

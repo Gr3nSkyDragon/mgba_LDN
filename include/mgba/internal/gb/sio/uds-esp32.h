@@ -54,6 +54,8 @@ enum UDSEsp32Command {
 	UDS_ESP32_CMD_GB_START = 0x10,
 	UDS_ESP32_CMD_GB_XFER = 0x11,
 	UDS_ESP32_CMD_GB_STOP = 0x12,
+	// Firmware 1.6 on: a frame of the GB-Link Pico's serial protocol from the Pico mGBA stands in for (see udsEsp32GbPico).
+	UDS_ESP32_CMD_GB_PICO = 0x13,
 };
 
 enum UDSEsp32Event {
@@ -68,6 +70,7 @@ enum UDSEsp32Event {
 	UDS_ESP32_EVT_GB_STATE = 0x90,
 	UDS_ESP32_EVT_GB_REPLY = 0x91,
 	UDS_ESP32_EVT_GB_STATS = 0x92,
+	UDS_ESP32_EVT_GB_PICO = 0x93, // a Pico frame to the Pico: the board drives the clock
 };
 
 #define UDS_ESP32_KEY_SLOT_DATA 0x2D // the 3DS UDS data key the board's wrapper needs
@@ -133,6 +136,9 @@ struct UDSEsp32Handlers {
 	// The wrapper on the board: its state changed (room, session, wire phase, generation, channel), or its 5-second counters.
 	void (*gbState)(void* context, const uint8_t state[5]);
 	void (*gbStats)(void* context, const uint32_t stats[UDS_ESP32_GB_STATS]);
+	// Firmware 1.6 on, the wrapper started with `pico`: a frame of the GB-Link Pico's protocol (| 47 42 | channel | length:u16 LE |
+	// payload |) for the Pico mGBA stands in for.
+	void (*gbPico)(void* context, const uint8_t* frame, size_t length);
 };
 
 struct Esp32Serial;
@@ -183,19 +189,26 @@ bool udsEsp32Ping(struct UDSEsp32* esp, uint32_t token);
 
 // Firmware 1.4 on. These wait for the board's answer (up to `timeoutMs`), polling the port meanwhile.
 bool udsEsp32HasGbWrapper(const struct UDSEsp32* esp); // the HelloAck says 1.4 or later
+// The HelloAck says 1.6 or later: the wrapper can drive the clock of a cartridge behind a GB-Link Pico (udsEsp32GbStart's `pico`).
+bool udsEsp32HasGbPico(const struct UDSEsp32* esp);
 // Stores a key in the board's flash (the board never sends it back). True when the board says it is stored.
 bool udsEsp32SetKey(struct UDSEsp32* esp, uint8_t slot, const uint8_t key[16], unsigned timeoutMs);
 // Whether the board holds the UDS data key. -1: no answer.
 int udsEsp32KeyStatus(struct UDSEsp32* esp, unsigned timeoutMs);
 bool udsEsp32EraseKeys(struct UDSEsp32* esp, unsigned timeoutMs);
 // Starts the board's Game Boy wrapper for the cartridge with this header title (0x134, up to 16 characters) and player name. The result
-// is the board's status (0 ok; see udsEsp32GbStartText), or -1 for no answer.
-int32_t udsEsp32GbStart(struct UDSEsp32* esp, bool log, const char title[UDS_ESP32_GB_TITLE], const uint16_t name[10], unsigned timeoutMs);
+// is the board's status (0 ok; see udsEsp32GbStartText), or -1 for no answer. `pico` (firmware 1.6 on): the cartridge is the slave
+// behind a GB-Link Pico that this side stands in for; the board drives the clock with gbPico frames, answered by udsEsp32GbPico.
+// Without it the cartridge is the master and each transfer goes to udsEsp32GbTransfer.
+int32_t udsEsp32GbStart(struct UDSEsp32* esp, bool log, bool pico, const char title[UDS_ESP32_GB_TITLE], const uint16_t name[10],
+                        unsigned timeoutMs);
 const char* udsEsp32GbStartText(int32_t result);
 bool udsEsp32GbStop(struct UDSEsp32* esp, unsigned timeoutMs);
 // One transfer the cartridge clocked out as master: `master` goes to the board, the byte the slave shifts back comes into *reply. False if
 // the board did not answer in time.
 bool udsEsp32GbTransfer(struct UDSEsp32* esp, uint8_t master, uint8_t* reply, uint8_t* phase, unsigned timeoutMs);
+// A frame of the Pico's protocol to the board (the Pico's status, or the bytes it shifted in). Not waited for.
+bool udsEsp32GbPico(struct UDSEsp32* esp, const uint8_t* frame, size_t length);
 
 const char* udsEsp32StatusText(int32_t result);
 
