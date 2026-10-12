@@ -70,8 +70,8 @@ static bool gRfuAttached;
 static char gTracePath[512];
 static char gSaveDir[512];
 
-// The RFU Cable Wrapper ("Cable adapter"): a cable-only game (Ruby/Sapphire) gets a virtual cable partner whose other end
-// is an FRLG leader reached through the same ESP32 backend. It takes the game's link port like the adapter does.
+// The RFU Cable Wrapper: a cable-only game (Ruby/Sapphire) gets a virtual cable partner whose other end is an FRLG leader reached
+// through the same ESP32 backend. It takes the game's link port like the adapter does. Chosen by the game, as on the desktop.
 static struct GBASIORFUWrapper gWrapper;
 static bool gWrapperAttached;
 static bool gWrapperTraceHeld;
@@ -142,6 +142,17 @@ static bool _attachVc(void) {
 
 static bool _isGameBoy(void) {
 	return gCore && gCore->platform(gCore) == mPLATFORM_GB;
+}
+
+// Ruby and Sapphire have only the link cable, so they get the wrapper instead of the adapter (CoreController::rfuCableOnlyGame).
+// Any language (AXVx Ruby, AXPx Sapphire).
+static bool _isCableOnlyGame(void) {
+	if (!gCore || gCore->platform(gCore) != mPLATFORM_GBA) {
+		return false;
+	}
+	struct mGameInfo info;
+	gCore->getGameInfo(gCore, &info);
+	return !strncmp(info.code, "AXV", 3) || !strncmp(info.code, "AXP", 3);
 }
 
 static void _detachAdapter(void) {
@@ -394,8 +405,8 @@ JNIEXPORT void JNICALL Java_io_mgbaldn_gba_Native_setTrace(JNIEnv* env, jclass c
 	(*env)->ReleaseStringUTFChars(env, path, text);
 }
 
-// 0 = nothing, 1 = wireless adapter (ESP32), 2 = cable adapter (RFU cable wrapper over the ESP32). Called between frames
-// (Java takes care of that), like the desktop menu's switching. On a Game Boy game 1 is the Virtual Console link and 2 is nothing.
+// 0 = nothing, 1 = ESP32. Called between frames (Java takes care of that), like the desktop menu's switching. The game decides what
+// the ESP32 is: the Virtual Console link for a Game Boy game, the cable wrapper for Ruby/Sapphire, the wireless adapter otherwise.
 JNIEXPORT jboolean JNICALL Java_io_mgbaldn_gba_Native_setAdapter(JNIEnv* env, jclass clazz, jint mode) {
 	(void) env;
 	(void) clazz;
@@ -404,7 +415,7 @@ JNIEXPORT jboolean JNICALL Java_io_mgbaldn_gba_Native_setAdapter(JNIEnv* env, jc
 		_detachAdapter();
 		return mode == 1 ? (_attachVc() ? JNI_TRUE : JNI_FALSE) : JNI_TRUE;
 	}
-	if (mode == 2) {
+	if (mode == 1 && _isCableOnlyGame()) {
 		_detachAdapter();
 		return _attachWrapper("esp32") ? JNI_TRUE : JNI_FALSE;
 	}

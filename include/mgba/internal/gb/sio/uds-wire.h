@@ -88,6 +88,7 @@ struct UDSWire {
 	uint8_t cartNybble; // the nybble the cartridge is syncing
 	uint8_t syncHigh; // and its high nybble: 60 in Gen 1; Gen 2 uses 60, 70 (Trade Center) or 80 (Colosseum) by link mode
 	bool gen2; // Gen 2 syncs are recognised in all three ranges
+	bool genDetect; // the generation is not known yet: the cartridge's first sync tells it (udsWireSetGeneration 0)
 	int hostNybble; // the 3DS's nybble, -1 until its 6x unit has been read
 	bool syncDone; // the 3DS side of the sync has finished
 	enum UDSWireSyncPart syncPart;
@@ -163,7 +164,13 @@ struct UDSWire {
 
 void udsWireInit(struct UDSWire* wire, const struct UDSUnitPort* port);
 // 2 makes syncs in the 70 and 80 ranges count as syncs too (Gen 2 picks the range by link mode); 1 (the default) only 60.
+// 0: not known (a cartridge behind a GB-Link, whose header nobody can read). The cartridge's first sync tells it: the Cable Club
+// receptionist's is 60 in Gen 1 (pokered cable_club_npc.asm: nybble 0) and 61 in Gen 2 (CheckLinkTimeout_Receptionist sets link
+// action 1 before any room's range is chosen, Time Capsule included), and a 70 or 80 range is Gen 2's alone. Nothing before that
+// sync depends on the generation. Until it is known the wire behaves as Gen 1 but recognises the 70 and 80 ranges.
 void udsWireSetGeneration(struct UDSWire* wire, int generation);
+// 1 or 2, or 0 while it is still to be detected.
+int udsWireGeneration(const struct UDSWire* wire);
 
 // Off by default. On, a menu the cartridge chose first is echoed to the 3DS as the 3DS's own choice is echoed to the cartridge: a
 // Gen 1 game that pressed A while its partner had not uses its own selection and leaves the menu at once (LinkMenu,

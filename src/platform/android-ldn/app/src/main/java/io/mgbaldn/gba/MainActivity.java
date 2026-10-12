@@ -45,8 +45,7 @@ public class MainActivity extends Activity implements UsbLink.Logger {
     private static final String ACTION_PERMISSION = "io.mgbaldn.gba.USB_PERMISSION";
     private static final int[] DEFAULT_COLORS = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
     private static final int ADAPTER_OFF = 0;
-    private static final int ADAPTER_ESP32 = 1;
-    private static final int ADAPTER_CABLE = 2; // the RFU Cable Wrapper over the ESP32 (Ruby/Sapphire with a cable-only link)
+    private static final int ADAPTER_ESP32 = 1; // the game decides: Virtual Console link, cable wrapper (Ruby/Sapphire) or wireless adapter
 
     private GameView gameView;
     private Emulator emulator;
@@ -150,7 +149,7 @@ public class MainActivity extends Activity implements UsbLink.Logger {
             registerReceiver(usbReceiver, filter);
         }
 
-        adapter = prefs.getInt("adapter", ADAPTER_OFF);
+        adapter = Math.min(prefs.getInt("adapter", ADAPTER_OFF), ADAPTER_ESP32); // (an older build had a separate cable adapter, 2)
         showFps = prefs.getBoolean("showFps", true);
         showFrameCounter = prefs.getBoolean("showFrameCounter", false);
         colorMode = Math.min(prefs.getInt("colorMode", GameView.MODE_ORIGINAL), GameView.MODE_NAMES.length - 1); // (an older build had a sixth mode)
@@ -920,7 +919,7 @@ public class MainActivity extends Activity implements UsbLink.Logger {
     }
 
     private void chooseAdapter() {
-        String[] names = {"Off", "ESP32 (USB board: Switch LDN for GBA games, 3DS UDS bridge for Game Boy)", "Cable adapter (Ruby/Sapphire, ESP32)"};
+        String[] names = {"Off", "ESP32"};
         new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert).setTitle("Wireless adapter")
                 .setSingleChoiceItems(names, adapter, (dialog, which) -> {
                     adapter = which;
@@ -944,7 +943,7 @@ public class MainActivity extends Activity implements UsbLink.Logger {
                 .setMessage("mGBA with Wireless Adapter support, for trading Generation 3 games with a Nintendo Switch through "
                         + "an ESP32 using GB-Link Switch LDN firmware.\n\nWireless adapter (FireRed/LeafGreen, Emerald): with board "
                         + "firmware 2.1 or later either side can lead the group in the Wireless Club > Direct Corner; earlier firmware needs "
-                        + "the Switch to host.\nCable adapter (Ruby/Sapphire): the Switch must host.\n\nGame Boy (Red, Blue, Yellow, Gold, "
+                        + "the Switch to host.\nRuby/Sapphire (the cable wrapper, chosen automatically): the Switch must host.\n\nGame Boy (Red, Blue, Yellow, Gold, "
                         + "Silver, Crystal): ESP32 trades with the Virtual Console on a 3DS. The board must run Azahar's esp32-uds-bridge "
                         + "firmware 1.4 or later with the 3DS key already stored on it (from the desktop build or uds-esp32-probe "
                         + "--store-key).\n\nDo not use "

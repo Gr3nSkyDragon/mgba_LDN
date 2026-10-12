@@ -25,7 +25,7 @@ static void _trace(struct UDSWire* wire, const char* format, ...) {
 
 static bool _isSync(const struct UDSWire* wire, uint8_t byte) {
 	uint8_t high = byte & 0xF0;
-	return high == 0x60 || (wire->gen2 && (high == 0x70 || high == 0x80));
+	return high == 0x60 || ((wire->gen2 || wire->genDetect) && (high == 0x70 || high == 0x80));
 }
 
 static bool _isMenu(uint8_t byte) {
@@ -154,6 +154,28 @@ void udsWireInit(struct UDSWire* wire, const struct UDSUnitPort* port) {
 
 void udsWireSetGeneration(struct UDSWire* wire, int generation) {
 	wire->gen2 = generation == 2;
+	wire->genDetect = generation == 0;
+}
+
+int udsWireGeneration(const struct UDSWire* wire) {
+	return wire->genDetect ? 0 : wire->gen2 ? 2 : 1;
+}
+
+// The generation from the cartridge's first sync (see udsWireSetGeneration). A 6x with another nybble (a sync seen first after the
+// room was entered, as when the board started midway) does not tell: the next one may.
+static void _detectGeneration(struct UDSWire* wire, uint8_t byte) {
+	const uint8_t high = byte & 0xF0;
+	const uint8_t nybble = byte & 0x0F;
+	if (high == 0x70 || high == 0x80 || (high == 0x60 && nybble == 1)) {
+		wire->gen2 = true;
+	} else if (high == 0x60 && nybble == 0) {
+		wire->gen2 = false;
+	} else {
+		_trace(wire, "generation: the cartridge's sync %02X does not tell it yet", byte);
+		return;
+	}
+	wire->genDetect = false;
+	_trace(wire, "generation: the cartridge's first sync is %02X: Gen %d", byte, wire->gen2 ? 2 : 1);
 }
 
 void udsWireSetCartEcho(struct UDSWire* wire, bool enabled) {
@@ -577,6 +599,9 @@ static void _enterPass(struct UDSWire* wire) {
 }
 
 static void _startSync(struct UDSWire* wire, uint32_t nowMs, uint8_t byte, uint8_t stale) {
+	if (wire->genDetect) {
+		_detectGeneration(wire, byte);
+	}
 	wire->phase = UDS_WIRE_SYNC;
 	wire->cartNybble = byte & 0x0F;
 	wire->syncHigh = byte & 0xF0;

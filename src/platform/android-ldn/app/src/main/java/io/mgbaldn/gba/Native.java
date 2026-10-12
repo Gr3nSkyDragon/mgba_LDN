@@ -39,8 +39,8 @@ final class Native {
     static native void traceNote(String note);
 
     /**
-     * 0 = no adapter, 1 = wireless adapter (ESP32), 2 = cable adapter (RFU cable wrapper over the ESP32). On a Game Boy game 1 is
-     * the Virtual Console link to a retail 3DS (the board runs Azahar's esp32-uds-bridge 1.4 or later) and 2 is nothing.
+     * 0 = no adapter, 1 = ESP32. The game decides what the ESP32 is: on a Game Boy game the Virtual Console link to a retail 3DS (the
+     * board runs Azahar's esp32-uds-bridge 1.4 or later), on Ruby/Sapphire the RFU cable wrapper, otherwise the wireless adapter.
      */
     static native boolean setAdapter(int mode);
 

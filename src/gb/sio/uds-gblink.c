@@ -167,6 +167,7 @@ struct GBVCLink {
 	// and the board drives the clock (uds-clock.c there). Wanted unless MGBA_VCLINK_CART=master; used if the firmware has it.
 	bool boardPicoWanted;
 	bool boardPico;
+	bool genDetect; // MGBA_VCLINK_GEN=auto: the wrapper is not told the generation and detects it, as behind a real GB-Link
 	bool picoGbMode; // the board's SetMode put the Pico in Game Boy mode
 	uint32_t picoUsBetween; // SetTimingConfig: the Pico's wait after each chunk, before it answers
 	uint8_t picoBytesPer;
@@ -855,7 +856,8 @@ static void _boardStep(struct GBVCLink* link, uint32_t now) {
 		return;
 	}
 	case BOARD_START: {
-		int32_t result = udsEsp32GbStart(&link->esp, link->trace != NULL, link->boardPico, link->boardTitle, link->name, 2000);
+		int32_t result = udsEsp32GbStart(&link->esp, link->trace != NULL, link->boardPico, link->boardPico && link->genDetect,
+		                                 link->boardTitle, link->name, 2000);
 		if (result != 0) {
 			char why[200];
 			snprintf(why, sizeof(why), "the board's wrapper did not start: %s", udsEsp32GbStartText(result));
@@ -1167,6 +1169,10 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 	link->wireMode = wire;
 	link->lastWirePhase = -1;
 	link->cartSlave = cartSlave;
+	// A test of what a cartridge behind a real GB-Link is like: nobody can read its header, so the wrapper detects the generation
+	// from the cartridge's first sync (udsWireSetGeneration 0).
+	const char* genEnv = getenv("MGBA_VCLINK_GEN");
+	link->genDetect = genEnv && !strcmp(genEnv, "auto");
 	if (cartSlave) {
 		link->clockByteCycles = GBVC_CLOCK_BYTE_CYCLES;
 		const char* gapEnv = getenv("MGBA_VCLINK_CLOCK_GAP_US");
@@ -1193,7 +1199,7 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 			.waiting = _portWaiting,
 			.trace = _portTrace,
 		});
-		udsWireSetGeneration(&link->wire, game->gen2 ? 2 : 1);
+		udsWireSetGeneration(&link->wire, link->genDetect ? 0 : game->gen2 ? 2 : 1);
 		udsWireSetCartEcho(&link->wire, true); // a menu the cartridge chose first reaches the 3DS, whichever side clocks
 		if (cartSlave) {
 			// The mail hold is a Pico rule: udsClockInit leaves it off without the Pico clock.
@@ -1238,6 +1244,9 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 			.context = link, .log = _boardLog, .gbState = _boardState, .gbStats = _boardStats, .gbPico = _boardPico,
 		};
 		link->boardPicoWanted = !(cartEnv && !strcmp(cartEnv, "master"));
+		if (link->genDetect) {
+			_trace(link, "board: MGBA_VCLINK_GEN=auto: the board detects the generation (needs the Pico mode, firmware 1.7)");
+		}
 		if (!udsEsp32Open(&link->esp, config->portName, &handlers)) {
 			mLOG(GB_SIO, ERROR, "Virtual Console (board): no ESP32 board found%s%s", config->portName && *config->portName ? " on " : "",
 			     config->portName && *config->portName ? config->portName : "");

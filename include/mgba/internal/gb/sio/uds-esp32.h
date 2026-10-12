@@ -191,6 +191,8 @@ bool udsEsp32Ping(struct UDSEsp32* esp, uint32_t token);
 bool udsEsp32HasGbWrapper(const struct UDSEsp32* esp); // the HelloAck says 1.4 or later
 // The HelloAck says 1.6 or later: the wrapper can drive the clock of a cartridge behind a GB-Link Pico (udsEsp32GbStart's `pico`).
 bool udsEsp32HasGbPico(const struct UDSEsp32* esp);
+// The HelloAck says 1.8 or later: the board may have a link port of its own (udsEsp32GbStartPort; built with CONFIG_UDS_LINK_PORT).
+bool udsEsp32HasGbPort(const struct UDSEsp32* esp);
 // Stores a key in the board's flash (the board never sends it back). True when the board says it is stored.
 bool udsEsp32SetKey(struct UDSEsp32* esp, uint8_t slot, const uint8_t key[16], unsigned timeoutMs);
 // Whether the board holds the UDS data key. -1: no answer.
@@ -199,9 +201,15 @@ bool udsEsp32EraseKeys(struct UDSEsp32* esp, unsigned timeoutMs);
 // Starts the board's Game Boy wrapper for the cartridge with this header title (0x134, up to 16 characters) and player name. The result
 // is the board's status (0 ok; see udsEsp32GbStartText), or -1 for no answer. `pico` (firmware 1.6 on): the cartridge is the slave
 // behind a GB-Link Pico that this side stands in for; the board drives the clock with gbPico frames, answered by udsEsp32GbPico.
-// Without it the cartridge is the master and each transfer goes to udsEsp32GbTransfer.
-int32_t udsEsp32GbStart(struct UDSEsp32* esp, bool log, bool pico, const char title[UDS_ESP32_GB_TITLE], const uint16_t name[10],
-                        unsigned timeoutMs);
+// Without it the cartridge is the master and each transfer goes to udsEsp32GbTransfer. `detect` (firmware 1.7 on, with `pico`): the
+// board is not told the generation and takes it from the cartridge's first sync, as behind a real GB-Link.
+int32_t udsEsp32GbStart(struct UDSEsp32* esp, bool log, bool pico, bool detect, const char title[UDS_ESP32_GB_TITLE],
+                        const uint16_t name[10], unsigned timeoutMs);
+// Firmware 1.8 on: the cartridge is on the board's own link port (a GBA/GBC link port wired to its GPIOs, no GB-Link) and the board
+// clocks it, as behind a Pico but with nothing for this side to carry. `detect` as above. The board answers ESP_ERR_INVALID_STATE (0x103)
+// when it was built without a link port.
+int32_t udsEsp32GbStartPort(struct UDSEsp32* esp, bool log, bool detect, const char title[UDS_ESP32_GB_TITLE], const uint16_t name[10],
+                            unsigned timeoutMs);
 const char* udsEsp32GbStartText(int32_t result);
 bool udsEsp32GbStop(struct UDSEsp32* esp, unsigned timeoutMs);
 // One transfer the cartridge clocked out as master: `master` goes to the board, the byte the slave shifts back comes into *reply. False if

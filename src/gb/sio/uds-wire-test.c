@@ -453,6 +453,45 @@ static void testGen2Sync(void) {
 	      "a 3DS answering in another range is not taken for the sync's partner (reply %02X)", reply);
 }
 
+// Generation 0 (a cartridge behind a GB-Link): the cartridge's first sync tells it. The receptionist's is 60 in Gen 1 and 61 in Gen 2; a
+// 70 or 80 range is Gen 2's alone; any other 6x waits for the next sync.
+static void testDetectGeneration(void) {
+	static const struct {
+		uint8_t first;
+		uint8_t second;
+		int generation;
+	} kCases[] = {
+		{0x60, 0, 1},
+		{0x61, 0, 2},
+		{0x75, 0, 2},
+		{0x85, 0, 2},
+		{0x63, 0x61, 2},
+		{0x63, 0x60, 1},
+	};
+	size_t c;
+	for (c = 0; c < sizeof(kCases) / sizeof(kCases[0]); ++c) {
+		struct Sim sim;
+		simInit(&sim);
+		udsWireSetGeneration(&sim.wire, 0);
+		CHECK(udsWireGeneration(&sim.wire) == 0, "generation 0 is not known yet");
+		hostPush(&sim.host, 0xEF);
+		uint8_t replies[3];
+		tick(&sim);
+		handshake(&sim, replies);
+		wait(&sim, 300);
+		exchange(&sim, kCases[c].first);
+		CHECK(sim.wire.phase == UDS_WIRE_SYNC, "%02X starts a sync while the generation is unknown (phase %d)", kCases[c].first,
+		      sim.wire.phase);
+		if (kCases[c].second) {
+			CHECK(udsWireGeneration(&sim.wire) == 0, "%02X does not tell the generation", kCases[c].first);
+			sim.wire.phase = UDS_WIRE_IDLE; // as after that sync ended: the next one is the cartridge's next try
+			exchange(&sim, kCases[c].second);
+		}
+		CHECK(udsWireGeneration(&sim.wire) == kCases[c].generation, "%02X%s%02X: Gen %d (got %d)", kCases[c].first,
+		      kCases[c].second ? " then " : "", kCases[c].second, kCases[c].generation, udsWireGeneration(&sim.wire));
+	}
+}
+
 static void testMenu(void) {
 	struct Sim sim;
 	uint8_t r[4];
@@ -1112,6 +1151,7 @@ int main(void) {
 	testRole();
 	testSync();
 	testGen2Sync();
+	testDetectGeneration();
 	testGen2Menu();
 	testMail();
 	testPlayerBlockWindow(2);

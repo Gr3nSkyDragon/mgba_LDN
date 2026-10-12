@@ -417,6 +417,10 @@ bool udsEsp32HasGbPico(const struct UDSEsp32* esp) {
 	return esp->info.valid && (esp->info.major > 1 || (esp->info.major == 1 && esp->info.minor >= 6));
 }
 
+bool udsEsp32HasGbPort(const struct UDSEsp32* esp) {
+	return esp->info.valid && (esp->info.major > 1 || (esp->info.major == 1 && esp->info.minor >= 8));
+}
+
 // Polls until *flag is set or the time is up. The board answers within a few milliseconds over USB, so this spins rather than sleeping
 // (a sleep on Windows lasts a scheduler tick, about 15 ms).
 static bool _await(struct UDSEsp32* esp, const bool* flag, unsigned timeoutMs) {
@@ -479,11 +483,12 @@ bool udsEsp32EraseKeys(struct UDSEsp32* esp, unsigned timeoutMs) {
 	return _request(esp, UDS_ESP32_CMD_ERASE_KEYS, NULL, 0, timeoutMs) == 0;
 }
 
-int32_t udsEsp32GbStart(struct UDSEsp32* esp, bool log, bool pico, const char title[UDS_ESP32_GB_TITLE], const uint16_t name[10],
+// GB_START {flags (bit 0: log, bit 1: Pico, bit 2: detect, bit 3: the link port), title[16], name[20]}.
+static int32_t _gbStart(struct UDSEsp32* esp, uint8_t flags, const char title[UDS_ESP32_GB_TITLE], const uint16_t name[10],
                         unsigned timeoutMs) {
 	uint8_t payload[1 + UDS_ESP32_GB_TITLE + 20];
 	memset(payload, 0, sizeof(payload));
-	payload[0] = (log ? 1 : 0) | (pico ? 2 : 0);
+	payload[0] = flags;
 	size_t i;
 	for (i = 0; i < UDS_ESP32_GB_TITLE && title[i]; ++i) {
 		payload[1 + i] = (uint8_t) title[i];
@@ -493,6 +498,16 @@ int32_t udsEsp32GbStart(struct UDSEsp32* esp, bool log, bool pico, const char ti
 		payload[2 + UDS_ESP32_GB_TITLE + 2 * i] = (uint8_t) (name[i] >> 8);
 	}
 	return _request(esp, UDS_ESP32_CMD_GB_START, payload, sizeof(payload), timeoutMs);
+}
+
+int32_t udsEsp32GbStart(struct UDSEsp32* esp, bool log, bool pico, bool detect, const char title[UDS_ESP32_GB_TITLE],
+                        const uint16_t name[10], unsigned timeoutMs) {
+	return _gbStart(esp, (log ? 1 : 0) | (pico ? 2 : 0) | (detect ? 4 : 0), title, name, timeoutMs);
+}
+
+int32_t udsEsp32GbStartPort(struct UDSEsp32* esp, bool log, bool detect, const char title[UDS_ESP32_GB_TITLE], const uint16_t name[10],
+                            unsigned timeoutMs) {
+	return _gbStart(esp, (log ? 1 : 0) | (detect ? 4 : 0) | 8, title, name, timeoutMs);
 }
 
 const char* udsEsp32GbStartText(int32_t result) {

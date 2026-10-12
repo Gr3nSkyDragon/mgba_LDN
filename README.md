@@ -60,7 +60,7 @@ For trading between a smartphone (FRLG/Emerald) and a Switch, you need to instal
 
 For GB Gen 1 and 2, the steps are the same, but you need to use an ESP32 running the Azahar UDS firmware instead and make sure to have Azahar or the 3DS hosting the trade before starting the game in mGBA.
 
-For trading between a smartphone (Ruby/Sapphire) and a Switch, click the three bars (☰) menu in the top right, select Wireless Adapter, choose Cable Adapter (currently supports an ESP32 running the GB-Link Switch LDN firmware; I'm using an ESP32-S3, other models may be added later), and plug the adapter into your smartphone via its USB-C port. Let FRLG host the trade before interacting with the Link Cable Trade lady at the middle window in Ruby/Sapphire.
+For trading between a smartphone (Ruby/Sapphire) and a Switch, click the three bars (☰) menu in the top right, select Wireless Adapter, choose ESP32 (Ruby and Sapphire use the cable wrapper automatically; currently supports an ESP32 running the GB-Link Switch LDN firmware; I'm using an ESP32-S3, other models may be added later), and plug the adapter into your smartphone via its USB-C port. Let FRLG host the trade before interacting with the Link Cable Trade lady at the middle window in Ruby/Sapphire.
 
 ### Other Android mGBA Features
 

@@ -35,6 +35,10 @@ struct Esp32SerialPortInfo {
 };
 size_t Esp32SerialListEspressif(struct Esp32SerialPortInfo* out, size_t max);
 
+// The first serial port of a present USB device with this vendor id, e.g. 0x2FE3 for a GB-Link (Pico), whose USB serial function
+// speaks the Pico's 'GB' frames. Built-in implementation only (Windows); false elsewhere or when none is present.
+bool Esp32SerialFindVendor(uint16_t vendorId, char* out, size_t capacity);
+
 // The five operations above, as a table a host application can supply. `struct Esp32Serial` is opaque: an implementation
 // defines it however it likes (a Win32 handle, a JNI reference to an Android USB connection, ...). `find` is the
 // auto-detection hook; where the host application has already been handed a specific device it can simply report that

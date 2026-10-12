@@ -186,6 +186,19 @@ static bool _platformFindEspressif(char* out, size_t capacity) {
 	return true;
 }
 
+static bool _platformFindVendor(uint16_t vendorId, char* out, size_t capacity) {
+	char prefix[16];
+	snprintf(prefix, sizeof(prefix), "VID_%04X", vendorId);
+	struct Esp32SerialPortInfo first;
+	size_t count = 0;
+	_listPortsForVendor(prefix, "", &first, 1, &count);
+	if (!count || strlen(first.name) >= capacity) {
+		return false;
+	}
+	strcpy(out, first.name);
+	return true;
+}
+
 #else
 
 static struct Esp32Serial* _platformOpen(const char* name, unsigned baud) {
@@ -217,6 +230,12 @@ static size_t _platformListEspressif(struct Esp32SerialPortInfo* out, size_t max
 	(void) out;
 	(void) max;
 	return 0;
+}
+static bool _platformFindVendor(uint16_t vendorId, char* out, size_t capacity) {
+	(void) vendorId;
+	(void) out;
+	(void) capacity;
+	return false;
 }
 
 #endif
@@ -258,6 +277,10 @@ bool Esp32SerialWrite(struct Esp32Serial* port, const void* data, size_t length)
 
 bool Esp32SerialFindEspressif(char* out, size_t capacity) {
 	return sOps->find(out, capacity);
+}
+
+bool Esp32SerialFindVendor(uint16_t vendorId, char* out, size_t capacity) {
+	return _platformFindVendor(vendorId, out, capacity);
 }
 
 size_t Esp32SerialListEspressif(struct Esp32SerialPortInfo* out, size_t max) {

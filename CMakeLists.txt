@@ -962,6 +962,18 @@ if(BUILD_UDS_TEST)
 		target_link_libraries(uds-esp32-probe setupapi)
 	endif()
 
+	# A real cartridge behind a GB-Link and an ESP32 board, both on this PC's USB: carries the Pico's frames between them.
+	add_executable(uds-gblink-relay
+		src/gb/sio/uds-gblink-relay.c
+		src/gb/sio/uds-esp32.c
+		src/gb/sio/uds-keyfile.c
+		src/gb/sio/uds-room.c
+		src/gba/sio/esp32/esp32-serial.c)
+	target_include_directories(uds-gblink-relay PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
+	if(WIN32)
+		target_link_libraries(uds-gblink-relay setupapi winmm)
+	endif()
+
 	# The flasher's ROM loader client against a simulated ESP32-S3.
 	add_executable(uds-esp32-flash-test
 		src/gb/sio/uds-esp32-flash-test.c
