@@ -962,41 +962,8 @@ if(BUILD_UDS_TEST)
 		target_link_libraries(uds-esp32-probe setupapi)
 	endif()
 
-	# A real cartridge behind a GB-Link and an ESP32 board, both on this PC's USB: carries the Pico's frames between them.
-	add_executable(uds-gblink-relay
-		src/gb/sio/uds-gblink-relay.c
-		src/gb/sio/uds-esp32.c
-		src/gb/sio/uds-keyfile.c
-		src/gb/sio/uds-room.c
-		src/gba/sio/esp32/esp32-serial.c)
-	target_include_directories(uds-gblink-relay PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
-	if(WIN32)
-		target_link_libraries(uds-gblink-relay setupapi winmm)
-	endif()
-
-	# The flasher's ROM loader client against a simulated ESP32-S3.
-	add_executable(uds-esp32-flash-test
-		src/gb/sio/uds-esp32-flash-test.c
-		src/gb/sio/uds-esp32-flash.c
-		src/util/md5.c)
-	target_include_directories(uds-esp32-flash-test PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
-
-	# Flashes esp32-uds-bridge and stores the 3DS key on the board, with a window: one file to hand out with the firmware. The C runtime is
-	# linked in so that it runs on a PC without the Visual C++ redistributable.
-	if(WIN32)
-		add_executable(uds-esp32-setup WIN32
-			src/gb/sio/uds-esp32-setup.c
-			src/gb/sio/uds-esp32-flash.c
-			src/gb/sio/uds-esp32.c
-			src/gb/sio/uds-keyfile.c
-			src/gba/sio/esp32/esp32-serial.c
-			src/util/md5.c)
-		target_include_directories(uds-esp32-setup PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/include)
-		target_link_libraries(uds-esp32-setup setupapi comctl32 comdlg32 advapi32)
-		if(MSVC)
-			target_compile_options(uds-esp32-setup PRIVATE $<IF:$<CONFIG:Debug>,/MTd,/MT>)
-		endif()
-	endif()
+	# The board's installer (uds-esp32-setup), its flasher test and the GB-Link relay (uds-gblink-relay) live with the firmware in
+	# the VC-Adapter repository.
 endif()
 
 if(USE_LDND)
