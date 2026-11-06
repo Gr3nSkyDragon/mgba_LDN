@@ -73,10 +73,17 @@ int16_t mInterpolatorSincInterpolate(const struct mInterpolator* interpolator, c
 	double offset = (time - x) / M_PI;
 
 	double sum = 0;
-	for (int i = -7; i <= 8; i++) {
+	for (int i = 1 - interp->width; i <= (int) interp->width; i++) {
 		double weight = fastWindowedSinc(interp, i - offset);
 		double sample = data->at(x + i, data->context);
 		sum += sample * weight;
+	}
+
+	if (sum > INT16_MAX) {
+		return INT16_MAX;
+	}
+	if (sum < INT16_MIN) {
+		return INT16_MIN;
 	}
 
 	return sum;
@@ -90,10 +97,11 @@ void mInterpolatorCosineInit(struct mInterpolatorCosine* interp, unsigned resolu
 	}
 
 	interp->lut = calloc(resolution + 1, sizeof(double));
+	interp->resolution = resolution;
 
 	unsigned i;
 	for(i = 0; i < resolution; ++i) {
-		interp->lut[i] = (1.0 - cos(M_PI * i / resolution) * M_PI) * 0.5;
+		interp->lut[i] = (1.0 - cos(M_PI * i / resolution)) * 0.5;
 	}
 }
 

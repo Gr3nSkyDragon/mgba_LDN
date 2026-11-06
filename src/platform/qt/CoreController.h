@@ -280,7 +280,7 @@ private:
 
 	void updatePlayerSave();
 
-	void updateFastForward();
+	void updateFastForward(bool isChange);
 
 	void updateROMInfo();
 

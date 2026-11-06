@@ -92,7 +92,7 @@ CoreController::CoreController(mCore* core, QObject* parent)
 		}
 
 		controller->applyPendingMute();
-		controller->updateFastForward();
+		controller->updateFastForward(false);
 
 		if (controller->m_multiplayer) {
 			controller->m_multiplayer->attachGame(controller);
@@ -350,7 +350,7 @@ void CoreController::loadConfig(ConfigController* config) {
 	m_threadContext.core->setVideoBuffer(m_threadContext.core, reinterpret_cast<mColor*>(m_activeBuffer.data()), sizeAfter.width());
 
 	if (hasStarted()) {
-		updateFastForward();
+		updateFastForward(false);
 		mCoreThreadRewindParamsChanged(&m_threadContext);
 	}
 #ifdef M_CORE_GB
@@ -621,7 +621,7 @@ void CoreController::setFastForward(bool enable) {
 		return;
 	}
 	m_fastForward = enable;
-	updateFastForward();
+	updateFastForward(true);
 	emit fastForwardChanged(enable);
 }
 
@@ -630,7 +630,7 @@ void CoreController::forceFastForward(bool enable) {
 		return;
 	}
 	m_fastForwardForced = enable;
-	updateFastForward();
+	updateFastForward(true);
 	emit fastForwardChanged(enable || m_fastForward);
 }
 
@@ -1797,7 +1797,7 @@ void CoreController::updatePlayerSave() {
 	}
 }
 
-void CoreController::updateFastForward() {
+void CoreController::updateFastForward(bool isChange) {
 	// If we have "Fast forward" checked in the menu (m_fastForwardForced)
 	// or are holding the fast forward button (m_fastForward):
 	if (m_fastForward || m_fastForwardForced) {
@@ -1829,6 +1829,13 @@ void CoreController::updateFastForward() {
 		mCoreConfigGetBoolValue(&m_threadContext.core->config, "mute", &m_threadContext.core->opts.mute);
 		m_threadContext.impl->sync.fpsTarget = m_fpsTarget;
 		setSync(true);
+
+		// Flush backed up audio samples
+		if (isChange) {
+			mCoreSyncLockAudio(&m_threadContext.impl->sync);
+			mAudioBufferClear(m_threadContext.core->getAudioBuffer(m_threadContext.core));
+			mCoreSyncUnlockAudio(&m_threadContext.impl->sync);
+		}
 	}
 
 	m_threadContext.core->reloadConfigOption(m_threadContext.core, NULL, NULL);

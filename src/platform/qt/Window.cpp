@@ -270,25 +270,26 @@ void Window::argumentsPassed() {
 }
 
 QSize Window::contentSize(bool fallback) const {
-	if (m_display) {
-		return m_display->contentSize();
+	QSize size;
+	if (size.isEmpty() && m_display) {
+		size = m_display->contentSize();
 	}
-	if (m_controller) {
-		return m_controller->screenDimensions();
+	if (size.isEmpty() && m_controller) {
+		size = m_controller->screenDimensions();
 	}
-	if (fallback) {
+	if (size.isEmpty() && fallback) {
 #if defined(M_CORE_GBA)
 		return QSize(GBA_VIDEO_HORIZONTAL_PIXELS, GBA_VIDEO_VERTICAL_PIXELS);
 #elif defined(M_CORE_GB)
 		return QSize(GB_VIDEO_HORIZONTAL_PIXELS, GB_VIDEO_VERTICAL_PIXELS);
 #endif
 	}
-	return QSize();
+	return size;
 }
 
-void Window::resizeFrame(const QSize& size) {
+void Window::resizeFrame(const QSize& size, bool force) {
 	QSize newSize(size);
-	if (!m_config->getOption("lockFrameSize").toInt()) {
+	if (force || !m_config->getOption("lockFrameSize").toInt()) {
 		m_savedSize = size;
 		if (windowHandle()) {
 			QRect geom = windowHandle()->screen()->availableGeometry();
@@ -727,7 +728,26 @@ void Window::keyReleaseEvent(QKeyEvent* event) {
 	event->accept();
 }
 
+void Window::setFrameSize(int scale) {
+	auto setSize = m_frameSizes[scale];
+	bool lockFrameSize = m_config->getOption("lockFrameSize").toInt();
+	if (!lockFrameSize) {
+		exitFullScreen();
+	}
+	QSize size(contentSize(true));
+	size *= scale;
+	resizeFrame(size);
+	if (lockFrameSize) {
+		m_display->setMaximumScale(scale);
+	}
+	setSize->setActive(true);
+}
+
 void Window::recalculateFrameSize(const QSize& size) {
+	if (!m_wasOpened) {
+		return;
+	}
+
 	int factor = -1;
 	QSize baseSize(contentSize(true));
 	if (!baseSize.isEmpty() && size.width() % baseSize.width() == 0 && size.height() % baseSize.height() == 0 && size.width() / baseSize.width() == size.height() / baseSize.height()) {
@@ -735,6 +755,7 @@ void Window::recalculateFrameSize(const QSize& size) {
 	}
 
 	m_savedScale = factor;
+	m_config->setOption("scaleMultiplier", factor);
 	for (QMap<int, std::shared_ptr<Action>>::iterator iter = m_frameSizes.begin(); iter != m_frameSizes.end(); ++iter) {
 		std::shared_ptr<Action> frameSize = iter.value();
 		frameSize->setActive(iter.key() == factor);
@@ -777,7 +798,7 @@ void Window::showEvent(QShowEvent* event) {
 	DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cornerPref, sizeof(cornerPref));
 #endif
 	if (m_initialSize.isValid()) {
-		resizeFrame(m_initialSize);
+		resizeFrame(m_initialSize, true);
 	}
 	QVariant windowPos = m_config->getQtOption("windowPos", m_playerId > 0 ? QString("player%0").arg(m_playerId) : QString());
 	bool maximized = m_config->getQtOption("maximized").toBool();
@@ -823,9 +844,10 @@ void Window::closeEvent(QCloseEvent* event) {
 	m_config->setQtOption("windowPos", pos(), m_playerId > 0 ? QString("player%0").arg(m_playerId) : QString());
 	m_config->setQtOption("maximized", isMaximized());
 
-	if (m_savedScale > 0) {
-		m_config->setOption("height", GBA_VIDEO_VERTICAL_PIXELS * m_savedScale);
-		m_config->setOption("width", GBA_VIDEO_HORIZONTAL_PIXELS * m_savedScale);
+	QSize size = contentSize(true);
+	if (m_savedScale > 0 && !size.isEmpty()) {
+		m_config->setOption("height", size.height() * m_savedScale);
+		m_config->setOption("width", size.width() * m_savedScale);
 	}
 	saveConfig();
 	if (m_controller) {
@@ -1156,7 +1178,7 @@ void Window::reloadDisplayDriver() {
 	});
 
 	connect(m_display.get(), &QGBA::Display::contentSizeChanged, [this](const QSize& size) {
-		if (m_savedScale > 0 && !m_config->getOption("lockFrameSize").toInt()) {
+		if (m_savedScale > 0 && !size.isEmpty() && !m_config->getOption("lockFrameSize").toInt()) {
 			resizeFrame(size * m_savedScale);
 		}
 	});
@@ -1773,21 +1795,7 @@ void Window::setupMenu(QMenuBar* menubar) {
 	m_actions.addMenu(tr("Audio/&Video"), "av");
 	m_actions.addMenu(tr("Frame size"), "frame", "av");
 	for (int i = 1; i <= 8; ++i) {
-		auto setSize = m_actions.addAction(tr("%1×").arg(QString::number(i)), QString("frame.%1x").arg(QString::number(i)), [this, i]() {
-			auto setSize = m_frameSizes[i];
-			bool lockFrameSize = m_config->getOption("lockFrameSize").toInt();
-			if (!lockFrameSize) {
-				showNormal();
-			}
-			QSize size(contentSize(true));
-			size *= i;
-			m_config->setOption("scaleMultiplier", i); // TODO: Port to other
-			resizeFrame(size);
-			if (lockFrameSize) {
-				m_display->setMaximumScale(i);
-			}
-			setSize->setActive(true);
-		}, "frame");
+		auto setSize = m_actions.addAction(tr("%1×").arg(QString::number(i)), QString("frame.%1x").arg(QString::number(i)), std::bind(&Window::setFrameSize, this, i), "frame");
 		setSize->setExclusive(true);
 		if (m_savedScale == i) {
 			QSignalBlocker blocker(setSize.get());

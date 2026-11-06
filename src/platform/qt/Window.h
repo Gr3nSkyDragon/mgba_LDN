@@ -62,7 +62,7 @@ public:
 
 	void argumentsPassed();
 
-	void resizeFrame(const QSize& size);
+	void resizeFrame(const QSize& size, bool force = false);
 
 	void updateMultiplayerStatus(bool canOpenAnother);
 	void updateMultiplayerActive(bool active);
@@ -202,6 +202,8 @@ private:
 	void updateRFUStatus();
 
 	void ensureScripting();
+
+	void setFrameSize(int scale);
 	void recalculateFrameSize(const QSize&);
 
 	template <typename T, typename... A> std::function<void()> openTView(A... arg);
