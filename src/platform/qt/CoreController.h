@@ -231,6 +231,7 @@ public slots:
 	// The connection of the attached wireless adapter's backend, or else the RFU Cable Wrapper's wireless side, for the
 	// status menu. False when neither is attached. `backend` gets its name, `wrapper` whether it is the wrapper's.
 	bool rfuStatus(GBASIORFUBackendStatus* out, QString* backend, bool* wrapper) const;
+	QString vcStatus() const;
 	// "Check now": asks that backend to contact its device if it is idle.
 	void probeRFU();
 	void setBattleChipId(uint16_t id);
@@ -418,6 +419,8 @@ private:
 	QString m_vcLinkPort;
 	QString m_vcLinkKey;
 	QString m_vcKeyFile;
+	QString m_vcLinkTrace; // its trace file ("Save adapter log"), empty for none
+	bool m_vcTried = false; // applyVC made a link for this game (m_vcLink is NULL if it could not start)
 	bool m_rfuWrapperLogEnabled = false; // "Save adapter log" of the wrapper: <config dir>/rfu-wrapper-trace.log
 	bool m_rfuWrapperTraceHeld = false; // this controller holds a reference on the cable trace file
 	QByteArray m_eReaderData;

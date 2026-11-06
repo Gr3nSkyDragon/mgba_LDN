@@ -156,8 +156,13 @@ struct GBVCLink {
 	bool boardMode;
 	int boardState; // enum BoardState
 	struct UDSEsp32 esp;
+	struct UDSEsp32Handlers boardHandlers;
+	char boardPort[64]; // the configured port, or empty to find the board
 	uint32_t boardSinceMs;
 	uint32_t boardHelloMs;
+	uint32_t boardOpenMs; // the last attempt to open the port
+	unsigned boardReopens;
+	char boardWhy[200]; // why it failed (BOARD_FAILED), for the status line
 	char boardTitle[UDS_ESP32_GB_TITLE + 1];
 	char keyPath[512];
 	uint16_t name[10];
@@ -625,14 +630,19 @@ static uint8_t _wireWriteSC(struct GBSIODriver* driver, uint8_t value) {
 // Board mode: the wrapper runs on the ESP32 board, this ROM is the cartridge ----------------------------------------------------
 
 enum BoardState {
-	BOARD_BOOT, // the board resets when its port opens: Hello until it answers
+	BOARD_BOOT, // the board resets when its port opens: Hello until it answers, opening the port again while it is gone
 	BOARD_KEY, // does it hold the 3DS key? (if not, the key file is stored on it)
 	BOARD_START, // GB_START for this game
 	BOARD_RUNNING, // every transfer goes to the board
 	BOARD_FAILED,
 };
 
-#define BOARD_BOOT_MS 15000
+// Long enough for a board that boots in GB-Link Switch LDN's mode (VC-Adapter firmware with both sides) to see the Hello, restart
+// into its 3DS side and boot again.
+#define BOARD_BOOT_MS 30000
+// While the board's port is gone (it restarts, to change mode or after a Switch session), how often to try opening it again. Only a
+// missing port is retried: opening the port resets the board, so a port that is open is kept.
+#define BOARD_REOPEN_MS 500
 #define BOARD_TRANSFER_MS 250
 
 static const char* const kRoomStates[] = {"scan", "auth", "eapol", "joined"};
@@ -640,6 +650,7 @@ static const char* const kSessionStates[] = {"idle", "setup", "joined", "closed"
 
 static void _boardFail(struct GBVCLink* link, const char* why) {
 	link->boardState = BOARD_FAILED;
+	snprintf(link->boardWhy, sizeof(link->boardWhy), "%s", why);
 	mLOG(GB_SIO, ERROR, "Virtual Console (board): %s", why);
 	_trace(link, "board: %s", why);
 }
@@ -801,6 +812,22 @@ static void _picoPace(struct GBVCLink* link) {
 static void _boardStep(struct GBVCLink* link, uint32_t now) {
 	switch (link->boardState) {
 	case BOARD_BOOT:
+		if (!link->esp.info.valid && (!link->esp.port || link->esp.portFailed)) {
+			// No board yet, or its port went away: it is restarting (after a Switch session, or to change from GB-Link Switch LDN's
+			// mode to its 3DS side when it saw the Hello). Open it again once it is back.
+			if (now - link->boardSinceMs > BOARD_BOOT_MS) {
+				_boardFail(link, "no ESP32 board answered: plug it in by its native USB port");
+			} else if (!link->boardOpenMs || now - link->boardOpenMs >= BOARD_REOPEN_MS) {
+				link->boardOpenMs = now ? now : 1;
+				udsEsp32Close(&link->esp);
+				if (udsEsp32Open(&link->esp, link->boardPort[0] ? link->boardPort : NULL, &link->boardHandlers)) {
+					++link->boardReopens;
+					link->boardHelloMs = 0;
+					_trace(link, "board: port open (%u)", link->boardReopens);
+				}
+			}
+			return;
+		}
 		if (link->esp.info.valid) {
 			_trace(link, "board: firmware %u.%u, protocol %u", link->esp.info.major, link->esp.info.minor, link->esp.info.proto);
 			if (!udsEsp32HasGbWrapper(&link->esp)) {
@@ -887,10 +914,10 @@ static void _boardPoll(struct mTiming* timing, void* context, uint32_t cyclesLat
 		_picoPace(link);
 	}
 	if (link->boardState != BOARD_FAILED) {
-		if (!udsEsp32Poll(&link->esp)) {
+		if (!udsEsp32Poll(&link->esp) && link->boardState != BOARD_BOOT) {
 			_boardFail(link, "the serial port failed (is the board still plugged in?)");
 		} else {
-			_boardStep(link, now);
+			_boardStep(link, now); // while booting, a port that is gone is opened again there
 		}
 	}
 	if (link->trace && now - link->lastHeartbeatMs >= 5000) {
@@ -1240,18 +1267,21 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 		if (config->keyPath) {
 			strncpy(link->keyPath, config->keyPath, sizeof(link->keyPath) - 1);
 		}
-		struct UDSEsp32Handlers handlers = {
+		link->boardHandlers = (struct UDSEsp32Handlers) {
 			.context = link, .log = _boardLog, .gbState = _boardState, .gbStats = _boardStats, .gbPico = _boardPico,
 		};
+		if (config->portName) {
+			strncpy(link->boardPort, config->portName, sizeof(link->boardPort) - 1);
+		}
 		link->boardPicoWanted = !(cartEnv && !strcmp(cartEnv, "master"));
 		if (link->genDetect) {
 			_trace(link, "board: MGBA_VCLINK_GEN=auto: the board detects the generation (needs the Pico mode, firmware 1.7)");
 		}
-		if (!udsEsp32Open(&link->esp, config->portName, &handlers)) {
-			mLOG(GB_SIO, ERROR, "Virtual Console (board): no ESP32 board found%s%s", config->portName && *config->portName ? " on " : "",
-			     config->portName && *config->portName ? config->portName : "");
-			GBVCLinkDestroy(link);
-			return NULL;
+		// A board that is not there yet (restarting after a Switch session, say) is waited for: the poll keeps opening the port until
+		// BOARD_BOOT_MS has passed (_boardStep).
+		if (!udsEsp32Open(&link->esp, config->portName, &link->boardHandlers)) {
+			mLOG(GB_SIO, INFO, "Virtual Console (board): no ESP32 board found%s%s yet; waiting for it",
+			     config->portName && *config->portName ? " on " : "", config->portName && *config->portName ? config->portName : "");
 		}
 		link->boardSinceMs = _nowMs() - link->startMs;
 		link->d.init = _driverInit;
@@ -1425,5 +1455,45 @@ void GBVCLinkDestroy(struct GBVCLink* link) {
 void GBVCLinkTraceNote(struct GBVCLink* link, const char* text) {
 	if (link) {
 		_trace(link, "app: %s", text);
+	}
+}
+
+// Read from the front end's thread while the emulation runs: only plain fields are read, and a line that is a moment out of date is fine.
+void GBVCLinkStatus(const struct GBVCLink* link, char* out, size_t size) {
+	if (!size) {
+		return;
+	}
+	if (!link) {
+		snprintf(out, size, "not running (is this one of the games it knows?)");
+		return;
+	}
+	if (!link->boardMode) {
+		snprintf(out, size, "running here, on Azahar's bridge");
+		return;
+	}
+	const char* port = link->boardPort[0] ? link->boardPort : "auto-detect";
+	const uint32_t waited = (_nowMs() - link->startMs - link->boardSinceMs) / 1000;
+	switch (link->boardState) {
+	case BOARD_BOOT:
+		if (!link->esp.port || link->esp.portFailed) {
+			snprintf(out, size, "waiting for the ESP32 board (%s), %u s of %u", port, (unsigned) waited, BOARD_BOOT_MS / 1000);
+		} else {
+			snprintf(out, size, "board port open (%s), waiting for its answer (it may be restarting into its 3DS mode), %u s of %u", port,
+			         (unsigned) waited, BOARD_BOOT_MS / 1000);
+		}
+		break;
+	case BOARD_KEY:
+		snprintf(out, size, "board firmware %u.%u: checking its 3DS key", link->esp.info.major, link->esp.info.minor);
+		break;
+	case BOARD_START:
+		snprintf(out, size, "board firmware %u.%u: starting the wrapper", link->esp.info.major, link->esp.info.minor);
+		break;
+	case BOARD_RUNNING:
+		snprintf(out, size, "running on the board (firmware %u.%u), wire %s, %u transfers", link->esp.info.major, link->esp.info.minor,
+		         link->boardPhase <= UDS_WIRE_PASS ? kWirePhases[link->boardPhase] : "?", link->wireExchanges);
+		break;
+	default:
+		snprintf(out, size, "failed: %s", link->boardWhy[0] ? link->boardWhy : "?");
+		break;
 	}
 }

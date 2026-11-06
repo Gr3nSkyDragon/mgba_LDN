@@ -1400,7 +1400,14 @@ void CoreController::applyVC() {
 	}
 	// Which side of the cable the cartridge plays is the link's own choice (uds-gblink.h): slave behind a virtual GB-Link on Local,
 	// master on the board.
-	if (m_vcLink && m_vcLinkBoard == board && (!board || (m_vcLinkPort == m_rfuEsp32Port && m_vcLinkKey == m_vcKeyFile))) {
+	// "Save adapter log" also writes the link's trace, to a fixed file in the config folder (MGBA_VCLINK_TRACE=<folder> still wins).
+	QString trace;
+	const char* traceEnv = getenv("MGBA_VCLINK_TRACE");
+	if (m_rfuLogEnabled && (!traceEnv || !traceEnv[0])) {
+		trace = QDir(ConfigController::configDir()).filePath("vclink-trace.log");
+	}
+	if (m_vcLink && m_vcLinkBoard == board && m_vcLinkTrace == trace &&
+	    (!board || (m_vcLinkPort == m_rfuEsp32Port && m_vcLinkKey == m_vcKeyFile))) {
 		return;
 	}
 	stopVC();
@@ -1409,14 +1416,18 @@ void CoreController::applyVC() {
 	uint16_t name[GBVC_NAME_WORDS] = {'M', 'G', 'B', 'A'};
 	const QByteArray port = m_rfuEsp32Port.toUtf8();
 	const QByteArray key = m_vcKeyFile.toUtf8();
+	const QByteArray tracePath = trace.toUtf8();
 	GBVCLinkConfig config = {};
 	config.air = board ? GBVC_AIR_BOARD : GBVC_AIR_BRIDGE;
 	config.portName = port.constData();
 	config.keyPath = key.constData();
+	config.tracePath = tracePath.constData();
 	m_vcLink = GBVCLinkCreate(m_threadContext.core, &m_debugger, name, &config);
 	m_vcLinkBoard = board;
 	m_vcLinkPort = m_rfuEsp32Port;
 	m_vcLinkKey = m_vcKeyFile;
+	m_vcLinkTrace = trace;
+	m_vcTried = true;
 	if (!m_vcLink) {
 		LOG(QT, ERROR) << tr("Virtual Console: could not start (see the log above)");
 	}
@@ -1430,7 +1441,19 @@ void CoreController::setVCKeyFile(const QString& path) {
 	applyVC();
 }
 
+// The Virtual Console link's state for the Wireless Adapter > Status lines. Empty when this game has no link to run (not a Game Boy
+// game, or no backend that carries one).
+QString CoreController::vcStatus() const {
+	if (!m_vcTried) {
+		return QString();
+	}
+	char text[300];
+	GBVCLinkStatus(m_vcLink, text, sizeof(text));
+	return QString::fromUtf8(text);
+}
+
 void CoreController::stopVC() {
+	m_vcTried = false;
 	if (!m_vcLink) {
 		return;
 	}
@@ -1473,6 +1496,10 @@ void CoreController::setRFULogging(bool enabled) {
 		return;
 	}
 	m_rfuLogEnabled = enabled;
+	if (platform() == mPLATFORM_GB) {
+		applyVC(); // the Virtual Console link writes its trace with the same box
+		return;
+	}
 	if (platform() != mPLATFORM_GBA || !m_rfuAttached || !rfuEnabled()) {
 		return;
 	}

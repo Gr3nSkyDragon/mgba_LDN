@@ -1060,6 +1060,12 @@ static void _exitClosePassed(struct Air* air) {
 	_cablePushCmd(air, LINKCMD_READY_CLOSE_LINK, 0, 0);
 	air->exitLinger = 1;
 	air->haveRubyLP = false; // a new cable club visit starts a new search
+	// ... with a new leader: its LinkPlayer is taken as the first 200-byte block again (_hostBlock), and nothing of this one's
+	// is handed to the game. Kept, the old leader's LinkPlayer went to the game at once on its next visit, which walked into
+	// the room while the leader was still at its attendant, and the new leader's LinkPlayer went to it as a plain block.
+	air->haveHostLP = false;
+	air->heldCount = 0;
+	air->pendingPull = -1;
 	air->closeCount = 0;
 	air->roomClosed = false;
 	air->cancelPending = false;

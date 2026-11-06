@@ -2350,9 +2350,27 @@ void Window::updateRFUStatus() {
 	QString error = tr("Last error: none");
 	if (!attached) {
 		bool chosen = m_rfuBackend != QLatin1String("off");
-		state = tr("Status: %1").arg(!chosen ? tr("Off") : m_controller ? tr("Not attached") : tr("No game running"));
+		// A Game Boy game does not use the wireless adapter: with ESP32 the board carries its Virtual Console link instead (the board's
+		// firmware changes to its 3DS side by itself), and with Local the link runs here if Virtual Console (local only) is ticked.
+		const bool gbGame = m_controller && m_controller->platform() == mPLATFORM_GB;
+		QString notAttached = tr("Not attached");
+		if (gbGame && m_rfuBackend == QLatin1String("esp32")) {
+			notAttached = tr("Game Boy game: the Virtual Console link uses the ESP32 board");
+		} else if (gbGame) {
+			notAttached = tr("Game Boy game: no wireless adapter (Virtual Console runs here with Local if ticked)");
+		}
+		state = tr("Status: %1").arg(!chosen ? tr("Off") : m_controller ? notAttached : tr("No game running"));
 		device = tr("Device: none");
-		activity = tr("Activity: %1").arg(!chosen ? tr("choose Local, ldnd or ESP32 above") : tr("attached when a GBA game is running"));
+		activity = tr("Activity: %1").arg(!chosen ? tr("choose Local, ldnd or ESP32 above")
+		                                          : tr("attached when a game runs: a GBA game uses the wireless adapter, a Game Boy "
+		                                               "game the Virtual Console link"));
+		const QString vc = gbGame ? m_controller->vcStatus() : QString();
+		if (!vc.isEmpty()) {
+			activity = tr("Virtual Console: %1").arg(vc);
+			if (m_rfuBackend == QLatin1String("esp32")) {
+				device = tr("Device: %1").arg(m_rfuEsp32Port.isEmpty() ? tr("ESP32 board (auto-detect)") : m_rfuEsp32Port);
+			}
+		}
 	} else {
 		QString link;
 		switch (status.link) {

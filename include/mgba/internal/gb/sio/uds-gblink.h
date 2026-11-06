@@ -75,6 +75,8 @@ struct GBVCLink* GBVCLinkCreate(struct mCore* core, struct mDebugger* debugger, 
 void GBVCLinkDestroy(struct GBVCLink* link);
 // A line of the front end's own in the trace (the Android app's wall-clock and frame-rate notes). Nothing without a trace.
 void GBVCLinkTraceNote(struct GBVCLink* link, const char* text);
+// One line on how the link is doing (waiting for the board, running, why it failed), for the front end's status. NULL: not running.
+void GBVCLinkStatus(const struct GBVCLink* link, char* out, size_t size);
 
 CXX_GUARD_END
 
