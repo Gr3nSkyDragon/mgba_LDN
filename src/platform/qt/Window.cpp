@@ -122,9 +122,10 @@ Window::Window(CoreManager* manager, ConfigController* config, int playerId, QWi
 #endif
 	QVariant multiplier = m_config->getOption("scaleMultiplier");
 	if (!multiplier.isNull()) {
-		m_savedScale = multiplier.toInt();
-		i = m_savedScale;
+		m_frameScale = multiplier.toInt();
+		i = m_frameScale;
 	}
+	m_frameSize = QSize(m_config->getOption("frameWidth", 0).toInt(), m_config->getOption("frameHeight", 0).toInt());
 #ifdef USE_SQLITE3
 	m_libraryView = new LibraryController(nullptr, ConfigController::configDir() + "/library.sqlite3", m_config);
 	ConfigOption* showLibrary = m_config->addOption("showLibrary");
@@ -250,14 +251,14 @@ void Window::argumentsPassed() {
 #endif
 
 	if (m_config->graphicsOpts()->multiplier > 0) {
-		m_savedScale = m_config->graphicsOpts()->multiplier;
+		m_frameScale = m_config->graphicsOpts()->multiplier;
 
 #if defined(M_CORE_GBA)
 		QSize size(GBA_VIDEO_HORIZONTAL_PIXELS, GBA_VIDEO_VERTICAL_PIXELS);
 #elif defined(M_CORE_GB)
 		QSize size(GB_VIDEO_HORIZONTAL_PIXELS, GB_VIDEO_VERTICAL_PIXELS);
 #endif
-		m_initialSize = size * m_savedScale;
+		m_initialSize = size * m_frameScale;
 	}
 
 	if (args->fname) {
@@ -290,7 +291,7 @@ QSize Window::contentSize(bool fallback) const {
 void Window::resizeFrame(const QSize& size, bool force) {
 	QSize newSize(size);
 	if (force || !m_config->getOption("lockFrameSize").toInt()) {
-		m_savedSize = size;
+		m_frameSize = size;
 		if (windowHandle()) {
 			QRect geom = windowHandle()->screen()->availableGeometry();
 			if (newSize.width() > geom.width()) {
@@ -754,7 +755,7 @@ void Window::recalculateFrameSize(const QSize& size) {
 		factor = size.width() / baseSize.width();
 	}
 
-	m_savedScale = factor;
+	m_frameScale = factor;
 	m_config->setOption("scaleMultiplier", factor);
 	for (QMap<int, std::shared_ptr<Action>>::iterator iter = m_frameSizes.begin(); iter != m_frameSizes.end(); ++iter) {
 		std::shared_ptr<Action> frameSize = iter.value();
@@ -845,9 +846,9 @@ void Window::closeEvent(QCloseEvent* event) {
 	m_config->setQtOption("maximized", isMaximized());
 
 	QSize size = contentSize(true);
-	if (m_savedScale > 0 && !size.isEmpty()) {
-		m_config->setOption("height", size.height() * m_savedScale);
-		m_config->setOption("width", size.width() * m_savedScale);
+	if (m_frameScale > 0 && !size.isEmpty()) {
+		m_config->setOption("height", size.height() * m_frameScale);
+		m_config->setOption("width", size.width() * m_frameScale);
 	}
 	saveConfig();
 	if (m_controller) {
@@ -1178,8 +1179,8 @@ void Window::reloadDisplayDriver() {
 	});
 
 	connect(m_display.get(), &QGBA::Display::contentSizeChanged, [this](const QSize& size) {
-		if (m_savedScale > 0 && !size.isEmpty() && !m_config->getOption("lockFrameSize").toInt()) {
-			resizeFrame(size * m_savedScale);
+		if (m_frameScale > 0 && !size.isEmpty() && !m_config->getOption("lockFrameSize").toInt()) {
+			resizeFrame(size * m_frameScale);
 		}
 	});
 
@@ -1797,7 +1798,7 @@ void Window::setupMenu(QMenuBar* menubar) {
 	for (int i = 1; i <= 8; ++i) {
 		auto setSize = m_actions.addAction(tr("%1×").arg(QString::number(i)), QString("frame.%1x").arg(QString::number(i)), std::bind(&Window::setFrameSize, this, i), "frame");
 		setSize->setExclusive(true);
-		if (m_savedScale == i) {
+		if (m_frameScale == i) {
 			QSignalBlocker blocker(setSize.get());
 			setSize->setActive(true);
 		}
@@ -1817,10 +1818,13 @@ void Window::setupMenu(QMenuBar* menubar) {
 	lockFrameSize->connect([this](const QVariant& value) {
 		if (m_display) {
 			if (value.toBool()) {
-				if (m_savedScale > 0) {
-					m_display->setMaximumScale(m_savedScale);
+				if (m_frameScale > 0) {
+					m_display->setMaximumScale(m_frameScale);
 				} else {
-					m_display->setMaximumSize(m_display->size());
+					m_frameSize = m_display->size();
+					m_config->setOption("frameWidth", m_frameSize.width());
+					m_config->setOption("frameHeight", m_frameSize.height());
+					m_display->setMaximumSize(m_frameSize);
 				}
 			} else {
 				m_display->setMaximumSize({});
@@ -2692,10 +2696,13 @@ void Window::attachDisplay() {
 	m_display->attach(m_controller);
 	connect(m_display.get(), &QGBA::Display::drawingStarted, this, &Window::changeRenderer);
 	if (m_config->getOption("lockFrameSize").toInt()) {
-		if (m_savedScale > 0) {
-			m_display->setMaximumScale(m_savedScale);
+		if (m_frameScale > 0) {
+			m_display->setMaximumScale(m_frameScale);
 		} else {
-			m_display->setMaximumSize(m_savedSize);
+			if (m_frameSize.isEmpty()) {
+				m_frameSize = m_display->size();
+			}
+			m_display->setMaximumSize(m_frameSize);
 		}
 	} else {
 		m_display->setMaximumSize({});
